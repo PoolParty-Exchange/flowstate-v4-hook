@@ -27,12 +27,20 @@ contract MockFlowstateMarket is IFlowstateMarketMinimal {
 
     IERC20 public immutable quoteAsset;
     IERC20 public immutable inventoryToken;
-    uint256 public immutable rateNum;
-    uint256 public immutable rateDen;
+    /// @dev Mutable (test-only) so a suite can pick a rate whose inversion genuinely
+    ///      loses dust to the floor — the hook's rounding proofs need a market where
+    ///      quotePaid < quoteIn is reachable. Not part of the real market surface.
+    uint256 public rateNum;
+    uint256 public rateDen;
 
     constructor(address _quoteAsset, address _inventoryToken, uint256 _rateNum, uint256 _rateDen) {
         quoteAsset = IERC20(_quoteAsset);
         inventoryToken = IERC20(_inventoryToken);
+        rateNum = _rateNum;
+        rateDen = _rateDen;
+    }
+
+    function setRate(uint256 _rateNum, uint256 _rateDen) external {
         rateNum = _rateNum;
         rateDen = _rateDen;
     }

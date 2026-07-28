@@ -82,7 +82,9 @@ abstract contract ForkTestBase is Test {
         hook = new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this));
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
 
-        hook.registerPair(Currency.wrap(USDG), Currency.wrap(address(token)), address(market));
+        // Conservative ship default: zero base spread, no rung schedule (the spread
+        // suite configures spreads per test; the floor is 0 until set).
+        hook.registerPair(Currency.wrap(USDG), Currency.wrap(address(token)), address(market), 0);
 
         usdgIsCurrency0 = USDG < address(token);
         (Currency c0, Currency c1) = usdgIsCurrency0

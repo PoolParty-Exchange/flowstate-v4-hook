@@ -2,6 +2,8 @@
 pragma solidity 0.8.26;
 
 import {ForkTestBase} from "./ForkTestBase.sol";
+import {FlowstateC1Hook} from "../../src/FlowstateC1Hook.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IV4Quoter} from "@uniswap/v4-periphery/src/interfaces/IV4Quoter.sol";
 import {console2} from "forge-std/console2.sol";
 
@@ -106,6 +108,30 @@ contract GasColdWarmForkTest is ForkTestBase {
 contract GasColdWarmSeasonedForkTest is GasColdWarmForkTest {
     function setUp() public override {
         super.setUp();
+        vm.prank(swapper);
+        _swapBuy(-int256(10e6), "");
+    }
+}
+
+/// @notice Phase 1 slice 2 gas delta: identical seasoned measurements with the spread
+///         logic ACTIVE (base 16 bps + a three-rung size schedule). Subtracting the
+///         plain seasoned numbers above isolates what the fee-determination rungs and
+///         margin accrual cost per swap.
+///
+///         Seasoning here also runs one spread-bearing fill so the margin/dust accrual
+///         slots are already nonzero: a pool's first accrual pays a one-time
+///         zero-to-nonzero SSTORE that steady-state routed flow never repeats.
+contract GasColdWarmSeasonedSpreadForkTest is GasColdWarmForkTest {
+    function setUp() public override {
+        super.setUp();
+
+        hook.setBaseSpread(Currency.wrap(USDG), Currency.wrap(address(token)), 16);
+        FlowstateC1Hook.SpreadRung[] memory rungs = new FlowstateC1Hook.SpreadRung[](3);
+        rungs[0] = FlowstateC1Hook.SpreadRung({notionalCeiling: 1_000e6, extraBps: 0});
+        rungs[1] = FlowstateC1Hook.SpreadRung({notionalCeiling: 10_000e6, extraBps: 5});
+        rungs[2] = FlowstateC1Hook.SpreadRung({notionalCeiling: 100_000e6, extraBps: 15});
+        hook.setSizeRungs(Currency.wrap(USDG), rungs);
+
         vm.prank(swapper);
         _swapBuy(-int256(10e6), "");
     }
