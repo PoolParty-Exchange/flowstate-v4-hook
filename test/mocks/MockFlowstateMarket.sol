@@ -3,20 +3,25 @@ pragma solidity 0.8.26;
 
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IFlowstateMarketMinimal} from "../../src/interfaces/IFlowstateMarketMinimal.sol";
+import {IFlowstateBuyFunder} from "../../src/interfaces/IFlowstateBuyFunder.sol";
 
-/// @notice Phase 0 stand-in for FlowstateMarket: fixed-rate, pull-exact, all-or-nothing.
-///         Holds the token inventory itself and acts as its own pool record. Phase 1
-///         replaces this with the real market + FlowstatePool; the hook-facing interface
-///         is identical.
-/// @dev Pricing: tokensOut = quoteIn * rateNum / rateDen (rounded down);
+/// @notice Stand-in for FlowstateMarket: fixed-rate, pull-exact, all-or-nothing.
+///         Holds the token inventory itself and acts as its own pool record, but
+///         mirrors the REAL market's Phase 1 entry-point semantics exactly:
+///         - buyFromPoolExactQuote inverts with floor rounding then recomputes the
+///           pull as the ceil cost of the tokens delivered (quotePaid <= quoteIn);
+///         - buyFromPoolExactOut runs the IFlowstateBuyFunder callback under the
+///           real market's skip rules (caller has code AND balance or allowance
+///           short) before the pull-exact transferFrom.
+/// @dev Pricing: tokensOut = quoteIn * rateNum / rateDen (floor);
 ///      quoteCost = ceil(tokenAmount * rateDen / rateNum). The asymmetric rounding
-///      mirrors a real market: the buyer side never underpays.
+///      mirrors the real market: the buyer side never underpays.
 contract MockFlowstateMarket is IFlowstateMarketMinimal {
     using SafeERC20 for IERC20;
 
     error UnknownPool();
     error ZeroAmount();
-    error InsufficientInventory(uint256 requested, uint256 available);
+    error FillShortfall();
 
     event MockBuy(address indexed buyer, uint256 quotePaid, uint256 tokensFilled);
 
@@ -38,24 +43,48 @@ contract MockFlowstateMarket is IFlowstateMarketMinimal {
     {
         if (pool != address(this)) revert UnknownPool();
         if (amount == 0) revert ZeroAmount();
-        quotePaid = _quoteCost(amount);
-        _fill(buyer, quotePaid, amount);
-        tokensFilled = amount;
+        // legacy partial-fill semantics: cap at inventory
+        uint256 available = inventoryToken.balanceOf(address(this));
+        tokensFilled = amount < available ? amount : available;
+        if (tokensFilled == 0) revert FillShortfall();
+        quotePaid = _quoteCost(tokensFilled);
+        _fill(buyer, quotePaid, tokensFilled);
     }
 
     function buyFromPoolExactQuote(address pool, uint256 quoteIn, string calldata, address buyer)
         external
-        returns (uint256 tokensFilled)
+        returns (uint256 tokensFilled, uint256 quotePaid)
     {
         if (pool != address(this)) revert UnknownPool();
         if (quoteIn == 0) revert ZeroAmount();
-        tokensFilled = quoteIn * rateNum / rateDen;
-        _fill(buyer, quoteIn, tokensFilled);
+        tokensFilled = quoteIn * rateNum / rateDen; // invert, floor (against the buyer)
+        if (tokensFilled == 0) revert ZeroAmount();
+        if (tokensFilled > inventoryToken.balanceOf(address(this))) revert FillShortfall(); // all-or-nothing
+        quotePaid = _quoteCost(tokensFilled); // recompute, ceil — always <= quoteIn
+        _fill(buyer, quotePaid, tokensFilled);
     }
 
-    function quoteBuyFromPool(address pool, uint256 amount) external view returns (uint256 quoteCost) {
+    function buyFromPoolExactOut(address pool, uint256 tokenAmountOut, string calldata, address buyer)
+        external
+        returns (uint256 tokensFilled, uint256 quotePaid)
+    {
         if (pool != address(this)) revert UnknownPool();
-        quoteCost = _quoteCost(amount);
+        if (tokenAmountOut == 0) revert ZeroAmount();
+        if (tokenAmountOut > inventoryToken.balanceOf(address(this))) revert FillShortfall(); // all-or-nothing
+        tokensFilled = tokenAmountOut;
+        quotePaid = _quoteCost(tokenAmountOut);
+        // real-market callback rules: only a code-bearing caller that cannot already
+        // cover the cost is asked to fund itself
+        if (
+            msg.sender.code.length != 0
+                && (
+                    quoteAsset.balanceOf(msg.sender) < quotePaid
+                        || quoteAsset.allowance(msg.sender, address(this)) < quotePaid
+                )
+        ) {
+            IFlowstateBuyFunder(msg.sender).fundBuy(address(quoteAsset), quotePaid);
+        }
+        _fill(buyer, quotePaid, tokensFilled);
     }
 
     function _quoteCost(uint256 tokenAmount) internal view returns (uint256) {
@@ -63,8 +92,6 @@ contract MockFlowstateMarket is IFlowstateMarketMinimal {
     }
 
     function _fill(address buyer, uint256 quotePaid, uint256 tokensFilled) internal {
-        uint256 available = inventoryToken.balanceOf(address(this));
-        if (tokensFilled > available) revert InsufficientInventory(tokensFilled, available);
         quoteAsset.safeTransferFrom(msg.sender, address(this), quotePaid);
         inventoryToken.safeTransfer(buyer, tokensFilled);
         emit MockBuy(buyer, quotePaid, tokensFilled);

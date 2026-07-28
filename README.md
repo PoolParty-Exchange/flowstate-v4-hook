@@ -16,15 +16,27 @@ transient unlock balances.
   AFTER_SWAP_RETURNS_DELTA). beforeInitialize gates pool creation on an admin pair
   registry; beforeAddLiquidity always reverts (`LiquidityNotAllowed`); beforeSwap
   implements the full curve override (specifiedDelta = -amountSpecified), prices buys
-  through the pull-exact market interface (both exactInput and exactOutput), reverts
-  the sell direction with `SellDirectionNotSupported`, and raises
-  `ManagerReservesExceeded` when a ticket exceeds the PoolManager's physical reserves
-  (scope §2.1 decision); afterSwap returns 0. hookData is never read.
-- `src/interfaces/IFlowstateMarketMinimal.sol` — the market surface the hook consumes:
-  real pass-1 `buyFromPool` shape plus the additive `buyFromPoolExactQuote` from scope
-  §2.2. Phase 1 swaps the mock for the real FlowstateMarket with no hook changes.
-- `test/mocks/MockFlowstateMarket.sol` — Phase 0 stand-in: fixed rate
-  (2 FLOWMOCK per 1 USDG), pull-exact, all-or-nothing, holds its own inventory.
+  through the pull-exact market interface (exactInput via `buyFromPoolExactQuote`,
+  exactOutput via `buyFromPoolExactOut` + the `fundBuy` funding callback — each a
+  single market call with a single oracle read), reverts the sell direction with
+  `SellDirectionNotSupported`, and raises `ManagerReservesExceeded` when a ticket
+  exceeds the PoolManager's physical reserves (scope §2.1 decision, preserved inside
+  the callback); afterSwap returns 0. hookData is never read.
+- `src/interfaces/IFlowstateMarketMinimal.sol` — the market surface the hook consumes,
+  now the FINAL Phase 1 signatures of the scope §2.2 entry-point pair (landed on
+  PoolParty_Contracts branch `feat/market-exact-quote-pair`): `buyFromPoolExactQuote`
+  (exact-input in quote terms, single oracle read, `quotePaid <= quoteIn` with
+  inversion dust accruing on the hook) and `buyFromPoolExactOut` (exact-output twin
+  with the `IFlowstateBuyFunder.fundBuy` funding callback resolving the Phase 0
+  funding-order finding — the hook does `manager.take` inside the callback, then the
+  market pulls exactly the cost). Legacy `buyFromPool` remains declared for reference;
+  the hook's swap paths use only the pair.
+- `src/interfaces/IFlowstateBuyFunder.sol` — the funding-callback interface the hook
+  implements (mirror of the PoolParty_Contracts original).
+- `test/mocks/MockFlowstateMarket.sol` — stand-in implementing the identical Phase 1
+  interface: fixed rate (2 FLOWMOCK per 1 USDG), pull-exact, all-or-nothing
+  (`FillShortfall`), real callback skip rules (only a code-bearing caller whose
+  balance/allowance falls short gets `fundBuy`), holds its own inventory.
 - `test/fork/` — all tests fork RH mainnet. `ForkTestBase` mines the 0x28cc address
   with v4-periphery's HookMiner and deploys via plain CREATE2 from the test contract
   (`new FlowstateC1Hook{salt: salt}(...)`) — no vm.etch fallback was needed. It also

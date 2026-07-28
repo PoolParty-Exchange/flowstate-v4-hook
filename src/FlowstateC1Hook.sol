@@ -15,6 +15,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IFlowstateMarketMinimal} from "./interfaces/IFlowstateMarketMinimal.sol";
+import {IFlowstateBuyFunder} from "./interfaces/IFlowstateBuyFunder.sol";
 
 /// @title FlowstateC1Hook
 /// @notice Uniswap V4 custom-curve hook adapting routed BUY flow onto Flowstate C1 pool
@@ -34,7 +35,7 @@ import {IFlowstateMarketMinimal} from "./interfaces/IFlowstateMarketMinimal.sol"
 ///
 ///      Address flags must be 0x28cc: BEFORE_INITIALIZE | BEFORE_ADD_LIQUIDITY |
 ///      BEFORE_SWAP | AFTER_SWAP | BEFORE_SWAP_RETURNS_DELTA | AFTER_SWAP_RETURNS_DELTA.
-contract FlowstateC1Hook is IHooks, Ownable2Step {
+contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
     using SafeCast for int256;
@@ -44,6 +45,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     // -------------------------------------------------------------------------
 
     error NotPoolManager();
+    error NotMarket();
     error HookNotImplemented();
     error ZeroAddress();
     error PairNotRegistered();
@@ -51,8 +53,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     error LiquidityNotAllowed();
     error SellDirectionNotSupported();
     error ManagerReservesExceeded(Currency currency, uint256 requested, uint256 available);
-    error QuoteExecutionMismatch(uint256 quoted, uint256 pulled);
-    error FillShortfall(uint256 requested, uint256 filled);
 
     // -------------------------------------------------------------------------
     // Immutable wiring
@@ -61,7 +61,9 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     /// @notice The canonical PoolManager on this chain.
     IPoolManager public immutable poolManager;
 
-    /// @notice The FlowstateMarket router (Phase 0: a mock with the same pull-exact shape).
+    /// @notice The FlowstateMarket router (final Phase 1 pull-exact surface: the
+    ///         exact-quote entry-point pair incl. the fundBuy funding callback; the
+    ///         Phase 0 mock implements the identical interface for fork tests).
     IFlowstateMarketMinimal public immutable market;
 
     // -------------------------------------------------------------------------
@@ -209,37 +211,60 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         bool exactInput = params.amountSpecified < 0;
         (uint256 quoteIn, uint256 tokensOut, BeforeSwapDelta hookDelta) = exactInput
             ? _buyExactInput(cfg.marketPool, input, output, params.amountSpecified)
-            : _buyExactOutput(cfg.marketPool, input, output, params.amountSpecified);
+            : _buyExactOutput(cfg.marketPool, output, params.amountSpecified);
 
         emit BuyExecuted(key.toId(), quote, output, quoteIn, tokensOut, exactInput);
         return (IHooks.beforeSwap.selector, hookDelta, 0);
     }
 
+    /// @dev The swapper's specified quoteIn is taken in full and charged in full; the
+    ///      market pulls the exact oracle cost of the tokens it delivers (<= quoteIn),
+    ///      so any inversion dust accrues on the hook alongside spread margin, awaiting
+    ///      the same sweep.
     function _buyExactInput(address marketPool, Currency input, Currency output, int256 amountSpecified)
         internal
         returns (uint256 quoteIn, uint256 tokensOut, BeforeSwapDelta hookDelta)
     {
         quoteIn = uint256(-amountSpecified);
         _takeChecked(input, quoteIn);
-        tokensOut = market.buyFromPoolExactQuote(marketPool, quoteIn, resellerCode, address(this));
+        (tokensOut,) = market.buyFromPoolExactQuote(marketPool, quoteIn, resellerCode, address(this));
         _settle(output, tokensOut);
         hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), -tokensOut.toInt128());
     }
 
-    function _buyExactOutput(address marketPool, Currency input, Currency output, int256 amountSpecified)
+    /// @dev Single market call, single oracle read: buyFromPoolExactOut computes the
+    ///      cost inside priceBuy's one read, then calls fundBuy (below) so this hook
+    ///      can take exactly that cost from the PoolManager BEFORE the market's
+    ///      pull-exact transferFrom — the Phase 0 funding-order fix. All-or-nothing
+    ///      is enforced market-side (FillShortfall), so tokensFilled == tokensOut
+    ///      whenever this returns.
+    function _buyExactOutput(address marketPool, Currency output, int256 amountSpecified)
         internal
         returns (uint256 quoteIn, uint256 tokensOut, BeforeSwapDelta hookDelta)
     {
         tokensOut = uint256(amountSpecified);
-        uint256 quoted = market.quoteBuyFromPool(marketPool, tokensOut);
-        _takeChecked(input, quoted);
-        (uint256 tokensFilled, uint256 quotePaid) =
-            market.buyFromPool(marketPool, tokensOut, resellerCode, address(this));
-        if (tokensFilled != tokensOut) revert FillShortfall(tokensOut, tokensFilled);
-        if (quotePaid != quoted) revert QuoteExecutionMismatch(quoted, quotePaid);
+        (, uint256 quotePaid) = market.buyFromPoolExactOut(marketPool, tokensOut, resellerCode, address(this));
         quoteIn = quotePaid;
         _settle(output, tokensOut);
         hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), quoteIn.toInt128());
+    }
+
+    // -------------------------------------------------------------------------
+    // Funding callback (IFlowstateBuyFunder)
+    // -------------------------------------------------------------------------
+
+    /// @notice Funding callback from FlowstateMarket.buyFromPoolExactOut: the market
+    ///         has computed the exact band-checked cost inside its single oracle read
+    ///         and is about to pull it; take exactly that amount from the PoolManager.
+    /// @dev Only the market may call. Safe by construction outside this hook's own
+    ///      beforeSwap frame: manager.take reverts outside an unlock, and inside any
+    ///      unrelated unlock it creates PoolManager debt on this hook that nothing
+    ///      settles, so the transaction reverts — funds cannot be extracted. The
+    ///      explicit ManagerReservesExceeded check (scope §2.1) is preserved inside
+    ///      the callback via _takeChecked.
+    function fundBuy(address quoteAsset, uint256 cost) external {
+        if (msg.sender != address(market)) revert NotMarket();
+        _takeChecked(Currency.wrap(quoteAsset), cost);
     }
 
     function afterSwap(address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)
