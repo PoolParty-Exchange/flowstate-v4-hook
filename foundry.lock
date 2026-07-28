@@ -1,0 +1,20 @@
+{
+  "lib/forge-std": {
+    "branch": {
+      "name": "master",
+      "rev": "f355ba17303d62d9bf5dcc9d970670c1e1aba5ca"
+    }
+  },
+  "lib/v4-core": {
+    "branch": {
+      "name": "main",
+      "rev": "46c6834698c48bc4a463a86d8420f4eb1d7f3b75"
+    }
+  },
+  "lib/v4-periphery": {
+    "branch": {
+      "name": "main",
+      "rev": "3245c3cb99c48fa1dc2459c3b60abc37d4294aba"
+    }
+  }
+}
