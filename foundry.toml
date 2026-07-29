@@ -4,12 +4,21 @@ out = "out"
 libs = ["lib"]
 test = "test"
 script = "script"
-solc = "0.8.26"
+# No `solc` pin: the hook is 0.8.26 (exact pragma, the version it ships at) and the
+# vendored real Flowstate contracts in test/real are 0.8.29 (their own exact pragma).
+# Auto-detect puts each in its own compilation unit; nothing bridges them at the
+# Solidity level (see test/fork/RealStackDeployer.sol).
 evm_version = "cancun"
 optimizer = true
 optimizer_runs = 200
 via_ir = true
-gas_reports = ["FlowstateC1Hook", "PoolSwapTest", "MockFlowstateMarket", "V4Quoter"]
+gas_reports = [
+    "FlowstateC1Hook",
+    "PoolSwapTest",
+    "FlowstateMarket",
+    "FlowstatePool",
+    "V4Quoter",
+]
 
 [profile.default.fuzz]
 runs = 64

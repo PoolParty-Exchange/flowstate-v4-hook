@@ -4,8 +4,11 @@ pragma solidity ^0.8.26;
 /// @notice Minimal market surface the V4 hook consumes — the FINAL Phase 1 signatures
 ///         of the pass-1 FlowstateMarket (pull-exact model) plus the additive
 ///         exact-quote entry-point pair from build scope §2.2 (PoolParty_Contracts
-///         PR "FlowstateMarket: exact-quote entry-point pair"), so the Phase 0 mock
-///         and the real market are interchangeable behind this interface.
+///         PR #8, on origin/main).
+/// @dev Verified against the REAL FlowstateMarket on an RH fork (Phase 1 final): the
+///      whole fork suite runs the hook against the deployed pass-1 contracts, and the
+///      Phase 0 mock has been deleted. Signature drift on the market side is therefore
+///      a compile/test failure here, not a silent divergence.
 /// @dev Pull-exact: the market computes the band-checked oracle cost internally and
 ///      pulls exactly that many quote-asset units from msg.sender via transferFrom,
 ///      then delivers the tokens to `buyer`. The pair is all-or-nothing with a typed

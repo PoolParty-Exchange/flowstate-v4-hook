@@ -47,19 +47,13 @@ abstract contract SpreadTestBase is ForkTestBase {
         _setRungs(ceilings, extras);
     }
 
-    // -- expectation helpers (mirror the mock market's rate exactly) ----------
+    // -- expectation helpers --------------------------------------------------
+    // _marketTokensFor / _marketCostFor live on ForkTestBase and now mirror the REAL
+    // FlowstatePool's arithmetic (floor inversion, ceil cost, RATE_SCALE = 1e18).
 
     function _ceilBps(uint256 amount, uint256 bps) internal pure returns (uint256) {
         if (bps == 0) return 0;
         return (amount * bps + 9_999) / 10_000;
-    }
-
-    function _marketTokensFor(uint256 quoteIn) internal view returns (uint256) {
-        return quoteIn * market.rateNum() / market.rateDen();
-    }
-
-    function _marketCostFor(uint256 tokens) internal view returns (uint256) {
-        return (tokens * market.rateDen() + market.rateNum() - 1) / market.rateNum();
     }
 
     struct ExactInExpectation {
@@ -259,12 +253,14 @@ contract SpreadParityForkTest is SpreadTestBase {
 ///         bps by more than one wei, in both directions, including against a market
 ///         rate whose inversion genuinely loses dust to the floor.
 contract SpreadRoundingForkTest is SpreadTestBase {
-    /// @dev A rate with rateDen > 1 so the market's floor inversion actually drops
-    ///      units (with the default 2e12/1 rate the inversion is exact and the only
-    ///      residue is the hook's own carve).
+    /// @dev A rate that does not divide 1e18 evenly, so FlowstatePool's floor inversion
+    ///      in priceBuyExactQuote actually drops units (at the default 5e5 rate the
+    ///      inversion is exact and the only residue is the hook's own carve).
+    ///      Re-anchoring through the market's admin escape hatch is required: a bare
+    ///      oracle move of this size would trip the pool's anchor band.
     function _setAwkwardRate() internal {
-        market.setRate(3e12, 7);
-        token.mint(address(market), 10_000_000e18);
+        _setOracleRate(AWKWARD_ORACLE_RATE);
+        _contributeInventory(10_000_000e18);
     }
 
     function _assertExactInRounding(uint256 quoteIn) internal {
@@ -274,14 +270,14 @@ contract SpreadRoundingForkTest is SpreadTestBase {
         uint256 spreadBefore = hook.accruedSpreadMargin(usdg);
         uint256 dustBefore = hook.accruedDust(usdg);
         uint256 hookBalBefore = IERC20(USDG).balanceOf(address(hook));
-        uint256 marketBefore = IERC20(USDG).balanceOf(address(market));
+        uint256 sunkBefore = _quoteReceived();
 
         vm.prank(swapper);
         _swapBuy(-int256(quoteIn), "");
 
         uint256 spread = hook.accruedSpreadMargin(usdg) - spreadBefore;
         uint256 dust = hook.accruedDust(usdg) - dustBefore;
-        uint256 quotePaid = IERC20(USDG).balanceOf(address(market)) - marketBefore;
+        uint256 quotePaid = _quoteReceived() - sunkBefore;
 
         assertEq(quotePaid, e.quotePaid, "market pulled != expected oracle cost");
 
@@ -389,6 +385,21 @@ contract SpreadRoundingForkTest is SpreadTestBase {
         uint256[4] memory sizes = [uint256(1e12 + 1), uint256(3e15 + 7), uint256(101e18 + 3), uint256(999e18)];
         for (uint256 i = 0; i < sizes.length; i++) {
             _assertExactOutRounding(sizes[i]);
+        }
+    }
+
+    /// @dev Both dust sources present at once: the hook's own spread carve AND the real
+    ///      pool's floor inversion, which only leaves a residue above RATE_SCALE (see
+    ///      `RealStackFeeForkTest.test_MarketInversion*` — the aeWETH-quoted shape).
+    ///      Conservation `quotePaid + spread + dust == quoteIn` must still hold exactly.
+    function test_Rounding_ExactIn_WithMarketSideInversionDust() public {
+        _setOracleRate(DUST_ORACLE_RATE);
+        _setBase(23);
+        _setShipRungs();
+        uint256[4] memory sizes =
+            [uint256(100_000_000_000), uint256(99_999_999_991), uint256(12_345_678_901), uint256(7_777_777_777)];
+        for (uint256 i = 0; i < sizes.length; i++) {
+            _assertExactInRounding(sizes[i]);
         }
     }
 
@@ -619,7 +630,7 @@ contract SpreadConfigForkTest is SpreadTestBase {
         vm.expectRevert();
         hook.setSizeRungs(usdg, new FlowstateC1Hook.SpreadRung[](0));
         vm.expectRevert();
-        hook.registerPair(usdg, Currency.wrap(address(token)), address(market), 0);
+        hook.registerPair(usdg, Currency.wrap(address(token)), pool, 0);
         vm.expectRevert();
         hook.setResellerCode("x");
         vm.stopPrank();
@@ -645,7 +656,7 @@ contract SpreadConfigForkTest is SpreadTestBase {
     function test_BaseSpreadFloor_AppliesToRegisterPairToo() public {
         hook.setBaseSpreadFloor(16);
         vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.SpreadOutOfRange.selector, uint16(0), uint16(16), uint16(1_000)));
-        hook.registerPair(usdg, Currency.wrap(AEWETH), address(market), 0);
+        hook.registerPair(usdg, Currency.wrap(AEWETH), pool, 0);
     }
 
     /// @dev Raising the floor deliberately does NOT retro-check registered pairs, and
@@ -742,7 +753,7 @@ contract SpreadConfigForkTest is SpreadTestBase {
     }
 
     function test_RegisterPair_StoresBaseSpread() public {
-        hook.registerPair(usdg, Currency.wrap(address(token)), address(market), 42);
+        hook.registerPair(usdg, Currency.wrap(address(token)), pool, 42);
         assertEq(hook.spreadBpsFor(usdg, Currency.wrap(address(token)), 1e6), 42);
     }
 }

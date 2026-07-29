@@ -430,8 +430,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, input, quoteIn);
         uint256 netQuote = spreadBps == 0 ? quoteIn : quoteIn * BPS_DENOMINATOR / (BPS_DENOMINATOR + spreadBps);
         // Sub-dust ticket: the carve leaves the market nothing to price. Raise the
-        // explicit typed error rather than letting the market's ZeroAmount surface for
-        // a hook-caused condition (same posture as ManagerReservesExceeded, §2.1).
+        // explicit typed error rather than letting FlowstatePool's InvalidAmount
+        // surface for a hook-caused condition (same posture as ManagerReservesExceeded,
+        // §2.1).
         if (netQuote == 0) revert TradeTooSmallForSpread(quoteIn, spreadBps);
         _takeChecked(input, quoteIn);
         uint256 quotePaid;
