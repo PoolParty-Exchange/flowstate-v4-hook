@@ -10,12 +10,22 @@ import {console2} from "forge-std/console2.sol";
 /// @notice Cold vs warm gas for the quoter-parity path (scope §6 leans on the
 ///         same-block-cache distinction).
 ///
-///         Forge resets EIP-2929 access-list warmth per test function, so within one
-///         test the FIRST call is the cold measurement (cold storage on the pool
-///         config, registry, mock market, USDG proxy) and the second identical call
-///         in the same block is the warm one. The swap test issues no quoter call
-///         first, so its cold swap matches routed reality: a backend's eth_call
-///         quote warms nothing for the on-chain swap that follows.
+///         Two independent things are being separated here, and against the REAL
+///         market they finally differ:
+///           - EIP-2929 access-list warmth, which forge resets per test function, so
+///             the FIRST call in a test is cold on the pool config, registry, market,
+///             pool ledger and USDG proxy;
+///           - FlowstatePool's same-TIMESTAMP rate cache, which makes the second and
+///             later trades in one second skip the oracle call entirely. setUp (and
+///             each seasoning step) ends with `_expireRateCache()`, so every COLD
+///             number below includes a genuine oracle read + anchor band check.
+///         The Phase 0 mock market had no cache at all, so its "warm" column measured
+///         only storage warmth. NOTE for RH specifically: the chain runs ~10 blocks/s,
+///         so the cache is shared across roughly ten consecutive BLOCKS, not one.
+///
+///         The swap test issues no quoter call first, so its cold swap matches routed
+///         reality: a backend's eth_call quote warms nothing for the on-chain swap
+///         that follows.
 contract GasColdWarmForkTest is ForkTestBase {
     uint128 constant QUOTE_IN = 1_000e6;
     uint128 constant TOKENS_OUT = 2_000e18;
@@ -110,6 +120,7 @@ contract GasColdWarmSeasonedForkTest is GasColdWarmForkTest {
         super.setUp();
         vm.prank(swapper);
         _swapBuy(-int256(10e6), "");
+        _expireRateCache(); // seasoning must not leave the rate cache hot
     }
 }
 
@@ -134,5 +145,6 @@ contract GasColdWarmSeasonedSpreadForkTest is GasColdWarmForkTest {
 
         vm.prank(swapper);
         _swapBuy(-int256(10e6), "");
+        _expireRateCache(); // seasoning must not leave the rate cache hot
     }
 }

@@ -24,7 +24,7 @@ contract ManagerReservesForkTest is ForkTestBase {
     function test_LargestSafeTicket_FullUsdgReserveExecutes_OneWeiMoreReverts() public {
         uint256 ceiling = IERC20(USDG).balanceOf(POOL_MANAGER);
         uint256 tokensNeeded = ceiling * RATE_NUM / RATE_DEN;
-        token.mint(address(market), tokensNeeded);
+        _contributeInventory(tokensNeeded);
         deal(USDG, swapper, ceiling + 1);
 
         uint256 snapshot = vm.snapshotState();

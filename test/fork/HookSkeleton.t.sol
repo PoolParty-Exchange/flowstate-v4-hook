@@ -66,7 +66,7 @@ contract HookSkeletonForkTest is ForkTestBase {
         }
     }
 
-    function test_BuySwap_ExactInput_DeliversAtMockRate() public {
+    function test_BuySwap_ExactInput_DeliversAtOracleRate() public {
         uint256 quoteIn = 1_000e6;
         uint256 tokBefore = token.balanceOf(swapper);
         uint256 usdgBefore = IERC20(USDG).balanceOf(swapper);
@@ -75,7 +75,8 @@ contract HookSkeletonForkTest is ForkTestBase {
         _swapBuy(-int256(quoteIn), "");
 
         assertEq(IERC20(USDG).balanceOf(swapper), usdgBefore - quoteIn);
-        assertEq(token.balanceOf(swapper) - tokBefore, quoteIn * RATE_NUM / RATE_DEN);
+        assertEq(token.balanceOf(swapper) - tokBefore, _marketTokensFor(quoteIn));
+        assertEq(token.balanceOf(swapper) - tokBefore, quoteIn * RATE_NUM / RATE_DEN, "fixture equivalence holds");
     }
 
     function test_HookDataIgnored_ByteIdenticalDeltas() public {
