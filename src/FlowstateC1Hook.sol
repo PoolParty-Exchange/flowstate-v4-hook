@@ -17,6 +17,7 @@ import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IFlowstateMarketMinimal} from "./interfaces/IFlowstateMarketMinimal.sol";
 import {IFlowstateBuyFunder} from "./interfaces/IFlowstateBuyFunder.sol";
+import {IWETH9} from "./interfaces/IWETH9.sol";
 
 /// @title FlowstateC1Hook
 /// @notice Uniswap V4 custom-curve hook adapting routed BUY flow onto Flowstate C1 pool
@@ -56,6 +57,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     error LpFeeMustBeZero();
     error LiquidityNotAllowed();
     error SellDirectionNotSupported();
+    error NativeQuoteUnsupported(); // registerPair with a native quote on a chain with no weth9 configured
+    error UnexpectedNativeSender(address sender);
     error ManagerReservesExceeded(Currency currency, uint256 requested, uint256 available);
     error SpreadOutOfRange(uint16 bps, uint16 floorBps, uint16 maxBps);
     error TradeTooSmallForSpread(uint256 quoteIn, uint256 spreadBps);
@@ -74,6 +77,12 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         exact-quote entry-point pair incl. the fundBuy funding callback; the
     ///         Phase 0 mock implements the identical interface for fork tests).
     IFlowstateMarketMinimal public immutable market;
+
+    /// @notice Wrapped-native (aeWETH on RH). Native-quoted V4 pools are served by
+    ///         wrapping the taken native into this asset before the market call, so
+    ///         ONE wrapped-quote C1 pool serves BOTH V4 currency representations.
+    ///         address(0) disables native-quote support on chains without a wrapper.
+    IWETH9 public immutable weth9;
 
     // -------------------------------------------------------------------------
     // Constants
@@ -94,6 +103,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         bool quoteIsCurrency0;
         bool registered;
         uint16 baseSpreadBps; // packed into the same slot: zero hot-path cost
+        // The ERC-20 the market is actually called with: the quote currency itself,
+        // or weth9 when the V4 quote currency is native (the hook wraps in between).
+        address marketAsset;
     }
 
     /// @notice One size-adjustment rung (scope §5): trades whose quote notional is
@@ -102,6 +114,10 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         uint128 notionalCeiling; // in raw quote-asset units
         uint16 extraBps;
     }
+
+    /// @dev One-frame flag armed by _buyExactOutput for native-quoted pairs and read
+    ///      by fundBuy inside the same swap; always cleared before the frame returns.
+    bool private _takeNativeInCallback;
 
     /// @notice Pair registry gating pool initialization and resolving swap-time config.
     ///         Keyed by keccak256(currency0, currency1) in V4 sorted order.
@@ -183,12 +199,15 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     /// @param _poolManager canonical PoolManager for this chain.
     /// @param _market      FlowstateMarket (must be non-zero and code-bearing).
     /// @param _owner       admin for the pair registry and reseller code.
-    constructor(address _poolManager, address _market, address _owner) Ownable(_owner) {
+    constructor(address _poolManager, address _market, address _owner, address _weth9)
+        Ownable(_owner)
+    {
         if (_poolManager == address(0) || _market == address(0)) revert ZeroAddress();
         if (_market.code.length == 0) revert ZeroAddress();
 
         poolManager = IPoolManager(_poolManager);
         market = IFlowstateMarketMinimal(_market);
+        weth9 = IWETH9(_weth9); // address(0) = native quotes disabled on this chain
 
         Hooks.validateHookPermissions(
             this,
@@ -230,15 +249,25 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     {
         if (marketPool == address(0)) revert ZeroAddress();
         _checkBaseSpread(baseSpreadBps);
+        // native quote (v1 decision, 2026-07-30): served by wrapping into weth9, so
+        // the market-side asset for a native pair IS the wrapper
+        address marketAsset;
+        if (quote.isAddressZero()) {
+            if (address(weth9) == address(0)) revert NativeQuoteUnsupported();
+            marketAsset = address(weth9);
+        } else {
+            marketAsset = Currency.unwrap(quote);
+        }
         (Currency c0, Currency c1) = _sort(quote, token);
         bool quoteIsCurrency0 = Currency.unwrap(quote) == Currency.unwrap(c0);
         pairs[_pairKey(c0, c1)] = PairConfig({
             marketPool: marketPool,
             quoteIsCurrency0: quoteIsCurrency0,
             registered: true,
-            baseSpreadBps: baseSpreadBps
+            baseSpreadBps: baseSpreadBps,
+            marketAsset: marketAsset
         });
-        IERC20(Currency.unwrap(quote)).forceApprove(address(market), type(uint256).max);
+        IERC20(marketAsset).forceApprove(address(market), type(uint256).max);
         emit PairRegistered(c0, c1, marketPool, quoteIsCurrency0);
         emit BaseSpreadUpdated(c0, c1, baseSpreadBps);
     }
@@ -435,9 +464,12 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         // §2.1).
         if (netQuote == 0) revert TradeTooSmallForSpread(quoteIn, spreadBps);
         _takeChecked(input, quoteIn);
+        // native quote: wrap the WHOLE take (cost + spread + dust) so accrued margin
+        // is held uniformly in the wrapper and the sweep path stays ERC-20-only
+        if (input.isAddressZero()) weth9.deposit{value: quoteIn}();
         uint256 quotePaid;
         (tokensOut, quotePaid) =
-            market.buyFromPoolExactQuote(cfg.marketPool, Currency.unwrap(input), netQuote, resellerCode, address(this));
+            market.buyFromPoolExactQuote(cfg.marketPool, cfg.marketAsset, netQuote, resellerCode, address(this));
         _settle(output, tokensOut);
         spreadAccrued = _ceilBps(quotePaid, spreadBps);
         dustAccrued = quoteIn - quotePaid - spreadAccrued; // >= 0 by the floor carve (proven in tests)
@@ -461,15 +493,25 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         returns (uint256 quoteIn, uint256 tokensOut, uint256 spreadAccrued, uint256 dustAccrued, BeforeSwapDelta hookDelta)
     {
         tokensOut = uint256(amountSpecified);
+        bool nativeIn = input.isAddressZero();
+        // fundBuy receives the MARKET asset (the wrapper, for a native pair); this
+        // one-frame flag tells it to take native from the manager and wrap instead
+        if (nativeIn) _takeNativeInCallback = true;
         (, uint256 cost) =
-            market.buyFromPoolExactOut(cfg.marketPool, Currency.unwrap(input), tokensOut, resellerCode, address(this));
+            market.buyFromPoolExactOut(cfg.marketPool, cfg.marketAsset, tokensOut, resellerCode, address(this));
+        if (nativeIn) _takeNativeInCallback = false;
         uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, input, cost);
         spreadAccrued = _ceilBps(cost, spreadBps);
         dustAccrued = 0; // exact-output has no carve: cost is exact, spread is exact
         quoteIn = cost + spreadAccrued;
         int256 delta = poolManager.currencyDelta(address(this), input);
         uint256 takenInCallback = delta < 0 ? uint256(-delta) : 0; // cost if fundBuy ran, else 0
-        if (quoteIn > takenInCallback) _takeChecked(input, quoteIn - takenInCallback);
+        if (quoteIn > takenInCallback) {
+            _takeChecked(input, quoteIn - takenInCallback);
+            // spread margin (and, when the callback was skipped, the cost too until
+            // it was pulled above) is wrapped so margin custody is wrapper-uniform
+            if (nativeIn) weth9.deposit{value: quoteIn - takenInCallback}();
+        }
         _settle(output, tokensOut);
         hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), quoteIn.toInt128());
     }
@@ -489,7 +531,21 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///      the callback via _takeChecked.
     function fundBuy(address quoteAsset, uint256 cost) external {
         if (msg.sender != address(market)) revert NotMarket();
-        _takeChecked(Currency.wrap(quoteAsset), cost);
+        if (_takeNativeInCallback) {
+            // native-quoted pair: the manager owes NATIVE; take it and wrap so the
+            // market's pull-exact transferFrom of the wrapper succeeds
+            _takeChecked(Currency.wrap(address(0)), cost);
+            weth9.deposit{value: cost}();
+        } else {
+            _takeChecked(Currency.wrap(quoteAsset), cost);
+        }
+    }
+
+    /// @dev Native arrives from exactly two counterparties: the PoolManager (take)
+    ///      and nobody else — weth9.deposit never sends native back. Reject strays
+    ///      so accounting never has to explain an unexplained balance.
+    receive() external payable {
+        if (msg.sender != address(poolManager)) revert UnexpectedNativeSender(msg.sender);
     }
 
     function afterSwap(address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)

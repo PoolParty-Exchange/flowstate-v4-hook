@@ -139,9 +139,9 @@ abstract contract ForkTestBase is RealStackDeployer {
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this))
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH)
         );
-        hook = new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this));
+        hook = new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this), AEWETH);
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
 
         // Conservative ship default: zero base spread, no rung schedule (the spread
