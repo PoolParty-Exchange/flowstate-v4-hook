@@ -40,7 +40,7 @@ interface IFlowstateMarketTest {
     ) external;
 
     // registry / liquidity
-    function createPool(address token, address quoteAsset, uint256 amount, uint16 anchorBandBps)
+    function createPool(address token, uint256 amount, uint16 anchorBandBps)
         external
         returns (address pool);
     function contributeTokens(address pool, uint256 amount, address contributionOwner) external;
@@ -52,22 +52,22 @@ interface IFlowstateMarketTest {
     function buybackReceiver() external view returns (address);
 
     // trading
-    function buyFromPool(address pool, uint256 amount, string calldata resellerCode, address buyer)
+    function buyFromPool(address pool, address asset, uint256 amount, string calldata resellerCode, address buyer)
         external
         returns (uint256 tokensFilled, uint256 quotePaid);
-    function buyFromPoolExactQuote(address pool, uint256 quoteIn, string calldata resellerCode, address buyer)
+    function buyFromPoolExactQuote(address pool, address asset, uint256 quoteIn, string calldata resellerCode, address buyer)
         external
         returns (uint256 tokensFilled, uint256 quotePaid);
-    function buyFromPoolExactOut(address pool, uint256 tokenAmountOut, string calldata resellerCode, address buyer)
+    function buyFromPoolExactOut(address pool, address asset, uint256 tokenAmountOut, string calldata resellerCode, address buyer)
         external
         returns (uint256 tokensFilled, uint256 quotePaid);
-    function quoteBuyFromPool(address pool, uint256 amount) external view returns (Quote memory);
+    function quoteBuyFromPool(address pool, address asset, uint256 amount) external view returns (Quote memory);
 
     // admin
     function setQuoteAsset(address asset, bool approved) external;
     function setFeeBps(address token, uint16 feeBps) external;
     function setAnchorBand(address pool, uint16 bandBps) external;
-    function resetAnchor(address pool) external;
+    function resetAnchor(address pool, address asset) external;
     function setPriceOracle(address oracle) external;
     function pause() external;
     function unpause() external;
@@ -87,13 +87,12 @@ interface IFlowstateMarketTest {
 
 interface IFlowstatePoolTest {
     function inventoryToken() external view returns (address);
-    function quoteAsset() external view returns (address);
     function factory() external view returns (address);
     function tokenBalance() external view returns (uint256);
     function anchorBandBps() external view returns (uint16);
     function poolPaused() external view returns (bool);
-    function claimableQuote(address user) external view returns (uint256);
-    function anchor() external view returns (uint192 rate, uint64 time, uint32 epoch);
+    function claimableQuote(address asset, address user) external view returns (uint256);
+    function anchorOf(address asset) external view returns (uint192 rate, uint64 time, uint192 ema, uint32 epoch);
     function previewBuy(uint256 amount, address oracle, uint32 epoch)
         external
         view

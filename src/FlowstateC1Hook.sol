@@ -436,7 +436,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         if (netQuote == 0) revert TradeTooSmallForSpread(quoteIn, spreadBps);
         _takeChecked(input, quoteIn);
         uint256 quotePaid;
-        (tokensOut, quotePaid) = market.buyFromPoolExactQuote(cfg.marketPool, netQuote, resellerCode, address(this));
+        (tokensOut, quotePaid) =
+            market.buyFromPoolExactQuote(cfg.marketPool, Currency.unwrap(input), netQuote, resellerCode, address(this));
         _settle(output, tokensOut);
         spreadAccrued = _ceilBps(quotePaid, spreadBps);
         dustAccrued = quoteIn - quotePaid - spreadAccrued; // >= 0 by the floor carve (proven in tests)
@@ -460,7 +461,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         returns (uint256 quoteIn, uint256 tokensOut, uint256 spreadAccrued, uint256 dustAccrued, BeforeSwapDelta hookDelta)
     {
         tokensOut = uint256(amountSpecified);
-        (, uint256 cost) = market.buyFromPoolExactOut(cfg.marketPool, tokensOut, resellerCode, address(this));
+        (, uint256 cost) =
+            market.buyFromPoolExactOut(cfg.marketPool, Currency.unwrap(input), tokensOut, resellerCode, address(this));
         uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, input, cost);
         spreadAccrued = _ceilBps(cost, spreadBps);
         dustAccrued = 0; // exact-output has no carve: cost is exact, spread is exact

@@ -84,7 +84,8 @@ contract RealStackWiringForkTest is RealStackTestBase {
         assertEq(market.poolByPair(address(token), USDG), pool, "pair registry");
         assertEq(poolContract.factory(), address(market), "pool points back at the market");
         assertEq(poolContract.inventoryToken(), address(token));
-        assertEq(poolContract.quoteAsset(), USDG);
+        (uint192 seededRate,,,) = poolContract.anchorOf(USDG);
+        assertEq(uint256(seededRate), ORACLE_RATE, "USDG anchor seeded at creation (multi-asset)");
         assertEq(poolContract.tokenBalance(), INITIAL_INVENTORY, "holder-funded inventory");
         assertTrue(address(market) != stack.marketImpl, "market is behind a UUPS proxy");
     }
@@ -143,7 +144,7 @@ contract RealStackWiringForkTest is RealStackTestBase {
         uint128 quoteIn = 1_000e6;
         uint256 tokensExpected = _marketTokensFor(quoteIn);
 
-        IFlowstateMarketTest.Quote memory q = market.quoteBuyFromPool(pool, tokensExpected);
+        IFlowstateMarketTest.Quote memory q = market.quoteBuyFromPool(pool, USDG, tokensExpected);
         assertTrue(q.available, "market quoter must offer the pool");
         assertEq(q.fillableAmount, tokensExpected);
         assertEq(q.quoteAmount, _marketCostFor(tokensExpected), "buyer pays raw oracle cost");
@@ -181,7 +182,7 @@ contract RealStackFeeForkTest is RealStackTestBase {
         vm.prank(swapper);
         _swapBuy(-int256(uint256(quoteIn)), "");
         assertEq(
-            poolContract.claimableQuote(lister),
+            poolContract.claimableQuote(USDG, lister),
             quoteIn - (quoteIn * 1 / 10_000),
             "contributor credited net of the SELLER-side fee"
         );
@@ -271,14 +272,14 @@ contract RealStackOracleForkTest is RealStackTestBase {
     ///      anchorBandBps x widen must decline, and it must decline in the quoter and
     ///      the swap alike — the failure shape scope §8 calls acceptable.
     function test_AnchorBand_OutOfBandDeclinesInQuoterAndSwap() public {
-        assertEq(poolContract.anchorBandBps(), 1000, "default 10% band");
+        assertEq(poolContract.anchorBandBps(), 500, "default 5% band (tightened 30 Jul)");
         // setUp left the anchor 120s stale => widen 3 => 30% allowed. Double the rate.
         oracle.setRate(address(token), USDG, ORACLE_RATE * 2);
 
         _assertDeclinesIdentically(bytes4(keccak256("RateOutOfBand()")), 1_000e6, "RateOutOfBand");
 
         // the admin escape hatch restores service
-        market.resetAnchor(pool);
+        market.resetAnchor(pool, USDG);
         _expireRateCache();
         vm.prank(swapper);
         _swapBuy(-1_000e6, "");
@@ -290,7 +291,7 @@ contract RealStackOracleForkTest is RealStackTestBase {
         oracle.setRate(address(token), USDG, ORACLE_RATE * 105 / 100); // +5%, inside 30%
         vm.prank(swapper);
         _swapBuy(-1_000e6, "");
-        (uint192 anchorRate,,) = poolContract.anchor();
+        (uint192 anchorRate,,,) = poolContract.anchorOf(USDG);
         assertEq(uint256(anchorRate), ORACLE_RATE * 105 / 100, "anchor advanced to the fresh read");
     }
 

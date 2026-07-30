@@ -58,7 +58,7 @@ contract LiveOracleGasForkTest is ForkTestBase {
         deal(AEWETH, lister, LIVE_INVENTORY);
         vm.startPrank(lister);
         inv.approve(address(market), type(uint256).max);
-        pool = market.createPool(AEWETH, USDG, LIVE_INVENTORY, 0);
+        pool = market.createPool(AEWETH, LIVE_INVENTORY, 0);
         vm.stopPrank();
 
         (address hookAddress, bytes32 salt) = HookMiner.find(

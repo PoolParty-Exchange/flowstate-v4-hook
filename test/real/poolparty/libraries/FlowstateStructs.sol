@@ -23,10 +23,33 @@ library FlowstateStructs {
     }
 
     /// @notice Factory-side registry entry for a deployed pool.
+    /// @dev Multi-asset change: a pool is keyed by its inventory token alone; the
+    ///      quote asset became a per-trade parameter, so the record no longer
+    ///      carries one.
     struct PoolRecord {
         address inventoryToken;        // slot A
         bool exists;                   // slot A
-        address quoteAsset;            // slot B
+    }
+
+    /// @notice Per-quote-asset anchor state — the pool's own price historian for
+    ///         one (inventoryToken, asset) rate. Three slots (slot C is touched only
+    ///         while the anchor is stale, never on the trading hot path).
+    /// @dev slot A: lastRate (24B) + lastRateTime (8B);
+    ///      slot B: emaRate (24B) + lastRateEpoch (4B);
+    ///      slot C: pendingRate (24B) + pendingSince (8B) — two-phase revive state.
+    ///      lastRate == 0 ⇔ never seeded ⇒ the asset is untradeable in this pool
+    ///      until the factory seeds it (createPool or the admin resetAnchor lane).
+    ///      A pending entry is only VALID while pendingSince > lastRateTime: any
+    ///      accepted anchor write stamps a fresher lastRateTime, which implicitly
+    ///      invalidates leftovers from earlier stale episodes without costing the
+    ///      hot path a slot-C write.
+    struct Anchor {
+        uint192 lastRate;   // last ACCEPTED instantaneous rate
+        uint64 lastRateTime;
+        uint192 emaRate;    // slow anchor: EMA of accepted rates, tau = ANCHOR_TAU
+        uint32 lastRateEpoch;
+        uint192 pendingRate;  // revive reference under public contest (0 = none)
+        uint64 pendingSince;
     }
 
     /// @notice Per-fill fee context, computed by the factory and passed to the pool

@@ -12,25 +12,64 @@ import "./libraries/FlowstateEvents.sol";
 
 /**
  * @title FlowstatePool
- * @notice Fair-price pool for one (inventoryToken, quoteAsset) pair. Beacon-proxy
- *         implementation cloned per pool. Pass-1 rebuild of publicPool.sol.
+ * @notice Fair-price pool for ONE inventory token, tradeable against EVERY approved
+ *         quote asset (multi-asset change, stage one). Beacon-proxy implementation
+ *         cloned per pool. Pass-1 rebuild of publicPool.sol.
  *
- * @dev Spec: docs/FLOWSTATE_PASS1_IMPLEMENTATION_PLAN_2026-07-16.md §3.2.
+ * @dev Spec: docs/FLOWSTATE_PASS1_IMPLEMENTATION_PLAN_2026-07-16.md §3.2, as amended
+ *      by the multi-asset + anchor-hardening pass (roadmap items 1 and 2, 2026-07-30).
+ *
+ * MULTI-ASSET MODEL. The pool's identity is the inventory token alone. Buyers name
+ * the quote asset per trade; token-side depositors never choose one — their fill
+ * proceeds are credited in whatever asset each buy arrived in, so claimableQuote is
+ * per (asset, user) and a depositor may claim a mix (explained in depositor-facing
+ * material). The cash side (buy-back, ships OFF) deliberately runs in ONE designated
+ * asset per pool (`buybackAsset`): a per-asset cash FIFO would multiply the sell
+ * path's complexity for a feature not yet enabled anywhere. Sellers are paid in that
+ * designated asset.
  *
  * Fee incidence (single model, both legs): the fee is always levied on the
- * pool-payout leg, denominated in the quote asset. On a BUY the token-side
+ * pool-payout leg, denominated in the TRADED quote asset. On a BUY the token-side
  * contributors (sellers) pay it — they are credited quotePaid − fee. On a SELL
  * (M2) the seller receives quoteGross − fee. Buyers never pay the fee.
  *
- * Anchor band: the pool is its own one-slot price historian (the 1inch oracle is
- * spot-only). A fresh oracle read must sit within anchorBandBps × widen of the
- * stored anchor, where widen = 1 + elapsedSeconds/60 capped at 4 — an atomic
- * flash-crash reverts against the pre-attack anchor, while natural drift on an
- * idle pool heals within minutes instead of bricking the pool. The anchor is
- * SEEDED at pool creation from the factory's listability read, so no unchecked
- * first trade exists. An oracle-address migration at the factory bumps its epoch;
- * a pool seeing a new epoch reseeds band-check-free on its next trade — safe
- * because setPriceOracle is timelocked (announced), never attacker-triggerable.
+ * ANCHOR MODEL (hardened — bopAMM review §3.4 items 1/3/4; items 2 and 5 were
+ * considered and rejected). One anchor per quote asset, since token/USDC and
+ * token/WETH are different rates. Each anchor stores the last ACCEPTED rate, its
+ * timestamp, and an EMA of accepted rates (tau = ANCHOR_TAU). A fresh oracle read
+ * must pass BOTH checks:
+ *   step band — within anchorBandBps × widen of the last accepted rate, where
+ *               widen = 1 + elapsed/60 capped at 4 (max 20% at the 5% default).
+ *               Bounds any single jump; an atomic flash-crash reverts against the
+ *               pre-attack anchor.
+ *   walk band — within anchorBandBps × WALK_BAND_MULT of the EMA (10% at the 5%
+ *               default). Bounds CUMULATIVE travel: a patient attacker nudging the
+ *               venue price block after block (each step inside the band)
+ *               previously walked the anchor arbitrarily far; now the EMA trails
+ *               accepted rates with a 1h time constant, so walking at full speed
+ *               multiplies price by only e^(walkBand × T / tau) — doubling takes
+ *               ~7h of SUSTAINED venue manipulation at defaults, paying venue costs
+ *               the whole way. Genuine vertical pumps decline fills until the EMA
+ *               catches up — the correct side of the trade-off, because vertical
+ *               moves are when oracle-priced depositors get picked off. Pools that
+ *               need more room get a wider per-pool band (≤ 50%); the admin
+ *               resetAnchor lane is the liveness escape hatch (D3).
+ *   freshness — an anchor older than MAX_ANCHOR_AGE declines to trade instead of
+ *               silently accepting anything inside the fully-widened band. The
+ *               permissionless factory-routed pokeAnchor advances an anchor through
+ *               the identical checked path with no trade attached (keeper duty), so
+ *               an honest idle pool never goes stale. A pool that DOES go stale
+ *               revives through the two-phase public contest documented at
+ *               pokeAnchor, or through admin resetAnchor.
+ *   monotonic — the anchor timestamp never moves backwards (structural guard).
+ * Seeding is band-check-free BY DEFINITION (there is nothing to check against), so
+ * whoever picks the seeding moment picks the price. Therefore seeding is factory-
+ * gated only: createPool (the depositor picks the moment) and the admin resetAnchor
+ * lane (instant multisig). There is NO permissionless lazy seeding on the trade
+ * path. An unseeded asset simply declines. An oracle-address migration at the
+ * factory bumps its epoch; a pool seeing a new epoch reseeds band-check-free on its
+ * next trade per asset — safe because setPriceOracle is timelocked (announced),
+ * never attacker-triggerable.
  */
 contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     using SafeERC20 for IERC20;
@@ -44,10 +83,16 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     error AmountTooSmall();
     error NoOracleRate();
     error RateOutOfBand();
+    error AnchorWalkExceeded();
+    error AnchorNotSeeded();
+    error AnchorAlreadySeeded();
+    error StaleAnchor();
     error NotAContributor();
     error InsufficientPosition();
     error InvalidBand();
     error BuyBackDisabled();
+    error BuybackAssetUnset();
+    error CashSideNotEmpty();
     error SpreadTooHigh();
     error InvalidWindowConfig();
     error InvalidPriceSource();
@@ -62,28 +107,34 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     uint16 private constant MIN_BAND_BPS = 100;
     uint16 private constant MAX_BAND_BPS = 5000;
     uint16 private constant MAX_SPREAD_BPS = 1000; // buy-side spread ceiling: 10%
+    // anchor hardening (items 1/3/4 of the approved §3.4 bundle)
+    uint256 private constant ANCHOR_TAU = 1 hours;      // EMA time constant
+    uint256 private constant MAX_ANCHOR_AGE = 24 hours; // freshness bound (item 1)
+    uint256 private constant WALK_BAND_MULT = 2;        // walk band = 2 × anchorBandBps
+    uint256 private constant REVIVE_WINDOW = 30 minutes; // two-phase revive contest window
 
     // ── storage (fresh layout; OZ bases are ERC-7201 namespaced) ─────────
-    // slot 0 — identity + flags + epoch (single warm slot on the hot path)
+    // slot 0 — identity + flags (single warm slot on the hot path)
     address public inventoryToken;
     uint16 public anchorBandBps;
     uint8 public priceSource;      // RESERVED (parked) — always 0 = AGGREGATOR in pass 1
     bool public buyBackEnabled;    // ships OFF; sell path lands in M2
     bool public poolPaused;
     bool public isHidden;
-    uint32 public lastRateEpoch;
-    // slot 1
-    address public quoteAsset;
+    // slot 1 — the ONE asset the cash side / sell path runs in (multi-asset scope cut)
+    address public buybackAsset;
     uint16 public buySpreadBps;
     // slot 2
     address public factory;
-    // slot 3 — oracle anchor + same-timestamp cache
-    uint192 private lastRate;
-    uint64 private lastRateTime;
-    // slots 4/5 — inventory accounting
+    // per-asset anchors (2 slots each — see FlowstateStructs.Anchor)
+    mapping(address => FlowstateStructs.Anchor) private anchors;
+    // seeded-asset enumeration: claim loops and views iterate this, bounded by the
+    // chain's approved-asset set (small by policy)
+    address[] private seededAssetList;
+    // inventory accounting. quoteBalance is denominated in buybackAsset.
     uint256 public tokenBalance;
     uint256 public quoteBalance;
-    // slots 6/7 — buy-back window cap (used from M2)
+    // buy-back window cap (used from M2), denominated in buybackAsset
     uint128 public maxQuotePerWindow;
     uint128 public quoteSpentInWindow;
     uint64 public windowStart;
@@ -92,17 +143,18 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     FlowstateStructs.Node[] private tokenNodes;
     uint64 private tokenHead;
     uint64 private tokenTail;
-    // cash-side FIFO ledger (used from M2)
+    // cash-side FIFO ledger (used from M2; buybackAsset-denominated)
     FlowstateStructs.Node[] private cashNodes;
     uint64 private cashHead;
     uint64 private cashTail;
     mapping(address => uint256) private tokenIndex;
     mapping(address => uint256) private cashIndex;
-    // pool-local claim ledgers (plan D2)
-    mapping(address => uint256) public claimableQuote;
+    // pool-local claim ledgers (plan D2). claimableQuote is per (asset, user):
+    // buy proceeds arrive in whatever asset the buyer paid with.
+    mapping(address => mapping(address => uint256)) public claimableQuote;
     mapping(address => uint256) public claimableTokens;
     mapping(address => bool) public recycleOptIn;
-    uint256[24] private __gap;
+    uint256[22] private __gap;
 
     modifier onlyFactory() {
         if (msg.sender != factory) revert OnlyFactory();
@@ -114,36 +166,120 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         _disableInitializers();
     }
 
-    /// @param seedRate  the factory's listability getRate read at createPool — the anchor
-    ///                  is live from creation, so no unchecked first trade exists (R13).
-    ///                  Seeding from the creation-time read trades "creator front-runs the
-    ///                  first trade" for "creation is the first checked observation".
-    function initialize(
-        address token,
-        address quoteAsset_,
-        address factory_,
-        uint16 bandBps,
-        uint192 seedRate,
-        uint32 seedEpoch
-    ) external initializer {
-        if (token == address(0) || quoteAsset_ == address(0) || factory_ == address(0) || seedRate == 0) {
-            revert InvalidInitParams();
-        }
+    /// @dev Anchors are NOT seeded here — the factory seeds each priceable approved
+    ///      asset via seedAnchor immediately after, in the same createPool transaction
+    ///      (the depositor still picks the seeding moment; R13's "no unchecked first
+    ///      trade" holds per asset).
+    function initialize(address token, address factory_, uint16 bandBps) external initializer {
+        if (token == address(0) || factory_ == address(0)) revert InvalidInitParams();
         if (bandBps < MIN_BAND_BPS || bandBps > MAX_BAND_BPS) revert InvalidBand();
         __ReentrancyGuard_init();
 
         inventoryToken = token;
-        quoteAsset = quoteAsset_;
         factory = factory_;
         anchorBandBps = bandBps;
         buySpreadBps = 50; // default 0.5%; adjustable via setBuyBack (M2)
-        lastRate = seedRate;
-        lastRateTime = uint64(block.timestamp);
-        lastRateEpoch = seedEpoch;
 
         // sentinel node at index 0 for both FIFO lists
         tokenNodes.push(FlowstateStructs.Node(address(0), 0, 0, 0));
         cashNodes.push(FlowstateStructs.Node(address(0), 0, 0, 0));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Anchor lifecycle (factory-only writes; §3.4 hardening)
+    // ────────────────────────────────────────────────────────────────────
+
+    /// @notice First observation for an asset — createPool's per-asset seeding.
+    ///         Band-check-free by definition; refuses to overwrite a live anchor
+    ///         (that is resetAnchor's job, behind the admin lane).
+    function seedAnchor(address asset, uint192 seedRate, uint32 seedEpoch) external onlyFactory {
+        if (asset == address(0) || seedRate == 0) revert InvalidInitParams();
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        if (a.lastRate != 0) revert AnchorAlreadySeeded();
+        _writeAnchor(a, asset, seedRate, seedRate, seedEpoch);
+        seededAssetList.push(asset);
+        emit FlowstateEvents.AnchorReseeded(address(this), asset, seedRate, seedEpoch);
+    }
+
+    /// @notice Liveness escape hatch (D3): unconditionally re-anchors ONE asset to a
+    ///         fresh read. Also the late-seeding lane for assets approved after this
+    ///         pool was created. Admin-gated at the factory.
+    function resetAnchor(address asset, address oracle, uint32 epoch) external onlyFactory {
+        uint256 fresh = _readOracle(asset, oracle);
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        if (a.lastRate == 0) seededAssetList.push(asset);
+        _writeAnchor(a, asset, uint192(fresh), uint192(fresh), epoch);
+        emit FlowstateEvents.AnchorReseeded(address(this), asset, fresh, epoch);
+    }
+
+    /// @notice Freshness keeper (§3.4 item 1): a band-CHECKED, trade-less anchor
+    ///         advance. On a LIVE anchor it runs the identical _resolveRate path a
+    ///         trade runs — same step band, walk band and monotonic checks — so a
+    ///         poke is exactly as constrained as a trade and adds no attack surface.
+    ///         On a STALE anchor it drives the two-phase revive below. Factory-
+    ///         routed so the oracle address and epoch are always the canonical ones
+    ///         (permissionless at the market entry point).
+    ///
+    /// TWO-PHASE REVIVE (decided 2026-07-30). A single observation must never revive
+    /// a stale anchor: after a blind day the stored reference is unfit to judge one
+    /// reading, and a momentary venue push could otherwise "return" the price to a
+    /// day-old level and buy inventory at it (the manufactured-reversion attack).
+    /// Instead the first poke records a PENDING reference and starts a public
+    /// contest window. During the window, any poke reading OUTSIDE one (unwidened)
+    /// band of the pending cancels it and becomes the new pending — so keeping a
+    /// fake pending alive requires holding the venue at the fake price for the
+    /// ENTIRE window against every observer in the world, not touching it for one
+    /// block. A poke after the window that still reads within band of the pending
+    /// activates the anchor at the FRESH reading, with the EMA restarted there
+    /// (the blind period invalidates prior history). Trading stays declined
+    /// throughout the contest. Admin resetAnchor remains the human override.
+    /// Residual accepted: on a venue with zero organic flow, holding a price is
+    /// free — but such a pool holds near-worthless inventory, and the slim oracle's
+    /// minimum-depth rule (Phase 3) closes that corner at the source.
+    function pokeAnchor(address asset, address oracle, uint32 epoch) external onlyFactory {
+        if (poolPaused) revert PoolIsPaused();
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        if (a.lastRate == 0) revert AnchorNotSeeded();
+
+        // stale + same epoch ⇒ the revive path. (An epoch bump — timelocked oracle
+        // migration — reseeds unconditionally in _resolveRate, staleness included:
+        // the announced migration IS the human attestation.)
+        if (
+            epoch == a.lastRateEpoch && block.timestamp >= a.lastRateTime
+                && block.timestamp - a.lastRateTime > MAX_ANCHOR_AGE
+        ) {
+            _reviveStep(a, asset, oracle);
+            return;
+        }
+
+        uint256 rate = _resolveRate(asset, oracle, epoch);
+        emit FlowstateEvents.AnchorPoked(address(this), asset, rate, a.emaRate);
+    }
+
+    /// @dev One step of the two-phase revive. Pending validity: pendingSince must
+    ///      postdate lastRateTime — any accepted anchor write implicitly invalidates
+    ///      leftovers from earlier stale episodes (see FlowstateStructs.Anchor).
+    function _reviveStep(FlowstateStructs.Anchor storage a, address asset, address oracle) private {
+        uint256 fresh = _readOracle(asset, oracle);
+
+        bool pendingValid = a.pendingRate != 0 && a.pendingSince > a.lastRateTime;
+        if (!pendingValid || !_withinBand(fresh, a.pendingRate, 0)) {
+            // open a new contest (or cancel-and-replace a contradicted one)
+            a.pendingRate = uint192(fresh);
+            a.pendingSince = uint64(block.timestamp);
+            emit FlowstateEvents.AnchorRevivePending(
+                address(this), asset, fresh, uint64(block.timestamp)
+            );
+            return;
+        }
+
+        if (block.timestamp - a.pendingSince >= REVIVE_WINDOW) {
+            // survived the full public contest — activate at the fresh reading
+            _writeAnchor(a, asset, uint192(fresh), uint192(fresh), a.lastRateEpoch);
+            emit FlowstateEvents.AnchorRevived(address(this), asset, fresh);
+        }
+        // in-window confirmation: deliberately a silent no-op — the pending
+        // reference stays FIXED so it cannot be slow-walked during its own contest
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -191,14 +327,15 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     // Trading — buy path (pull-exact, two onlyFactory steps in one tx)
     // ────────────────────────────────────────────────────────────────────
 
-    /// @notice Step 1: band-checked oracle read + FIFO-capped fillable amount + exact cost.
+    /// @notice Step 1: band-checked oracle read for the NAMED asset + FIFO-capped
+    ///         fillable amount + exact cost in that asset.
     /// @dev Cost is computed on the FILLABLE amount before anything is pulled, so an
     ///      over-pull/refund path never exists (deletes the stranded-payment bug class).
     ///      Practical bound (review F4): fillableAmount × rate must fit uint256; with
     ///      amounts ≤ 50 × uint128.max and real 1inch rates (≤ ~1e30) the product tops
     ///      out ~1e70 « 2^256. A pathological max-supply × max-rate pair Panic-reverts,
     ///      which is a liveness refusal, not an exploit.
-    function priceBuy(uint256 requestedAmount, address oracle, uint32 epoch)
+    function priceBuy(address asset, uint256 requestedAmount, address oracle, uint32 epoch)
         external
         onlyFactory
         returns (uint256 fillableAmount, uint256 quoteCost, uint256 rate)
@@ -207,7 +344,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (tokenBalance == 0) revert NoLiquidity();
         if (requestedAmount == 0) revert InvalidAmount();
 
-        rate = _resolveRate(oracle, epoch);
+        rate = _resolveRate(asset, oracle, epoch);
 
         fillableAmount = _fillableBuy(requestedAmount);
         if (fillableAmount == 0) revert NoLiquidity();
@@ -218,9 +355,10 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @notice Exact-quote twin of priceBuy (V4 hook build scope §2.2, additive): the
-    ///         caller names the quote spend; the pool inverts to a token amount inside
-    ///         the SAME single band-checked oracle read — the view quote path is never
-    ///         involved, so no second cold read can exist in the transaction.
+    ///         caller names the quote spend in the NAMED asset; the pool inverts to a
+    ///         token amount inside the SAME single band-checked oracle read — the view
+    ///         quote path is never involved, so no second cold read can exist in the
+    ///         transaction.
     /// @dev The inversion rounds DOWN against the buyer (mirror of priceBuy's round-up),
     ///      then quoteCost is recomputed exactly as priceBuy would price that token
     ///      amount, so settlement accounting is wei-identical to a buyFromPool of
@@ -233,7 +371,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     ///      specified). Practical bound mirrors priceBuy's F4 note: quoteIn ×
     ///      RATE_SCALE must fit uint256; a pathological quoteIn Panic-reverts, which is
     ///      a liveness refusal, not an exploit.
-    function priceBuyExactQuote(uint256 quoteIn, address oracle, uint32 epoch)
+    function priceBuyExactQuote(address asset, uint256 quoteIn, address oracle, uint32 epoch)
         external
         onlyFactory
         returns (uint256 fillableAmount, uint256 quoteCost, uint256 rate)
@@ -242,7 +380,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (tokenBalance == 0) revert NoLiquidity();
         if (quoteIn == 0) revert InvalidAmount();
 
-        rate = _resolveRate(oracle, epoch);
+        rate = _resolveRate(asset, oracle, epoch);
 
         // invert inside the single read: round DOWN against the buyer
         uint256 desired = (quoteIn * RATE_SCALE) / rate;
@@ -255,8 +393,9 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         quoteCost = (desired * rate + RATE_SCALE - 1) / RATE_SCALE;
     }
 
-    /// @notice Step 2: factory has pulled `quotePaid` to this pool; settle ledgers,
-    ///         distribute fees, transfer tokens to the buyer.
+    /// @notice Step 2: factory has pulled `quotePaid` of `asset` to this pool; settle
+    ///         ledgers, distribute fees, transfer tokens to the buyer. Contributor
+    ///         credits and the fee split are denominated in `asset`.
     /// @dev Fee-on-transfer inventory tokens under-deliver on buys (review F-M2-2): the
     ///      buyer pays oracle price for fillAmount but receives fillAmount minus the
     ///      token's own fee. Pool accounting stays consistent; the shortfall is the
@@ -264,6 +403,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     ///      (the sell path rejects them outright via TransferAmountMismatch).
     function settleBuy(
         address buyer,
+        address asset,
         uint256 fillAmount,
         uint256 quotePaid,
         uint256 rate,
@@ -288,17 +428,21 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
             distributed += credit;
             // recycle (R12): an opted-in contributor's proceeds join the cash-side FIFO
             // as a contribution instead of claimableQuote — only while buy-back is live,
-            // and only if the credit fits the uint128 node bound (else fall back).
-            bool recycled = recycleOptIn[contributor] && buyBackEnabled && credit <= type(uint128).max;
+            // only when the traded asset IS the buy-back asset (the cash side is
+            // single-asset), and only if the credit fits the uint128 node bound.
+            bool recycled = recycleOptIn[contributor] && buyBackEnabled && asset == buybackAsset
+                && credit <= type(uint128).max;
             if (recycled && credit != 0) {
                 _addToList(cashNodes, cashIndex, contributor, uint128(credit), true);
                 quoteBalance += credit;
                 emit FlowstateEvents.ProceedsRecycled(address(this), contributor, credit);
             } else {
                 recycled = false;
-                claimableQuote[contributor] += credit;
+                claimableQuote[asset][contributor] += credit;
             }
-            emit FlowstateEvents.ContributorFilled(address(this), contributor, take, credit, recycled);
+            emit FlowstateEvents.ContributorFilled(
+                address(this), contributor, asset, take, credit, recycled
+            );
 
             if (take == nodeAmount) {
                 uint256 nextIdx = node.next;
@@ -311,23 +455,10 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         tokenBalance -= fillAmount;
         if (tokenBalance == 0) isHidden = true;
 
-        // fee split: fractions of the fee (3000/3000/4000 model); buyback takes the
-        // remainder, which also absorbs rounding dust — never less than its 4000
-        uint256 resellerCut = (fee * ctx.resellerShareBps) / BPS;
-        uint256 bd1Cut = (fee * ctx.bd1ShareBps) / BPS;
-        uint256 bd2Cut = (fee * ctx.bd2ShareBps) / BPS;
-        uint256 buybackCut = fee - resellerCut - bd1Cut - bd2Cut;
-
-        _pushQuote(ctx.resellerWallet, resellerCut);
-        _pushQuote(ctx.bd1, bd1Cut);
-        _pushQuote(ctx.bd2, bd2Cut);
-        _pushQuote(ctx.buybackReceiver, buybackCut);
-        emit FlowstateEvents.FeeDistributed(
-            address(this), ctx.resellerCode, resellerCut, bd1Cut, bd2Cut, buybackCut
-        );
+        _distributeFee(asset, fee, ctx);
 
         emit FlowstateEvents.PoolBuy(
-            address(this), buyer, quoteAsset, fillAmount, quotePaid, rate, fee,
+            address(this), buyer, asset, fillAmount, quotePaid, rate, fee,
             tokenBalance == 0, ctx.resellerCode
         );
 
@@ -335,11 +466,12 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Cash-side liquidity + sell path (buy-back mode — ships OFF, per-pool enable)
+    // Cash-side liquidity + sell path (buy-back mode — ships OFF, per-pool enable,
+    // single designated asset)
     // ────────────────────────────────────────────────────────────────────
 
     /// @dev Same pause policy as creditTokenContribution (D-M2-1): deposits blocked,
-    ///      withdrawals never.
+    ///      withdrawals never. Denominated in buybackAsset (the factory pulled that).
     function creditQuoteContribution(address owner, uint256 actualAmount) external onlyFactory {
         if (poolPaused) revert PoolIsPaused();
         if (!buyBackEnabled) revert BuyBackDisabled();
@@ -372,11 +504,12 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         cashSideEmpty = quoteBalance == 0;
         // NOTE: isHidden deliberately untouched — it means "no token inventory for
         // buyers"; cash-side emptiness has its own signals (this flag + quoteBalance).
-        IERC20(quoteAsset).safeTransfer(owner, withdrawn);
+        IERC20(buybackAsset).safeTransfer(owner, withdrawn);
     }
 
-    /// @notice Sell-path step 1: band-checked rate, buy-side spread, window cap, and
-    ///         cash-FIFO capacity → fillable token amount + gross quote payout.
+    /// @notice Sell-path step 1: band-checked rate FOR THE BUY-BACK ASSET, buy-side
+    ///         spread, window cap, and cash-FIFO capacity → fillable token amount +
+    ///         gross quote payout in buybackAsset.
     /// @dev The pool buys at oracle − spread; quoteGross rounds DOWN against the
     ///      seller (mirror of priceBuy's round-up against the buyer).
     function priceSell(uint256 requestedAmount, address oracle, uint32 epoch)
@@ -389,7 +522,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (requestedAmount == 0) revert InvalidAmount();
         if (quoteBalance == 0) revert NoLiquidity();
 
-        rate = _resolveRate(oracle, epoch);
+        rate = _resolveRate(buybackAsset, oracle, epoch);
         uint256 rateNet = (rate * (BPS - buySpreadBps)) / BPS;
         if (rateNet == 0) revert AmountTooSmall();
 
@@ -411,7 +544,8 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
 
     /// @notice Sell-path step 2: factory has pulled exactly `fillAmount` inventory
     ///         tokens into the pool; consume cash FIFO, credit bought tokens to the
-    ///         cash depositors, take the fee on the pool-payout leg, pay the seller.
+    ///         cash depositors, take the fee on the pool-payout leg, pay the seller
+    ///         in buybackAsset.
     /// @return sellerNet quote paid to the seller (gross − fee).
     function settleSell(
         address seller,
@@ -422,6 +556,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     ) external onlyFactory returns (uint256 sellerNet) {
         uint256 fee = (quoteGross * ctx.feeBps) / BPS;
         sellerNet = quoteGross - fee;
+        address asset = buybackAsset;
 
         // consume cash FIFO by quote spent; credit tokens pro-rata, last node absorbs
         // the rounding remainder so Σcredits == fillAmount exactly
@@ -439,7 +574,9 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
                 remainingQuote == 0 ? fillAmount - tokensDistributed : (fillAmount * take) / quoteGross;
             tokensDistributed += tokensCredit;
             claimableTokens[owner] += tokensCredit;
-            emit FlowstateEvents.ContributorFilled(address(this), owner, tokensCredit, take, false);
+            emit FlowstateEvents.ContributorFilled(
+                address(this), owner, asset, tokensCredit, take, false
+            );
 
             if (take == nodeAmount) {
                 uint256 nextIdx = node.next;
@@ -458,32 +595,24 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
             quoteSpentInWindow += uint128(quoteGross);
         }
 
-        uint256 resellerCut = (fee * ctx.resellerShareBps) / BPS;
-        uint256 bd1Cut = (fee * ctx.bd1ShareBps) / BPS;
-        uint256 bd2Cut = (fee * ctx.bd2ShareBps) / BPS;
-        uint256 buybackCut = fee - resellerCut - bd1Cut - bd2Cut;
-        _pushQuote(ctx.resellerWallet, resellerCut);
-        _pushQuote(ctx.bd1, bd1Cut);
-        _pushQuote(ctx.bd2, bd2Cut);
-        _pushQuote(ctx.buybackReceiver, buybackCut);
-        emit FlowstateEvents.FeeDistributed(
-            address(this), ctx.resellerCode, resellerCut, bd1Cut, bd2Cut, buybackCut
-        );
+        _distributeFee(asset, fee, ctx);
 
         emit FlowstateEvents.PoolSell(
-            address(this), seller, quoteAsset, fillAmount, quoteGross, rate, fee,
+            address(this), seller, asset, fillAmount, quoteGross, rate, fee,
             quoteBalance == 0, ctx.resellerCode
         );
 
         // seller payout is a hard transfer (no fallback credit): the seller is trading
         // for payment, not receiving a fee — a refusing/blocklisted seller should
         // revert the trade rather than strand value in a ledger they can't claim from
-        IERC20(quoteAsset).safeTransfer(seller, sellerNet);
+        IERC20(asset).safeTransfer(seller, sellerNet);
     }
 
     // ────────────────────────────────────────────────────────────────────
     // Claims (pool-local ledgers — plan D2). Silent no-op on zero so the
     // factory's claimMany can iterate without reverting on empty pools.
+    // claimQuote sweeps EVERY seeded asset — depositors are asset-blind, so
+    // they must never need to know which assets their fills arrived in.
     // ────────────────────────────────────────────────────────────────────
 
     function claimQuote() external nonReentrant {
@@ -508,12 +637,19 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         emit FlowstateEvents.RecycleOptInSet(address(this), msg.sender, optIn);
     }
 
+    /// @dev Loop bound: seededAssetList only grows via factory seeding, and the
+    ///      approved-asset set is small by policy (2-4 per chain), so this sweep is
+    ///      a handful of iterations, most of them zero-balance skips.
     function _claimQuote(address user) private {
-        uint256 amount = claimableQuote[user];
-        if (amount == 0) return;
-        claimableQuote[user] = 0;
-        IERC20(quoteAsset).safeTransfer(user, amount);
-        emit FlowstateEvents.ProceedsClaimed(address(this), user, quoteAsset, amount);
+        uint256 length = seededAssetList.length;
+        for (uint256 i = 0; i < length; ++i) {
+            address asset = seededAssetList[i];
+            uint256 amount = claimableQuote[asset][user];
+            if (amount == 0) continue;
+            claimableQuote[asset][user] = 0;
+            IERC20(asset).safeTransfer(user, amount);
+            emit FlowstateEvents.ProceedsClaimed(address(this), user, asset, amount);
+        }
     }
 
     function _claimTokens(address user) private {
@@ -547,12 +683,25 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
 
     /// @dev Window semantics: cap and window are configured together (both zero =
     ///      uncapped, both nonzero = capped); the window counter resets on config.
-    function setBuyBack(bool enabled, uint16 spreadBps, uint128 maxPerWindow, uint32 windowSecs)
-        external
-        onlyFactory
-    {
+    ///      Multi-asset rules: enabling requires a SEEDED asset (sells price off its
+    ///      anchor); changing the asset while the cash side holds funds is refused —
+    ///      quoteBalance and the cash FIFO are denominated in the old asset, so a
+    ///      silent switch would misdenominate every position.
+    function setBuyBack(
+        address asset,
+        bool enabled,
+        uint16 spreadBps,
+        uint128 maxPerWindow,
+        uint32 windowSecs
+    ) external onlyFactory {
         if (spreadBps > MAX_SPREAD_BPS) revert SpreadTooHigh();
         if ((maxPerWindow == 0) != (windowSecs == 0)) revert InvalidWindowConfig();
+        if (enabled) {
+            if (asset == address(0)) revert BuybackAssetUnset();
+            if (anchors[asset].lastRate == 0) revert AnchorNotSeeded();
+        }
+        if (asset != buybackAsset && quoteBalance != 0) revert CashSideNotEmpty();
+        buybackAsset = asset;
         buyBackEnabled = enabled;
         buySpreadBps = spreadBps;
         maxQuotePerWindow = maxPerWindow;
@@ -563,16 +712,6 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         }
     }
 
-    /// @notice Liveness escape hatch (D3): unconditionally re-anchors to a fresh read.
-    function resetAnchor(address oracle, uint32 epoch) external onlyFactory {
-        uint256 fresh = IOracle(oracle).getRate(IERC20(inventoryToken), IERC20(quoteAsset), false);
-        if (fresh == 0 || fresh > type(uint192).max) revert NoOracleRate();
-        lastRate = uint192(fresh);
-        lastRateTime = uint64(block.timestamp);
-        lastRateEpoch = epoch;
-        emit FlowstateEvents.AnchorReseeded(address(this), fresh, epoch);
-    }
-
     // ────────────────────────────────────────────────────────────────────
     // Views
     // ────────────────────────────────────────────────────────────────────
@@ -581,13 +720,13 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     /// @dev Consistency invariant: same block + same args ⇒ (fillable, cost) here
     ///      equals what buyFromPool executes, because rate resolution, the FIFO walk,
     ///      and the rounding are the same shared code paths.
-    function previewBuy(uint256 amount, address oracle, uint32 epoch)
+    function previewBuy(address asset, uint256 amount, address oracle, uint32 epoch)
         external
         view
         returns (bool ok, uint256 fillable, uint256 cost)
     {
         if (poolPaused || tokenBalance == 0 || amount == 0) return (false, 0, 0);
-        (bool rateOk, uint256 rate) = _peekRate(oracle, epoch);
+        (bool rateOk, uint256 rate) = _peekRate(asset, oracle, epoch);
         if (!rateOk) return (false, 0, 0);
         fillable = _fillableBuy(amount);
         if (fillable == 0) return (false, 0, 0);
@@ -604,7 +743,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         returns (bool ok, uint256 fillable, uint256 grossProceeds)
     {
         if (poolPaused || !buyBackEnabled || quoteBalance == 0 || amount == 0) return (false, 0, 0);
-        (bool rateOk, uint256 rate) = _peekRate(oracle, epoch);
+        (bool rateOk, uint256 rate) = _peekRate(buybackAsset, oracle, epoch);
         if (!rateOk) return (false, 0, 0);
         uint256 rateNet = (rate * (BPS - buySpreadBps)) / BPS;
         if (rateNet == 0) return (false, 0, 0);
@@ -618,21 +757,57 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         ok = true;
     }
 
-    function anchor() external view returns (uint192 rate, uint64 time, uint32 epoch) {
-        return (lastRate, lastRateTime, lastRateEpoch);
+    function anchorOf(address asset)
+        external
+        view
+        returns (uint192 rate, uint64 time, uint192 ema, uint32 epoch)
+    {
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        return (a.lastRate, a.lastRateTime, a.emaRate, a.lastRateEpoch);
+    }
+
+    /// @notice Two-phase revive state for a stale anchor (keeper telemetry).
+    ///         `valid` is false when the stored pending is a leftover from an
+    ///         earlier stale episode.
+    function pendingReviveOf(address asset)
+        external
+        view
+        returns (uint192 rate, uint64 since, bool valid)
+    {
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        return (a.pendingRate, a.pendingSince, a.pendingRate != 0 && a.pendingSince > a.lastRateTime);
+    }
+
+    function seededAssets() external view returns (address[] memory) {
+        return seededAssetList;
     }
 
     function positions(address user)
         external
         view
-        returns (uint256 tokenPosition, uint256 cashPosition, uint256 claimQ, uint256 claimT)
+        returns (uint256 tokenPosition, uint256 cashPosition, uint256 claimT)
     {
         uint256 tIdx = tokenIndex[user];
         if (tIdx != 0) tokenPosition = tokenNodes[tIdx].amount;
         uint256 cIdx = cashIndex[user];
         if (cIdx != 0) cashPosition = cashNodes[cIdx].amount;
-        claimQ = claimableQuote[user];
         claimT = claimableTokens[user];
+    }
+
+    /// @notice Per-asset claimable quote for a user, aligned arrays. The depositor-
+    ///         facing "what will claimQuote() send me" view.
+    function claimableQuoteOf(address user)
+        external
+        view
+        returns (address[] memory assets, uint256[] memory amounts)
+    {
+        uint256 length = seededAssetList.length;
+        assets = new address[](length);
+        amounts = new uint256[](length);
+        for (uint256 i = 0; i < length; ++i) {
+            assets[i] = seededAssetList[i];
+            amounts[i] = claimableQuote[assets[i]][user];
+        }
     }
 
     function getPlaceInLine(address user, bool cashSide) external view returns (uint256) {
@@ -656,29 +831,42 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     // Internals
     // ────────────────────────────────────────────────────────────────────
 
-    /// @dev Rate resolution — normative logic from plan §3.2:
-    ///      1. new factory epoch → reseed band-check-free (timelock-announced event);
-    ///      2. same timestamp → cached rate, no oracle call;
-    ///      3. otherwise → fresh read, band check widened by elapsed time, then update.
-    function _resolveRate(address oracle, uint32 epoch) private returns (uint256) {
-        if (epoch != lastRateEpoch) {
-            uint256 reseeded = _readOracle(oracle);
-            lastRate = uint192(reseeded);
-            lastRateTime = uint64(block.timestamp);
-            lastRateEpoch = epoch;
-            emit FlowstateEvents.AnchorReseeded(address(this), reseeded, epoch);
+    /// @dev Rate resolution — normative logic from plan §3.2 plus the §3.4 hardening:
+    ///      1. unseeded asset → decline (seeding is factory-gated, never lazy);
+    ///      2. new factory epoch → reseed band-check-free (timelock-announced event);
+    ///      3. monotonic guard (item 3) — the anchor timestamp never moves backwards;
+    ///      4. same timestamp → cached rate, no oracle call;
+    ///      5. freshness bound (item 1) — an anchor older than MAX_ANCHOR_AGE
+    ///         declines instead of trusting the fully-widened band;
+    ///      6. fresh read → step band vs last accepted rate (widened by elapsed)
+    ///         AND walk band vs the EMA (item 4), then update both.
+    function _resolveRate(address asset, address oracle, uint32 epoch) private returns (uint256) {
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        if (a.lastRate == 0) revert AnchorNotSeeded();
+
+        if (epoch != a.lastRateEpoch) {
+            uint256 reseeded = _readOracle(asset, oracle);
+            _writeAnchor(a, asset, uint192(reseeded), uint192(reseeded), epoch);
+            emit FlowstateEvents.AnchorReseeded(address(this), asset, reseeded, epoch);
             return reseeded;
         }
 
-        if (block.timestamp == lastRateTime) {
-            return lastRate; // same-timestamp cache: no oracle call, no new information
+        if (block.timestamp < a.lastRateTime) revert StaleAnchor(); // monotonic (item 3)
+
+        if (block.timestamp == a.lastRateTime) {
+            return a.lastRate; // same-timestamp cache: no oracle call, no new information
         }
 
-        uint256 fresh = _readOracle(oracle);
-        if (!_withinBand(fresh, lastRate, block.timestamp - lastRateTime)) revert RateOutOfBand();
+        uint256 elapsed = block.timestamp - a.lastRateTime;
+        if (elapsed > MAX_ANCHOR_AGE) revert StaleAnchor(); // freshness bound (item 1)
 
-        lastRate = uint192(fresh);
-        lastRateTime = uint64(block.timestamp);
+        uint256 fresh = _readOracle(asset, oracle);
+        if (!_withinBand(fresh, a.lastRate, elapsed)) revert RateOutOfBand();
+
+        uint256 newEma = _advanceEma(a.emaRate, a.lastRate, elapsed);
+        if (!_withinWalkBand(fresh, newEma)) revert AnchorWalkExceeded();
+
+        _writeAnchor(a, asset, uint192(fresh), uint192(newEma), epoch);
         return fresh;
     }
 
@@ -692,21 +880,74 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         return diff * BPS <= anchorRef * allowedBps;
     }
 
+    /// @dev Walk band (item 4): the fresh rate must sit near the SLOW anchor. No time
+    ///      widening here — widening the walk band with idle time would hand back
+    ///      exactly the cumulative headroom the EMA exists to remove.
+    function _withinWalkBand(uint256 fresh, uint256 ema) private view returns (bool) {
+        uint256 allowedBps = uint256(anchorBandBps) * WALK_BAND_MULT;
+        uint256 diff = fresh > ema ? fresh - ema : ema - fresh;
+        return diff * BPS <= ema * allowedBps;
+    }
+
+    /// @dev Linear-in-elapsed EMA step toward the last ACCEPTED rate (not toward the
+    ///      incoming read — the EMA only ever ingests observations that passed the
+    ///      bands, so a rejected read never drags the reference). elapsed ≥ tau ⇒ the
+    ///      EMA lands exactly on the last accepted rate.
+    function _advanceEma(uint256 ema, uint256 lastAccepted, uint256 elapsed)
+        private
+        pure
+        returns (uint256)
+    {
+        uint256 step = elapsed >= ANCHOR_TAU ? ANCHOR_TAU : elapsed;
+        if (lastAccepted >= ema) {
+            return ema + ((lastAccepted - ema) * step) / ANCHOR_TAU;
+        }
+        return ema - ((ema - lastAccepted) * step) / ANCHOR_TAU;
+    }
+
+    /// @dev Single writer for anchor state so no code path can update the pair
+    ///      half-way. Values are pre-validated by callers (≤ uint192.max via
+    ///      _readOracle bounds or seed checks).
+    function _writeAnchor(
+        FlowstateStructs.Anchor storage a,
+        address, /* asset — kept for call-site readability */
+        uint192 rate,
+        uint192 ema,
+        uint32 epoch
+    ) private {
+        a.lastRate = rate;
+        a.lastRateTime = uint64(block.timestamp);
+        a.emaRate = ema;
+        a.lastRateEpoch = epoch;
+    }
+
     /// @dev View twin of _resolveRate: identical rate resolution, no state writes, no
     ///      reverts (oracle failures return ok=false).
-    function _peekRate(address oracle, uint32 epoch) private view returns (bool ok, uint256 rate) {
-        if (epoch == lastRateEpoch && block.timestamp == lastRateTime) {
-            return (true, lastRate); // cache hit — execution would not call the oracle either
+    function _peekRate(address asset, address oracle, uint32 epoch)
+        private
+        view
+        returns (bool ok, uint256 rate)
+    {
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        if (a.lastRate == 0) return (false, 0);
+
+        if (epoch == a.lastRateEpoch && block.timestamp == a.lastRateTime) {
+            return (true, a.lastRate); // cache hit — execution would not call the oracle either
         }
         uint256 fresh;
-        try IOracle(oracle).getRate(IERC20(inventoryToken), IERC20(quoteAsset), false) returns (uint256 r) {
+        try IOracle(oracle).getRate(IERC20(inventoryToken), IERC20(asset), false) returns (uint256 r) {
             fresh = r;
         } catch {
             return (false, 0);
         }
         if (fresh == 0 || fresh > type(uint192).max) return (false, 0);
-        if (epoch != lastRateEpoch) return (true, fresh); // execution would reseed band-check-free
-        if (!_withinBand(fresh, lastRate, block.timestamp - lastRateTime)) return (false, 0);
+        if (epoch != a.lastRateEpoch) return (true, fresh); // execution would reseed band-check-free
+
+        if (block.timestamp < a.lastRateTime) return (false, 0); // monotonic (item 3)
+        uint256 elapsed = block.timestamp - a.lastRateTime;
+        if (elapsed > MAX_ANCHOR_AGE) return (false, 0); // freshness bound (item 1)
+        if (!_withinBand(fresh, a.lastRate, elapsed)) return (false, 0);
+        if (!_withinWalkBand(fresh, _advanceEma(a.emaRate, a.lastRate, elapsed))) return (false, 0);
         return (true, fresh);
     }
 
@@ -751,9 +992,29 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (nodeCapacity < capacity) capacity = nodeCapacity;
     }
 
-    function _readOracle(address oracle) private view returns (uint256 rate) {
-        rate = IOracle(oracle).getRate(IERC20(inventoryToken), IERC20(quoteAsset), false);
+    function _readOracle(address asset, address oracle) private view returns (uint256 rate) {
+        rate = IOracle(oracle).getRate(IERC20(inventoryToken), IERC20(asset), false);
         if (rate == 0 || rate > type(uint192).max) revert NoOracleRate();
+    }
+
+    /// @dev Fee split shared by settleBuy and settleSell, denominated in the traded
+    ///      asset: fractions of the fee (3000/3000/4000 model); buyback takes the
+    ///      remainder, which also absorbs rounding dust — never less than its 4000.
+    function _distributeFee(address asset, uint256 fee, FlowstateStructs.FeeContext calldata ctx)
+        private
+    {
+        uint256 resellerCut = (fee * ctx.resellerShareBps) / BPS;
+        uint256 bd1Cut = (fee * ctx.bd1ShareBps) / BPS;
+        uint256 bd2Cut = (fee * ctx.bd2ShareBps) / BPS;
+        uint256 buybackCut = fee - resellerCut - bd1Cut - bd2Cut;
+
+        _pushQuote(asset, ctx.resellerWallet, resellerCut);
+        _pushQuote(asset, ctx.bd1, bd1Cut);
+        _pushQuote(asset, ctx.bd2, bd2Cut);
+        _pushQuote(asset, ctx.buybackReceiver, buybackCut);
+        emit FlowstateEvents.FeeDistributed(
+            address(this), asset, ctx.resellerCode, resellerCut, bd1Cut, bd2Cut, buybackCut
+        );
     }
 
     /// @dev Fee push with fallback credit: a receiver the quote asset refuses (e.g. a
@@ -762,14 +1023,14 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     ///      The return-data check is STRICT (empty or exactly 32 bytes decoding true) —
     ///      any odd-shaped return counts as failure and takes the credit fallback,
     ///      never a revert (review F1: abi.decode on 1–31 bytes would panic and turn
-    ///      the fallback into a trade-reverting griefing surface).
-    function _pushQuote(address receiver, uint256 amount) private {
+    ///      the fallback into a trade-reverting griefing surface). The fallback credit
+    ///      lands on the SAME asset's claim ledger the push attempted.
+    function _pushQuote(address asset, address receiver, uint256 amount) private {
         if (amount == 0 || receiver == address(0)) return;
-        (bool ok, bytes memory ret) =
-            quoteAsset.call(abi.encodeCall(IERC20.transfer, (receiver, amount)));
+        (bool ok, bytes memory ret) = asset.call(abi.encodeCall(IERC20.transfer, (receiver, amount)));
         if (ok && (ret.length == 0 || (ret.length == 32 && abi.decode(ret, (bool))))) return;
-        claimableQuote[receiver] += amount;
-        emit FlowstateEvents.FeePushFailed(address(this), receiver, amount);
+        claimableQuote[asset][receiver] += amount;
+        emit FlowstateEvents.FeePushFailed(address(this), receiver, asset, amount);
     }
 
     function _addToList(

@@ -11,19 +11,23 @@ pragma solidity 0.8.29;
  */
 library FlowstateEvents {
     // ── pools & liquidity ────────────────────────────────────────────────
+    /// @dev Multi-asset: one pool per token. Per-asset seed rates are emitted as
+    ///      one AnchorReseeded per seeded asset in the same transaction.
     event PoolCreated(
         address indexed token,
-        address indexed quoteAsset,
         address indexed pool,
         address creator,
         uint256 amount,
-        uint16 anchorBandBps,
-        uint192 seedRate
+        uint16 anchorBandBps
     );
     event TokensContributed(address indexed pool, address indexed owner, uint256 amount);
-    event QuoteContributed(address indexed pool, address indexed owner, uint256 amount);
+    event QuoteContributed(
+        address indexed pool, address indexed owner, address indexed asset, uint256 amount
+    );
     event TokensWithdrawn(address indexed pool, address indexed owner, uint256 amount, bool poolEmpty);
-    event QuoteWithdrawn(address indexed pool, address indexed owner, uint256 amount, bool cashSideEmpty);
+    event QuoteWithdrawn(
+        address indexed pool, address indexed owner, address indexed asset, uint256 amount, bool cashSideEmpty
+    );
 
     // ── trading (replaces PoolPurchaseData — plan D5) ────────────────────
     event PoolBuy(
@@ -51,27 +55,46 @@ library FlowstateEvents {
     event ContributorFilled(
         address indexed pool,
         address indexed contributor,
+        address indexed asset, // the asset quoteCredited (buy) / tokenAmount's payment (sell) is denominated in
         uint256 tokenAmount,
         uint256 quoteCredited,
         bool recycled
     );
     event FeeDistributed(
         address indexed pool,
+        address indexed asset, // fee denomination: the traded quote asset
         string resellerCode,
         uint256 resellerCut,
         uint256 bd1Cut,
         uint256 bd2Cut,
         uint256 buybackCut
     );
-    event FeePushFailed(address indexed pool, address indexed receiver, uint256 amount);
+    event FeePushFailed(
+        address indexed pool, address indexed receiver, address asset, uint256 amount
+    );
     /// @dev Recycle routing (R12): distinct from QuoteContributed so each event keeps a
     ///      single meaning — QuoteContributed = explicit deposit, this = fill proceeds
-    ///      joining the cash side, ContributorFilled = fill accounting.
+    ///      joining the cash side, ContributorFilled = fill accounting. Recycle only
+    ///      fires when the traded asset IS the buy-back asset, so no asset field.
     event ProceedsRecycled(address indexed pool, address indexed contributor, uint256 amount);
     event ProceedsClaimed(address indexed pool, address indexed user, address asset, uint256 amount);
 
     // ── anchor lifecycle (reseeds observable — plan R3) ──────────────────
-    event AnchorReseeded(address indexed pool, uint256 newRate, uint32 epoch);
+    /// @dev Emitted on every band-check-FREE anchor write: createPool seeding, the
+    ///      admin resetAnchor lane, and the oracle-epoch reseed. Per (pool, asset).
+    event AnchorReseeded(address indexed pool, address indexed asset, uint256 newRate, uint32 epoch);
+    /// @dev Emitted by pokeAnchor: a band-CHECKED, trade-less anchor advance (the
+    ///      freshness keeper's path). Deliberately distinct from AnchorReseeded so
+    ///      monitoring can tell "checked advance" from "unchecked reseed" at topic0.
+    event AnchorPoked(address indexed pool, address indexed asset, uint256 newRate, uint256 emaRate);
+    /// @dev Two-phase revive of a STALE anchor: a poke opened (or replaced) the
+    ///      pending reference now under its public contest window. Any poke reading
+    ///      outside one band of `pendingRate` cancels it and becomes the new pending.
+    event AnchorRevivePending(address indexed pool, address indexed asset, uint256 pendingRate, uint64 since);
+    /// @dev The pending reference survived its full contest window and the anchor
+    ///      re-activated at `newRate` (EMA restarts there — the blind period
+    ///      invalidates prior history).
+    event AnchorRevived(address indexed pool, address indexed asset, uint256 newRate);
 
     // ── partner registry ─────────────────────────────────────────────────
     event ResellerRegistered(
@@ -94,6 +117,7 @@ library FlowstateEvents {
     event PriceSourceUpdated(address indexed pool, uint8 source);
     event BuyBackConfigured(
         address indexed pool,
+        address indexed asset, // the ONE asset the cash side runs in (multi-asset scope cut)
         bool enabled,
         uint16 spreadBps,
         uint128 maxQuotePerWindow,

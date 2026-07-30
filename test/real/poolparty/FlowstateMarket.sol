@@ -151,7 +151,7 @@ contract FlowstateMarket is
     uint16 public constant DEFAULT_FEE_BPS = 100;  // long-tail default tier
     uint16 public constant PARTNER_SHARE_BPS = 6000; // reseller + bd1 + bd2, always
     uint16 public constant BUYBACK_SHARE_BPS = 4000; // remainder by construction — untouchable
-    uint16 private constant DEFAULT_BAND_BPS = 1000; // 10%
+    uint16 private constant DEFAULT_BAND_BPS = 500; // 5% step (walk band = 2× = 10%) — tightened 2026-07-30
     uint16 private constant MIN_BAND_BPS = 100;
     uint16 private constant MAX_BAND_BPS = 5000;
 
@@ -162,6 +162,10 @@ contract FlowstateMarket is
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     // ── storage (plan §3.1; OZ bases are ERC-7201 namespaced) ────────────
+    // Multi-asset change: pools are keyed by inventory token alone (poolByToken
+    // replaces the old poolByPair mapping — a legacy-shape poolByPair VIEW remains
+    // below for integrators), and the approved quote assets gain an enumeration
+    // list so createPool can seed one anchor per priceable asset.
     address public poolBeacon;                                        // slot 0
     address public beaconProxyTemplate;                               // slot 1
     address public priceOracle;                                       // slot 2
@@ -172,9 +176,11 @@ contract FlowstateMarket is
     mapping(address => bool) public approvedQuoteAssets;              // slot 6
     mapping(string => FlowstateStructs.ResellerConfig) private resellers; // slot 7
     mapping(address => FlowstateStructs.PoolRecord) public poolRecords;   // slot 8
-    mapping(address => mapping(address => address)) public poolByPair;    // slot 9
+    mapping(address => address) public poolByToken;                   // slot 9
     mapping(address => bool) public frozen;                           // slot 10
-    uint256[40] private __gap;
+    address[] private quoteAssetList;                                 // slot 11 (ever-approved, dedup'd)
+    mapping(address => bool) private inQuoteAssetList;                // slot 12
+    uint256[38] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -272,48 +278,60 @@ contract FlowstateMarket is
     // Pool creation & liquidity
     // ────────────────────────────────────────────────────────────────────
 
-    /// @notice One live pool per (token, quote) pair. The listability oracle read
-    ///         doubles as the pool's anchor seed (plan R13).
+    /// @notice One live pool per TOKEN (multi-asset change): the pool accepts every
+    ///         approved quote asset. Creation seeds one anchor per approved asset the
+    ///         oracle can price — the depositor picks the seeding moment (plan R13),
+    ///         and at least one asset must be priceable for the token to be listable.
+    ///         Assets that fail here (or get approved later) are seeded through the
+    ///         admin resetAnchor lane; they simply decline to trade until then.
     /// @dev Fee-on-transfer tokens are unsupported as inventory (review F-M2-2):
     ///      contributions are balance-diff safe, but buyers of a FoT token pay oracle
     ///      price for more than they receive. Listing discretion, not a code check.
     /// @param anchorBandBps 0 ⇒ default 1000 (10%); otherwise bounded [100, 5000].
-    function createPool(address token, address quoteAsset, uint256 amount, uint16 anchorBandBps)
+    function createPool(address token, uint256 amount, uint16 anchorBandBps)
         external
         whenNotPaused
         nonReentrant
         returns (address pool)
     {
         if (token == address(0)) revert ZeroAddress();
-        if (!approvedQuoteAssets[quoteAsset]) revert QuoteAssetNotApproved();
-        if (poolByPair[token][quoteAsset] != address(0)) revert PoolAlreadyExists();
+        if (poolByToken[token] != address(0)) revert PoolAlreadyExists();
 
         uint16 band = anchorBandBps == 0 ? DEFAULT_BAND_BPS : anchorBandBps;
         if (band < MIN_BAND_BPS || band > MAX_BAND_BPS) revert InvalidBand();
 
-        // listability rule: a pair is listable iff the aggregator returns a usable
-        // direct rate — and that read seeds the anchor for free
-        uint256 seedRate = IOracle(priceOracle).getRate(IERC20(token), IERC20(quoteAsset), false);
-        if (seedRate == 0 || seedRate > type(uint192).max) revert NoOracleRate();
-
         pool = Clones.clone(beaconProxyTemplate);
         IInitializableBeaconProxy(pool).initialize(
             poolBeacon,
-            abi.encodeCall(
-                IFlowstatePool.initialize,
-                (token, quoteAsset, address(this), band, uint192(seedRate), oracleEpoch)
-            )
+            abi.encodeCall(IFlowstatePool.initialize, (token, address(this), band))
         );
 
-        poolRecords[pool] = FlowstateStructs.PoolRecord(token, true, quoteAsset);
-        poolByPair[token][quoteAsset] = pool;
+        // listability rule: a token is listable iff the aggregator returns a usable
+        // direct rate against AT LEAST ONE approved asset — each usable read seeds
+        // that asset's anchor (the pool emits AnchorReseeded per seeded asset).
+        // try/catch per asset: one unpriceable pairing must not block the others.
+        uint256 seeded;
+        uint256 length = quoteAssetList.length;
+        for (uint256 i = 0; i < length; ++i) {
+            address asset = quoteAssetList[i];
+            if (!approvedQuoteAssets[asset]) continue; // approval since revoked
+            try IOracle(priceOracle).getRate(IERC20(token), IERC20(asset), false) returns (uint256 r) {
+                if (r == 0 || r > type(uint192).max) continue;
+                IFlowstatePool(pool).seedAnchor(asset, uint192(r), oracleEpoch);
+                ++seeded;
+            } catch {
+                continue;
+            }
+        }
+        if (seeded == 0) revert NoOracleRate();
+
+        poolRecords[pool] = FlowstateStructs.PoolRecord(token, true);
+        poolByToken[token] = pool;
 
         uint256 actual = _pullToPool(token, pool, amount);
         IFlowstatePool(pool).creditTokenContribution(msg.sender, actual);
 
-        emit FlowstateEvents.PoolCreated(
-            token, quoteAsset, pool, msg.sender, actual, band, uint192(seedRate)
-        );
+        emit FlowstateEvents.PoolCreated(token, pool, msg.sender, actual, band);
         emit FlowstateEvents.TokensContributed(pool, msg.sender, actual);
     }
 
@@ -337,19 +355,23 @@ contract FlowstateMarket is
     }
 
     /// @notice Quote-side (cash) contribution — reverts unless the pool's buy-back is
-    ///         enabled. Same gift semantics as contributeTokens (R10).
+    ///         enabled. Same gift semantics as contributeTokens (R10). The cash side
+    ///         runs in the pool's ONE designated buy-back asset, so that is what gets
+    ///         pulled — cash-side depositors are funding a specific bid, unlike
+    ///         token-side depositors who stay asset-blind.
     function contributeQuote(address pool, uint256 amount, address contributionOwner)
         external
         whenNotPaused
         nonReentrant
     {
-        FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
-        if (!rec.exists) revert UnknownPool();
+        if (!poolRecords[pool].exists) revert UnknownPool();
         if (contributionOwner == address(0)) revert ZeroAddress();
 
-        uint256 actual = _pullToPool(rec.quoteAsset, pool, amount);
+        address asset = IFlowstatePool(pool).buybackAsset();
+        if (asset == address(0)) revert QuoteAssetNotApproved(); // buy-back never configured
+        uint256 actual = _pullToPool(asset, pool, amount);
         IFlowstatePool(pool).creditQuoteContribution(contributionOwner, actual);
-        emit FlowstateEvents.QuoteContributed(pool, contributionOwner, actual);
+        emit FlowstateEvents.QuoteContributed(pool, contributionOwner, asset, actual);
     }
 
     /// @notice Withdraw an unsold token-side position. Pass amount = 0 for the full
@@ -364,19 +386,30 @@ contract FlowstateMarket is
     function withdrawQuote(address pool, uint256 amount) external nonReentrant {
         if (!poolRecords[pool].exists) revert UnknownPool();
         (uint256 withdrawn, bool cashSideEmpty) = IFlowstatePool(pool).withdrawQuoteFor(msg.sender, amount);
-        emit FlowstateEvents.QuoteWithdrawn(pool, msg.sender, withdrawn, cashSideEmpty);
+        emit FlowstateEvents.QuoteWithdrawn(
+            pool, msg.sender, IFlowstatePool(pool).buybackAsset(), withdrawn, cashSideEmpty
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────
     // Trading (aggregator-facing)
     // ────────────────────────────────────────────────────────────────────
 
-    /// @notice Pull-exact buy: the pool computes the band-checked oracle cost for the
-    ///         fillable amount; the factory pulls exactly that from msg.sender into
-    ///         the pool; the pool settles ledgers, fees, and token delivery.
+    /// @notice Pull-exact buy in the NAMED quote asset: the pool computes the
+    ///         band-checked oracle cost for the fillable amount; the factory pulls
+    ///         exactly that from msg.sender into the pool; the pool settles ledgers,
+    ///         fees, and token delivery — all denominated in `asset`.
     /// @dev Approved quote assets are vetted no-fee-on-transfer (USDC/WETH class);
-    ///      the pull amount is credited at face value.
-    function buyFromPool(address pool, uint256 amount, string calldata resellerCode, address buyer)
+    ///      the pull amount is credited at face value. The approval check is at the
+    ///      market so revoking an asset stops NEW trades in it instantly, while pools
+    ///      keep their anchors and depositors keep their claims.
+    function buyFromPool(
+        address pool,
+        address asset,
+        uint256 amount,
+        string calldata resellerCode,
+        address buyer
+    )
         external
         whenNotPaused
         nonReentrant
@@ -384,17 +417,19 @@ contract FlowstateMarket is
     {
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists) revert UnknownPool();
+        if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
         if (buyer == address(0)) revert ZeroAddress();
         _checkCode(resellerCode);
         if (freezeEnabled && (frozen[msg.sender] || frozen[buyer])) revert AccountFrozen();
 
         uint256 rate;
-        (tokensFilled, quotePaid, rate) = IFlowstatePool(pool).priceBuy(amount, priceOracle, oracleEpoch);
+        (tokensFilled, quotePaid, rate) =
+            IFlowstatePool(pool).priceBuy(asset, amount, priceOracle, oracleEpoch);
 
-        IERC20(rec.quoteAsset).safeTransferFrom(msg.sender, pool, quotePaid);
+        IERC20(asset).safeTransferFrom(msg.sender, pool, quotePaid);
 
         IFlowstatePool(pool).settleBuy(
-            buyer, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
+            buyer, asset, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
         );
     }
 
@@ -412,7 +447,13 @@ contract FlowstateMarket is
     ///      wei-identical to buyFromPool of the same token amount.
     /// @return tokensFilled tokens delivered to `buyer`.
     /// @return quotePaid    quote-asset units pulled from msg.sender (≤ quoteIn).
-    function buyFromPoolExactQuote(address pool, uint256 quoteIn, string calldata resellerCode, address buyer)
+    function buyFromPoolExactQuote(
+        address pool,
+        address asset,
+        uint256 quoteIn,
+        string calldata resellerCode,
+        address buyer
+    )
         external
         whenNotPaused
         nonReentrant
@@ -420,18 +461,19 @@ contract FlowstateMarket is
     {
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists) revert UnknownPool();
+        if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
         if (buyer == address(0)) revert ZeroAddress();
         _checkCode(resellerCode);
         if (freezeEnabled && (frozen[msg.sender] || frozen[buyer])) revert AccountFrozen();
 
         uint256 rate;
         (tokensFilled, quotePaid, rate) =
-            IFlowstatePool(pool).priceBuyExactQuote(quoteIn, priceOracle, oracleEpoch);
+            IFlowstatePool(pool).priceBuyExactQuote(asset, quoteIn, priceOracle, oracleEpoch);
 
-        IERC20(rec.quoteAsset).safeTransferFrom(msg.sender, pool, quotePaid);
+        IERC20(asset).safeTransferFrom(msg.sender, pool, quotePaid);
 
         IFlowstatePool(pool).settleBuy(
-            buyer, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
+            buyer, asset, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
         );
     }
 
@@ -456,7 +498,13 @@ contract FlowstateMarket is
     ///      party, so no address can be forced into an unexpected call.
     /// @return tokensFilled tokens delivered to `buyer` (== tokenAmountOut).
     /// @return quotePaid    quote-asset units pulled from msg.sender.
-    function buyFromPoolExactOut(address pool, uint256 tokenAmountOut, string calldata resellerCode, address buyer)
+    function buyFromPoolExactOut(
+        address pool,
+        address asset,
+        uint256 tokenAmountOut,
+        string calldata resellerCode,
+        address buyer
+    )
         external
         whenNotPaused
         nonReentrant
@@ -464,16 +512,17 @@ contract FlowstateMarket is
     {
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists) revert UnknownPool();
+        if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
         if (buyer == address(0)) revert ZeroAddress();
         _checkCode(resellerCode);
         if (freezeEnabled && (frozen[msg.sender] || frozen[buyer])) revert AccountFrozen();
 
         uint256 rate;
         (tokensFilled, quotePaid, rate) =
-            IFlowstatePool(pool).priceBuy(tokenAmountOut, priceOracle, oracleEpoch);
+            IFlowstatePool(pool).priceBuy(asset, tokenAmountOut, priceOracle, oracleEpoch);
         if (tokensFilled != tokenAmountOut) revert FillShortfall();
 
-        IERC20 quote = IERC20(rec.quoteAsset);
+        IERC20 quote = IERC20(asset);
         if (
             msg.sender.code.length != 0
                 && (
@@ -481,12 +530,12 @@ contract FlowstateMarket is
                         || quote.allowance(msg.sender, address(this)) < quotePaid
                 )
         ) {
-            IFlowstateBuyFunder(msg.sender).fundBuy(rec.quoteAsset, quotePaid);
+            IFlowstateBuyFunder(msg.sender).fundBuy(asset, quotePaid);
         }
         quote.safeTransferFrom(msg.sender, pool, quotePaid);
 
         IFlowstatePool(pool).settleBuy(
-            buyer, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
+            buyer, asset, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
         );
     }
 
@@ -524,20 +573,21 @@ contract FlowstateMarket is
     // Quoters (SOR/adapter integration — NEVER revert)
     // ────────────────────────────────────────────────────────────────────
 
-    /// @notice Non-reverting quote for a buy. `quoteAmount` is exactly what
-    ///         buyFromPool would pull in the same block with the same args (the
-    ///         consistency invariant aggregators route on). `available == false` on
-    ///         any non-quotable state: unknown pool, pause, empty, band-out, oracle
-    ///         failure. Freeze status is per-caller and deliberately not reflected.
-    function quoteBuyFromPool(address pool, uint256 amount)
+    /// @notice Non-reverting quote for a buy in the NAMED asset. `quoteAmount` is
+    ///         exactly what buyFromPool would pull in the same block with the same
+    ///         args (the consistency invariant aggregators route on). `available ==
+    ///         false` on any non-quotable state: unknown pool, unapproved or unseeded
+    ///         asset, pause, empty, band-out, stale anchor, oracle failure. Freeze
+    ///         status is per-caller and deliberately not reflected.
+    function quoteBuyFromPool(address pool, address asset, uint256 amount)
         external
         view
         returns (FlowstateStructs.Quote memory q)
     {
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
-        if (!rec.exists || paused()) return q;
+        if (!rec.exists || !approvedQuoteAssets[asset] || paused()) return q;
         (bool ok, uint256 fillable, uint256 cost) =
-            IFlowstatePool(pool).previewBuy(amount, priceOracle, oracleEpoch);
+            IFlowstatePool(pool).previewBuy(asset, amount, priceOracle, oracleEpoch);
         if (!ok) return q;
         uint16 feeBps = _feeBpsOf(rec.inventoryToken);
         q = FlowstateStructs.Quote({
@@ -546,12 +596,13 @@ contract FlowstateMarket is
             quoteAmount: cost, // buyer pays cost; the fee is carved out of the seller leg
             feeAmount: (cost * feeBps) / 10_000,
             feeBps: feeBps,
-            quoteAsset: rec.quoteAsset
+            quoteAsset: asset
         });
     }
 
     /// @notice Non-reverting quote for a sell. `quoteAmount` is the seller-visible
-    ///         NET proceeds (gross − fee), matching sellToPool's return value.
+    ///         NET proceeds (gross − fee) in the pool's buy-back asset, matching
+    ///         sellToPool's return value.
     function quoteSellToPool(address pool, uint256 amount)
         external
         view
@@ -570,8 +621,48 @@ contract FlowstateMarket is
             quoteAmount: gross - fee,
             feeAmount: fee,
             feeBps: feeBps,
-            quoteAsset: rec.quoteAsset
+            quoteAsset: IFlowstatePool(pool).buybackAsset()
         });
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Anchor freshness keeper + integrator compatibility views
+    // ────────────────────────────────────────────────────────────────────
+
+    /// @notice Permissionless freshness keeper (§3.4 item 1): advances one pool
+    ///         anchor through the SAME band-checked path a trade uses, with no trade
+    ///         attached, so an idle pool never hits the staleness bound. Factory-
+    ///         routed so the oracle address and epoch are always canonical — the
+    ///         pool-side function is onlyFactory precisely so nobody can feed a pool
+    ///         a rate from an oracle of their choosing.
+    function pokeAnchor(address pool, address asset) external whenNotPaused nonReentrant {
+        if (!poolRecords[pool].exists) revert UnknownPool();
+        if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
+        IFlowstatePool(pool).pokeAnchor(asset, priceOracle, oracleEpoch);
+    }
+
+    /// @notice Legacy-shape compatibility view: pre-multi-asset integrators resolve
+    ///         pools by (token, quoteAsset). Any approved asset maps to the token's
+    ///         single pool now.
+    function poolByPair(address token, address quoteAsset) external view returns (address) {
+        if (!approvedQuoteAssets[quoteAsset]) return address(0);
+        return poolByToken[token];
+    }
+
+    /// @notice Currently-approved quote assets (filters revoked entries out of the
+    ///         ever-approved list).
+    function getApprovedQuoteAssets() external view returns (address[] memory assets) {
+        uint256 length = quoteAssetList.length;
+        uint256 count;
+        for (uint256 i = 0; i < length; ++i) {
+            if (approvedQuoteAssets[quoteAssetList[i]]) ++count;
+        }
+        assets = new address[](count);
+        uint256 j;
+        for (uint256 i = 0; i < length; ++i) {
+            address asset = quoteAssetList[i];
+            if (approvedQuoteAssets[asset]) assets[j++] = asset;
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -597,9 +688,17 @@ contract FlowstateMarket is
         emit FlowstateEvents.FeeBpsSet(token, feeBps);
     }
 
+    /// @dev The ever-approved list backs createPool's seeding loop and the filtered
+    ///      getApprovedQuoteAssets view; entries are never removed (revocation is the
+    ///      mapping flipping false — the loops skip revoked entries), so re-approval
+    ///      cannot duplicate and list growth is admin-bounded.
     function setQuoteAsset(address asset, bool approved) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (asset == address(0)) revert ZeroAddress();
         approvedQuoteAssets[asset] = approved;
+        if (approved && !inQuoteAssetList[asset]) {
+            inQuoteAssetList[asset] = true;
+            quoteAssetList.push(asset);
+        }
         emit FlowstateEvents.QuoteAssetSet(asset, approved);
     }
 
@@ -704,24 +803,34 @@ contract FlowstateMarket is
         emit FlowstateEvents.PriceSourceUpdated(pool, source);
     }
 
-    /// @notice Liveness escape hatch for drift beyond the widened band (D3).
-    function resetAnchor(address pool) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    /// @notice Liveness escape hatch for drift beyond the widened band (D3), per
+    ///         asset. Doubles as the LATE-SEEDING lane: an asset approved after a
+    ///         pool's creation (or unpriceable at creation) is seeded here — behind
+    ///         the admin role on purpose, because a first observation is band-check-
+    ///         free by definition and its moment must never be attacker-chosen.
+    function resetAnchor(address pool, address asset) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!poolRecords[pool].exists) revert UnknownPool();
-        IFlowstatePool(pool).resetAnchor(priceOracle, oracleEpoch);
+        if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
+        IFlowstatePool(pool).resetAnchor(asset, priceOracle, oracleEpoch);
     }
 
-    /// @notice Per-pool buy-back config (§4 scope): enable flag (ships OFF), buy-side
-    ///         spread, and quote-spend window cap.
+    /// @notice Per-pool buy-back config (§4 scope): the ONE asset the cash side runs
+    ///         in, enable flag (ships OFF), buy-side spread, and quote-spend window
+    ///         cap. The pool refuses an asset change while the cash side holds funds.
     function setBuyBack(
         address pool,
+        address asset,
         bool enabled,
         uint16 spreadBps,
         uint128 maxQuotePerWindow,
         uint32 windowSeconds
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (!poolRecords[pool].exists) revert UnknownPool();
-        IFlowstatePool(pool).setBuyBack(enabled, spreadBps, maxQuotePerWindow, windowSeconds);
-        emit FlowstateEvents.BuyBackConfigured(pool, enabled, spreadBps, maxQuotePerWindow, windowSeconds);
+        if (enabled && !approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
+        IFlowstatePool(pool).setBuyBack(asset, enabled, spreadBps, maxQuotePerWindow, windowSeconds);
+        emit FlowstateEvents.BuyBackConfigured(
+            pool, asset, enabled, spreadBps, maxQuotePerWindow, windowSeconds
+        );
     }
 
     /// @notice Emergency stop: pausing needs PAUSER_ROLE (hot-key eligible);
