@@ -92,6 +92,7 @@ interface IFlowstatePoolTest {
     function anchorBandBps() external view returns (uint16);
     function poolPaused() external view returns (bool);
     function claimableQuote(address asset, address user) external view returns (uint256);
+    function claimQuote() external;
     function anchorOf(address asset) external view returns (uint192 rate, uint64 time, uint192 ema, uint32 epoch);
     function previewBuy(uint256 amount, address oracle, uint32 epoch)
         external

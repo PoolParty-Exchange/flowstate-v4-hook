@@ -123,9 +123,12 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         Keyed by keccak256(currency0, currency1) in V4 sorted order.
     mapping(bytes32 pairKey => PairConfig config) public pairs;
 
-    /// @notice Size-adjustment schedule PER QUOTE ASSET (notional is measured in raw
-    ///         quote-asset units, so a schedule cannot be shared across quote assets
-    ///         with different decimals/value). Rungs are stored strictly ascending by
+    /// @notice Size-adjustment schedule PER MARKET ASSET: notional is measured in raw
+    ///         units of the asset the market is called with, so a schedule cannot be
+    ///         shared across assets with different decimals/value. For native-quoted
+    ///         V4 pools the market asset is the WRAPPER, so native and wrapped pools
+    ///         share ONE schedule (their units are identical by construction) — keyed
+    ///         under the wrapper's address. Rungs are stored strictly ascending by
     ///         ceiling with non-decreasing extraBps (unordered input is REJECTED, not
     ///         normalized — RungScheduleInvalid). Evaluation: the first rung whose
     ///         ceiling >= notional applies; above the top ceiling the TOP rung's
@@ -385,7 +388,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         (Currency c0, Currency c1) = _sort(quote, token);
         PairConfig memory cfg = pairs[_pairKey(c0, c1)];
         if (!cfg.registered) revert PairNotRegistered();
-        return _spreadBps(cfg.baseSpreadBps, quote, quoteNotional);
+        return _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), quoteNotional);
     }
 
     // -------------------------------------------------------------------------
@@ -456,7 +459,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         returns (uint256 quoteIn, uint256 tokensOut, uint256 spreadAccrued, uint256 dustAccrued, BeforeSwapDelta hookDelta)
     {
         quoteIn = uint256(-amountSpecified);
-        uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, input, quoteIn);
+        uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), quoteIn);
         uint256 netQuote = spreadBps == 0 ? quoteIn : quoteIn * BPS_DENOMINATOR / (BPS_DENOMINATOR + spreadBps);
         // Sub-dust ticket: the carve leaves the market nothing to price. Raise the
         // explicit typed error rather than letting FlowstatePool's InvalidAmount
@@ -500,7 +503,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         (, uint256 cost) =
             market.buyFromPoolExactOut(cfg.marketPool, cfg.marketAsset, tokensOut, resellerCode, address(this));
         if (nativeIn) _takeNativeInCallback = false;
-        uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, input, cost);
+        uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), cost);
         spreadAccrued = _ceilBps(cost, spreadBps);
         dustAccrued = 0; // exact-output has no carve: cost is exact, spread is exact
         quoteIn = cost + spreadAccrued;

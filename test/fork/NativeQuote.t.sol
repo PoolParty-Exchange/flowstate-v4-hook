@@ -110,6 +110,32 @@ contract NativeQuoteForkTest is ForkTestBase {
         assertEq(address(hook).balance, 0, "zero native custody");
     }
 
+    /// @dev Rung unification: schedules key on the MARKET asset, so the wrapper's
+    ///      schedule governs native pools too — one schedule to maintain per economic
+    ///      asset, no drift between the two V4 representations of the same value.
+    function test_Native_RungsSharedWithWrapperSchedule() public {
+        hook.setBaseSpread(Currency.wrap(address(0)), Currency.wrap(address(token)), 50);
+        FlowstateC1Hook.SpreadRung[] memory rungs = new FlowstateC1Hook.SpreadRung[](1);
+        rungs[0] = FlowstateC1Hook.SpreadRung({notionalCeiling: uint128(1e17), extraBps: 25});
+        hook.setSizeRungs(Currency.wrap(AEWETH), rungs); // configured under the WRAPPER
+
+        // the native pair reads the wrapper's schedule
+        assertEq(
+            hook.spreadBpsFor(Currency.wrap(address(0)), Currency.wrap(address(token)), 1e16),
+            75,
+            "native pair pays base + the wrapper-keyed rung"
+        );
+        // and it binds end to end: margin accrues at 75 bps on a native swap
+        uint256 quoteIn = 1e16;
+        uint256 wethBefore = IERC20(AEWETH).balanceOf(address(hook));
+        _swapBuyNative(-int256(quoteIn), quoteIn);
+        uint256 accrued = IERC20(AEWETH).balanceOf(address(hook)) - wethBefore;
+        // netQuote carve at 75 bps, spread = ceil(quotePaid x 75 / 10000); dust makes
+        // the exact wei value carve-dependent, so assert the tight band
+        assertGt(accrued, quoteIn * 70 / 10_000, "accrual reflects the rung");
+        assertLt(accrued, quoteIn * 80 / 10_000, "accrual bounded near 75 bps");
+    }
+
     /// @dev Rule 2 unchanged on native pools: buy direction only.
     function test_Native_SellDirectionReverts() public {
         deal(address(token), swapper, 1e18);
@@ -127,6 +153,38 @@ contract NativeQuoteForkTest is ForkTestBase {
             ""
         );
         vm.stopPrank();
+    }
+
+    /// @dev The multi-asset core, end to end through the hook: TWO V4 doors (USDG and
+    ///      native) draw from ONE C1 pool in the same block. Per-asset anchors resolve
+    ///      independently, both fill, inventory is shared, and the lister's proceeds
+    ///      arrive as a mix of both assets, swept in a single claim.
+    function test_Native_BothDoorsShareOneC1PoolSameBlock() public {
+        uint256 invBefore = poolContract.tokenBalance();
+
+        // door 1: USDG-quoted V4 pool (the base fixture's poolKey)
+        uint256 usdgIn = 100e6;
+        vm.prank(swapper);
+        _swapBuy(-int256(usdgIn), "");
+        // door 2: native-quoted V4 pool, same block, same C1 pool
+        uint256 nativeIn = 1e16;
+        _swapBuyNative(-int256(nativeIn), nativeIn);
+
+        uint256 usdgTokens = usdgIn * 1e18 / ORACLE_RATE;
+        uint256 nativeTokens = nativeIn * 1e18 / RATE_W;
+        assertEq(invBefore - poolContract.tokenBalance(), usdgTokens + nativeTokens, "one inventory, two doors");
+
+        // proceeds are a mix across both claim ledgers, swept in one claim
+        uint256 usdgFee = usdgIn * MARKET_FEE_BPS / 10_000;
+        uint256 wethFee = nativeIn * MARKET_FEE_BPS / 10_000;
+        assertEq(poolContract.claimableQuote(USDG, lister), usdgIn - usdgFee, "USDG leg credited");
+        assertEq(poolContract.claimableQuote(AEWETH, lister), nativeIn - wethFee, "aeWETH leg credited");
+        uint256 usdgBal = IERC20(USDG).balanceOf(lister);
+        uint256 wethBal = IERC20(AEWETH).balanceOf(lister);
+        vm.prank(lister);
+        poolContract.claimQuote();
+        assertEq(IERC20(USDG).balanceOf(lister) - usdgBal, usdgIn - usdgFee, "one claim sweeps USDG");
+        assertEq(IERC20(AEWETH).balanceOf(lister) - wethBal, nativeIn - wethFee, "and aeWETH");
     }
 
     /// @dev Config safety: a chain with no wrapper configured cannot register native
