@@ -37,7 +37,8 @@ contract SlimOracleLiveForkTest is Test {
         uint256 forkBlock = vm.envOr("FORK_BLOCK", uint256(0));
         if (forkBlock == 0) vm.createSelectFork(vm.rpcUrl("robinhood"));
         else vm.createSelectFork(vm.rpcUrl("robinhood"), forkBlock);
-        oracle = new FlowstateSlimOracle(address(this));
+        // the live aggregator IS the fallback: unregistered pairs read it verbatim
+        oracle = new FlowstateSlimOracle(address(this), RH_LIVE_ORACLE);
     }
 
     /// @dev poolId for a hookless (currency0, currency1, fee, tickSpacing) V4 key —
@@ -83,7 +84,7 @@ contract SlimOracleLiveForkTest is Test {
             srcIsToken0: true,
             poolId: poolId
         });
-        oracle.setFeed(AEWETH, USDG, venues, 0);
+        oracle.setFeed(AEWETH, USDG, venues);
 
         uint256 g = gasleft();
         uint256 slim = oracle.getRate(IERC20(AEWETH), IERC20(USDG), false);
@@ -104,5 +105,11 @@ contract SlimOracleLiveForkTest is Test {
         // deep single book sitting within 1.5% of it validates both directions
         assertLt(deltaBps, 150, "slim within 1.5% of the aggregator on the deep pair");
         assertLt(gasUsed, 80_000, "Phase 3 gas target holds on live state");
+
+        // the permissionless fallback, live: an unregistered pair answers exactly
+        // what the aggregator answers (any token prices with nobody's approval)
+        uint256 viaFallback = oracle.getRate(IERC20(USDG), IERC20(AEWETH), false);
+        uint256 aggDirect = IOracle(RH_LIVE_ORACLE).getRate(IERC20(USDG), IERC20(AEWETH), false);
+        assertEq(viaFallback, aggDirect, "unregistered pair passes through verbatim");
     }
 }

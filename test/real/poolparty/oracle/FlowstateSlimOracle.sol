@@ -46,6 +46,23 @@ import "../interface/IOracle.sol";
  * per-token decision, and the minimum-depth floor turns "the book got drained"
  * into a clean decline instead of a confident wrong answer.
  *
+ * PERMISSIONLESS BY CONSTRUCTION (revised 2026-07-31 after design review). The
+ * registry is an ACCELERATOR, never a gate:
+ *   - a pair with NO registered feed falls through to the fallback oracle (the
+ *     general-purpose aggregator) — any token prices the moment it exists, with
+ *     nobody's approval, at the aggregator's gas cost;
+ *   - a pair WITH a feed lives and dies by its curated venues and NEVER falls
+ *     through — otherwise draining a curated book would re-open pricing off the
+ *     same thin book via the fallback's floor-less read;
+ *   - venue quality is governed by ONE protocol-wide rule instead of per-pair
+ *     numbers: a venue holding less than minQuoteDepth[quote] of the quote asset
+ *     near the current price is IGNORED (rug/migration dust drops out on every
+ *     read, live), and if every venue for a pair is ignored the pair declines.
+ *     Config is one value per quote asset per chain, chosen from measured
+ *     manipulation-cost data. The floor prices the ENTRY TICKET of an attack;
+ *     the pools' anchor bands cap the rate of theft behind it — the floor is not
+ *     the whole defence and is not oversold as one.
+ *
  * INTERFACE. Drop-in IOracle: rate is dstToken raw units per 1e18-scaled srcToken
  * raw unit, the exact convention FlowstatePool consumes (quoteCost = amount x rate
  * / 1e18). getRateToEth is not part of C1's read path and reverts.
@@ -74,16 +91,39 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
     }
 
     struct PairFeed {
-        Venue[] venues;        // 1..MAX_VENUES
-        uint128 minLiquidity;  // Σ in-range L below this ⇒ decline (return 0)
+        Venue[] venues; // 1..MAX_VENUES
     }
 
     mapping(bytes32 pairKey => PairFeed) private feeds;
 
-    event FeedSet(address indexed src, address indexed dst, uint256 venueCount, uint128 minLiquidity);
-    event FeedCleared(address indexed src, address indexed dst);
+    /// @notice The protocol-wide thinness rule, one value per QUOTE asset: a venue
+    ///         holding less than this many raw quote units within ~±2% of the
+    ///         current price is ignored on that read. 0 = no floor configured
+    ///         (permissive; set at deploy from measured manipulation-cost data).
+    mapping(address quote => uint128) public minQuoteDepth;
 
-    constructor(address _owner) Ownable(_owner) {}
+    /// @notice The market-cap ratio floor, protocol-wide, in bps: a venue must also
+    ///         hold near-price depth of at least (ratio x totalSupply x price) to be
+    ///         trusted, so the minimum manipulation cost SCALES with the size of the
+    ///         token the venue is pricing. 0 = disabled. Tokens whose totalSupply()
+    ///         is unreadable skip this check (absolute floor still applies) rather
+    ///         than bricking the pair. On-chain "market cap" is fully-diluted by
+    ///         necessity; the error direction is stricter, never looser.
+    uint16 public mcRatioFloorBps;
+
+    /// @notice The permissionless fallback (the general-purpose aggregator).
+    ///         Unregistered pairs read it verbatim; registered pairs never do.
+    ///         address(0) = no fallback (unregistered pairs simply decline).
+    IOracle public immutable fallbackOracle;
+
+    event FeedSet(address indexed src, address indexed dst, uint256 venueCount);
+    event FeedCleared(address indexed src, address indexed dst);
+    event MinQuoteDepthSet(address indexed quote, uint128 minDepth);
+    event McRatioFloorSet(uint16 ratioBps);
+
+    constructor(address _owner, address _fallbackOracle) Ownable(_owner) {
+        fallbackOracle = IOracle(_fallbackOracle);
+    }
 
     // ────────────────────────────────────────────────────────────────────
     // Registry (owner; per-pair, deliberate — see header)
@@ -98,12 +138,7 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
     ///         not silently on the hot path.
     /// @dev The registry is intentionally per-(src,dst) directional: C1 pools only
     ///      ever read token→quote. Register the direction you serve.
-    function setFeed(
-        address src,
-        address dst,
-        Venue[] calldata venues,
-        uint128 minLiquidity
-    ) external onlyOwner {
+    function setFeed(address src, address dst, Venue[] calldata venues) external onlyOwner {
         if (venues.length == 0 || venues.length > MAX_VENUES) revert TooManyVenues();
         PairFeed storage feed = feeds[_pairKey(src, dst)];
         delete feed.venues;
@@ -125,8 +160,7 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
                 revert InvalidVenue();
             }
         }
-        feed.minLiquidity = minLiquidity;
-        emit FeedSet(src, dst, venues.length, minLiquidity);
+        emit FeedSet(src, dst, venues.length);
     }
 
     function clearFeed(address src, address dst) external onlyOwner {
@@ -134,25 +168,39 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
         emit FeedCleared(src, dst);
     }
 
-    function getFeed(address src, address dst)
-        external
-        view
-        returns (Venue[] memory venues, uint128 minLiquidity)
-    {
-        PairFeed storage feed = feeds[_pairKey(src, dst)];
-        return (feed.venues, feed.minLiquidity);
+    function getFeed(address src, address dst) external view returns (Venue[] memory venues) {
+        return feeds[_pairKey(src, dst)].venues;
+    }
+
+    /// @notice Set the thinness floor for one quote asset (raw units of near-price
+    ///         depth). Applies protocol-wide to every feed quoted in that asset.
+    function setMinQuoteDepth(address quote, uint128 minDepth) external onlyOwner {
+        minQuoteDepth[quote] = minDepth;
+        emit MinQuoteDepthSet(quote, minDepth);
+    }
+
+    /// @notice Set the protocol-wide market-cap ratio floor (bps of FDV a venue's
+    ///         near-price depth must reach). 100 = 1%.
+    function setMcRatioFloor(uint16 ratioBps) external onlyOwner {
+        mcRatioFloorBps = ratioBps;
+        emit McRatioFloorSet(ratioBps);
     }
 
     // ────────────────────────────────────────────────────────────────────
     // IOracle
     // ────────────────────────────────────────────────────────────────────
 
-    /// @notice dst raw units per src unit, scaled by 1e18. Returns 0 — a clean
-    ///         decline the pools convert to NoOracleRate / an unavailable quote —
-    ///         when: no feed is registered, every venue read fails, or total
-    ///         in-range liquidity sits under the pair's floor. Never reverts on
-    ///         venue state (a broken venue is skipped; a drained book declines).
-    function getRate(IERC20 srcToken, IERC20 dstToken, bool)
+    /// @notice dst raw units per src unit, scaled by 1e18.
+    ///         UNREGISTERED pair: reads the fallback aggregator verbatim (the
+    ///         permissionless path; returns 0 if no fallback is configured or the
+    ///         fallback fails). REGISTERED pair: reads only the curated venues,
+    ///         IGNORES any venue under the quote asset's near-price depth floor
+    ///         (checked live on every read — rug and migration dust drops out
+    ///         automatically), and returns 0 — a clean decline the pools convert
+    ///         to NoOracleRate / an unavailable quote — when every venue is
+    ///         ignored or fails. A registered pair NEVER falls through. Never
+    ///         reverts on venue state.
+    function getRate(IERC20 srcToken, IERC20 dstToken, bool useWrappers)
         external
         view
         override
@@ -160,8 +208,11 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
     {
         PairFeed storage feed = feeds[_pairKey(address(srcToken), address(dstToken))];
         uint256 n = feed.venues.length;
-        if (n == 0) return 0;
+        if (n == 0) return _fallbackRate(srcToken, dstToken, useWrappers);
 
+        uint128 floor = minQuoteDepth[address(dstToken)];
+        uint256 ratioBps = mcRatioFloorBps;
+        uint256 supply = ratioBps == 0 ? 0 : _tryTotalSupply(address(srcToken));
         uint256 weighted; // Σ rate_i × L_i
         uint256 totalL;   // Σ L_i — same-pair venues share L units, so weights compare
         for (uint256 i = 0; i < n; ++i) {
@@ -170,11 +221,56 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
             if (!ok || sqrtPriceX96 == 0 || liquidity == 0) continue;
             uint256 r = _rateFromSqrtPrice(sqrtPriceX96, v.srcIsToken0);
             if (r == 0) continue;
+            // the protocol-wide thinness rules: a venue must clear BOTH the absolute
+            // floor and the market-cap ratio floor (whichever is higher binds), or it
+            // is ignored on this read — rug/migration dust and books that are small
+            // relative to the token they price drop out live
+            if (floor != 0 || (ratioBps != 0 && supply != 0)) {
+                uint256 depth = _quoteDepthNearPrice(sqrtPriceX96, liquidity, v.srcIsToken0);
+                if (floor != 0 && depth < floor) continue;
+                if (ratioBps != 0 && supply != 0) {
+                    // FDV in quote raw units = supply × rate / 1e18; floor = bps of it
+                    uint256 mcFloor = Math.mulDiv(Math.mulDiv(supply, r, RATE_SCALE), ratioBps, 10_000);
+                    if (depth < mcFloor) continue;
+                }
+            }
             weighted += r * liquidity;
             totalL += liquidity;
         }
-        if (totalL == 0 || totalL < feed.minLiquidity) return 0;
+        if (totalL == 0) return 0;
         rate = weighted / totalL;
+    }
+
+    /// @dev The permissionless path. A failing or absent fallback yields 0 (decline),
+    ///      never a revert — same failure grammar as the curated path.
+    function _fallbackRate(IERC20 src, IERC20 dst, bool useWrappers) private view returns (uint256) {
+        if (address(fallbackOracle) == address(0)) return 0;
+        (bool ok, bytes memory data) = address(fallbackOracle).staticcall(
+            abi.encodeCall(IOracle.getRate, (src, dst, useWrappers))
+        );
+        if (!ok || data.length < 32) return 0;
+        return abi.decode(data, (uint256));
+    }
+
+    /// @dev Estimated raw quote-asset depth within ~±2% of the current price, from the
+    ///      two values already read (sqrtPriceX96, in-range L). A ±2% price band is a
+    ///      ~±1% sqrt-price band; V3 math gives, for that band:
+    ///        quote == token1:  depth ≈ L × ΔsqrtP / 2^96          = L × sqrtP/2^96 / 100
+    ///        quote == token0:  depth ≈ L × 2^96 × ΔsqrtP / sqrtP² = L × 2^96/sqrtP / 100
+    ///      An ESTIMATE by design (assumes L constant across the band, which
+    ///      concentrated positions may violate): its job is gating dust from real
+    ///      books, not measuring books precisely.
+    function _quoteDepthNearPrice(uint160 sqrtPriceX96, uint128 liquidity, bool srcIsToken0)
+        private
+        pure
+        returns (uint256)
+    {
+        if (srcIsToken0) {
+            // src (the priced token) is token0 ⇒ the quote is token1
+            return Math.mulDiv(liquidity, sqrtPriceX96, Q96) / 100;
+        }
+        // quote is token0
+        return Math.mulDiv(liquidity, Q96, sqrtPriceX96) / 100;
     }
 
     /// @dev Not part of C1's read path (pools price token→quote directly); reverting
@@ -224,6 +320,14 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
         }
         uint256 inv = Math.mulDiv(Q96, RATE_SCALE, uint256(sqrtPriceX96));
         return Math.mulDiv(inv, Q96, uint256(sqrtPriceX96));
+    }
+
+    /// @dev Failure-tolerant totalSupply: a token with a broken or non-standard
+    ///      supply skips the ratio check (returns 0) instead of bricking the pair.
+    function _tryTotalSupply(address token) private view returns (uint256) {
+        (bool ok, bytes memory data) = token.staticcall(abi.encodeCall(IERC20.totalSupply, ()));
+        if (!ok || data.length < 32) return 0;
+        return abi.decode(data, (uint256));
     }
 
     function _pairKey(address src, address dst) private pure returns (bytes32) {
