@@ -108,7 +108,9 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
     ///         token the venue is pricing. 0 = disabled. Tokens whose totalSupply()
     ///         is unreadable skip this check (absolute floor still applies) rather
     ///         than bricking the pair. On-chain "market cap" is fully-diluted by
-    ///         necessity; the error direction is stricter, never looser.
+    ///         necessity, corrected for 0xdead-address burns (effective supply =
+    ///         totalSupply minus the dead balance); residual error is stricter,
+    ///         never looser.
     uint16 public mcRatioFloorBps;
 
     /// @notice The permissionless fallback (the general-purpose aggregator).
@@ -212,7 +214,7 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
 
         uint128 floor = minQuoteDepth[address(dstToken)];
         uint256 ratioBps = mcRatioFloorBps;
-        uint256 supply = ratioBps == 0 ? 0 : _tryTotalSupply(address(srcToken));
+        uint256 supply = ratioBps == 0 ? 0 : _tryEffectiveSupply(address(srcToken));
         uint256 weighted; // Σ rate_i × L_i
         uint256 totalL;   // Σ L_i — same-pair venues share L units, so weights compare
         for (uint256 i = 0; i < n; ++i) {
@@ -322,12 +324,25 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
         return Math.mulDiv(inv, Q96, uint256(sqrtPriceX96));
     }
 
-    /// @dev Failure-tolerant totalSupply: a token with a broken or non-standard
-    ///      supply skips the ratio check (returns 0) instead of bricking the pair.
-    function _tryTotalSupply(address token) private view returns (uint256) {
+    address private constant DEAD = 0x000000000000000000000000000000000000dEaD;
+
+    /// @dev Failure-tolerant EFFECTIVE supply: totalSupply minus the 0xdead balance.
+    ///      Tokens that burn properly shrink totalSupply on their own; tokens that
+    ///      "burn" by transferring to 0xdead do not, which would overstate FDV and
+    ///      over-tighten the ratio floor for exactly those tokens (decided 31 Jul).
+    ///      One extra balance read into the already-warm token contract (~3k gas),
+    ///      only on reads where the ratio floor is active. A broken or non-standard
+    ///      token skips the ratio check (returns 0) instead of bricking the pair.
+    function _tryEffectiveSupply(address token) private view returns (uint256) {
         (bool ok, bytes memory data) = token.staticcall(abi.encodeCall(IERC20.totalSupply, ()));
         if (!ok || data.length < 32) return 0;
-        return abi.decode(data, (uint256));
+        uint256 supply = abi.decode(data, (uint256));
+        (bool ok2, bytes memory data2) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (DEAD)));
+        if (ok2 && data2.length >= 32) {
+            uint256 dead = abi.decode(data2, (uint256));
+            if (dead < supply) supply -= dead;
+        }
+        return supply;
     }
 
     function _pairKey(address src, address dst) private pure returns (bytes32) {
