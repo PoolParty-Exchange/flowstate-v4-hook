@@ -139,9 +139,9 @@ abstract contract ForkTestBase is RealStackDeployer {
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this))
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH)
         );
-        hook = new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this));
+        hook = new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this), AEWETH);
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
 
         // Conservative ship default: zero base spread, no rung schedule (the spread
@@ -179,7 +179,7 @@ abstract contract ForkTestBase is RealStackDeployer {
         token.mint(lister, amount);
         vm.startPrank(lister);
         token.approve(address(market), type(uint256).max);
-        created = market.createPool(address(token), USDG, amount, 0);
+        created = market.createPool(address(token), amount, 0);
         vm.stopPrank();
     }
 
@@ -196,7 +196,7 @@ abstract contract ForkTestBase is RealStackDeployer {
     ///      exposes for exactly this is the admin `resetAnchor`.
     function _setOracleRate(uint256 newRate) internal {
         oracle.setRate(address(token), USDG, newRate);
-        market.resetAnchor(pool);
+        market.resetAnchor(pool, USDG);
         _expireRateCache();
     }
 

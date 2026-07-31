@@ -45,7 +45,7 @@ contract TakeSettleForkTest is ForkTestBase {
         b.receiverUsdg = IERC20(USDG).balanceOf(stack.receiver);
         b.hookUsdg = IERC20(USDG).balanceOf(address(hook));
         b.hookTok = token.balanceOf(address(hook));
-        b.listerClaimable = poolContract.claimableQuote(lister);
+        b.listerClaimable = poolContract.claimableQuote(USDG, lister);
     }
 
     function _assertConservation(Balances memory pre, Balances memory post, uint256 quotePaid, uint256 tokensOut)
@@ -118,7 +118,7 @@ contract TakeSettleForkTest is ForkTestBase {
         vm.prank(swapper);
         _swapBuy(-int256(quoteIn), "");
 
-        uint256 claimable = poolContract.claimableQuote(lister);
+        uint256 claimable = poolContract.claimableQuote(USDG, lister);
         assertEq(claimable, quoteIn - _feeOn(quoteIn), "credited net of the seller-leg fee");
 
         uint256 before = IERC20(USDG).balanceOf(lister);
@@ -126,6 +126,6 @@ contract TakeSettleForkTest is ForkTestBase {
         (bool ok,) = pool.call(abi.encodeWithSignature("claimQuote()"));
         assertTrue(ok, "claimQuote");
         assertEq(IERC20(USDG).balanceOf(lister) - before, claimable, "claimed to the wei");
-        assertEq(poolContract.claimableQuote(lister), 0, "ledger cleared");
+        assertEq(poolContract.claimableQuote(USDG, lister), 0, "ledger cleared");
     }
 }

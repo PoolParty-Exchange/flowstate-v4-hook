@@ -3,8 +3,9 @@ pragma solidity ^0.8.26;
 
 /// @notice Minimal market surface the V4 hook consumes — the FINAL Phase 1 signatures
 ///         of the pass-1 FlowstateMarket (pull-exact model) plus the additive
-///         exact-quote entry-point pair from build scope §2.2 (PoolParty_Contracts
-///         PR #8, on origin/main).
+///         exact-quote entry-point pair from build scope §2.2 (PR #8) as reshaped by
+///         the multi-asset change (PR #11, origin/main @ fd5575c): every buy path
+///         names the quote asset per trade.
 /// @dev Verified against the REAL FlowstateMarket on an RH fork (Phase 1 final): the
 ///      whole fork suite runs the hook against the deployed pass-1 contracts, and the
 ///      Phase 0 mock has been deleted. Signature drift on the market side is therefore
@@ -18,7 +19,7 @@ interface IFlowstateMarketMinimal {
     ///         the hook's swap paths use the pair below).
     /// @return tokensFilled tokens delivered (may be < amount on inventory caps).
     /// @return quotePaid    quote-asset units pulled from msg.sender.
-    function buyFromPool(address pool, uint256 amount, string calldata resellerCode, address buyer)
+    function buyFromPool(address pool, address asset, uint256 amount, string calldata resellerCode, address buyer)
         external
         returns (uint256 tokensFilled, uint256 quotePaid);
 
@@ -32,7 +33,7 @@ interface IFlowstateMarketMinimal {
     /// @param buyer         recipient of the purchased tokens.
     /// @return tokensFilled tokens delivered.
     /// @return quotePaid    quote-asset units actually pulled (<= quoteIn).
-    function buyFromPoolExactQuote(address pool, uint256 quoteIn, string calldata resellerCode, address buyer)
+    function buyFromPoolExactQuote(address pool, address asset, uint256 quoteIn, string calldata resellerCode, address buyer)
         external
         returns (uint256 tokensFilled, uint256 quotePaid);
 
@@ -45,7 +46,7 @@ interface IFlowstateMarketMinimal {
     ///         tokensFilled == tokenAmountOut).
     /// @return tokensFilled tokens delivered (== tokenAmountOut).
     /// @return quotePaid    quote-asset units pulled from msg.sender.
-    function buyFromPoolExactOut(address pool, uint256 tokenAmountOut, string calldata resellerCode, address buyer)
+    function buyFromPoolExactOut(address pool, address asset, uint256 tokenAmountOut, string calldata resellerCode, address buyer)
         external
         returns (uint256 tokensFilled, uint256 quotePaid);
 }

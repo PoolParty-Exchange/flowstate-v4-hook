@@ -58,16 +58,16 @@ contract LiveOracleGasForkTest is ForkTestBase {
         deal(AEWETH, lister, LIVE_INVENTORY);
         vm.startPrank(lister);
         inv.approve(address(market), type(uint256).max);
-        pool = market.createPool(AEWETH, USDG, LIVE_INVENTORY, 0);
+        pool = market.createPool(AEWETH, LIVE_INVENTORY, 0);
         vm.stopPrank();
 
         (address hookAddress, bytes32 salt) = HookMiner.find(
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this))
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH)
         );
-        hook = new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this));
+        hook = new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this), AEWETH);
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
         hook.registerPair(Currency.wrap(USDG), Currency.wrap(AEWETH), pool, 0);
 
