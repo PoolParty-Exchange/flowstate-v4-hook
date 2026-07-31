@@ -69,6 +69,7 @@ import "../interface/IOracle.sol";
  */
 contract FlowstateSlimOracle is IOracle, Ownable2Step {
     error UnsupportedLookup();
+    error FeedDisagreesWithFallback(uint256 feedRate, uint256 fallbackRate);
     error InvalidVenue();
     error TooManyVenues();
     error VenueTokensMismatch();
@@ -82,6 +83,7 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
     uint256 private constant RATE_SCALE = 1e18;
     uint256 private constant Q96 = 1 << 96;
     uint256 public constant MAX_VENUES = 2; // the slimness invariant, enforced
+    uint256 public constant SANITY_BPS = 2_000; // registration-time max deviation vs the fallback (20%)
 
     struct Venue {
         uint8 kind;        // KIND_V3 | KIND_V4
@@ -160,6 +162,21 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
                 feed.venues.push(Venue(KIND_V4, v.target, v.srcIsToken0, v.poolId));
             } else {
                 revert InvalidVenue();
+            }
+        }
+        // Registration sanity check (decided 31 Jul, auditor layer 3): when a
+        // fallback aggregator exists and answers, the new feed's blended rate must
+        // sit within SANITY_BPS of it, or registration reverts. Config-time only,
+        // zero hot-path cost: catches wrong-pool, wrong-orientation and mispriced-
+        // book mistakes at the moment of the mistake instead of at the first bad
+        // fill. Deliberately NOT a hot-path check: a live divergence is exactly
+        // what the curated feed is trusted over the blend for.
+        uint256 fbRate = _fallbackRate(IERC20(src), IERC20(dst), false);
+        if (fbRate != 0) {
+            uint256 feedRate = this.getRate(IERC20(src), IERC20(dst), false);
+            uint256 diff = feedRate > fbRate ? feedRate - fbRate : fbRate - feedRate;
+            if (feedRate == 0 || diff * 10_000 > fbRate * SANITY_BPS) {
+                revert FeedDisagreesWithFallback(feedRate, fbRate);
             }
         }
         emit FeedSet(src, dst, venues.length);
