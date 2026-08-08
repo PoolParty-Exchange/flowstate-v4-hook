@@ -66,8 +66,15 @@ contract BeaconDustCostTest is Test {
             ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: 1, salt: 0}),
             ""
         );
-        emit log_named_uint("settle currency0 (wei) for L=1", a0Before - c0.balanceOf(address(this)));
-        emit log_named_uint("settle currency1 (wei) for L=1", a1Before - c1.balanceOf(address(this)));
+        uint256 settle0 = a0Before - c0.balanceOf(address(this));
+        uint256 settle1 = a1Before - c1.balanceOf(address(this));
+        emit log_named_uint("settle currency0 (wei) for L=1", settle0);
+        emit log_named_uint("settle currency1 (wei) for L=1", settle1);
+        // regression bound (review concern 1): the L=1 beacon settle must stay
+        // value-negligible. 1e6 wei = 1e-12 of an 18d token; measured value is 1 wei
+        // at this pool's live price, so a breach means the math or a library changed.
+        assertLt(settle0 + settle1, 1e6, "L=1 settle no longer dust");
+        assertGt(settle0 + settle1, 0, "L=1 settle should be nonzero");
 
         // scaling checks so the number is not a rounding fluke
         a0Before = c0.balanceOf(address(this));

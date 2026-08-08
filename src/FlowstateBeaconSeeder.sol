@@ -9,6 +9,7 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -51,6 +52,7 @@ contract FlowstateBeaconSeeder is IUnlockCallback, ReentrancyGuard {
     error ZeroAddress();
     error PayCurrencyNotInPool();
     error NativePayUnsupported();
+    error BeaconRangeOutOfBounds(int24 tickLower, int24 tickUpper);
 
     /// @notice The beacon mint inside seedAndDeposit failed; the deposit proceeded.
     ///         The pool stays unlit until anyone calls seed() successfully.
@@ -131,9 +133,29 @@ contract FlowstateBeaconSeeder is IUnlockCallback, ReentrancyGuard {
 
         (, int24 tick,,) = poolManager.getSlot0(key.toId());
         bool payIsCurrency0 = Currency.unwrap(key.currency0) == payToken;
-        int24 spacing = key.tickSpacing;
-        int24 lower;
-        int24 upper;
+        (int24 lower, int24 upper) = computeBeaconRange(tick, key.tickSpacing, payIsCurrency0);
+
+        (BalanceDelta delta,) = poolManager.modifyLiquidity(
+            key, ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: 1, salt: 0}), ""
+        );
+
+        _settleOwed(key.currency0, delta.amount0(), payer);
+        _settleOwed(key.currency1, delta.amount1(), payer);
+        return "";
+    }
+
+    /// @notice The dust position's range: one tickSpacing wide, placed entirely on
+    ///         the side of `tick` that owes ONLY the payer's currency (above the
+    ///         current tick owes currency0; below owes currency1). Public and pure so
+    ///         the truncating integer division is directly testable across tick signs
+    ///         and boundaries. Reverts with a typed error if the pool's tick sits so
+    ///         close to MIN_TICK/MAX_TICK that no aligned one-spacing range fits
+    ///         (unreachable for real pools; belt-and-suspenders).
+    function computeBeaconRange(int24 tick, int24 spacing, bool payIsCurrency0)
+        public
+        pure
+        returns (int24 lower, int24 upper)
+    {
         if (payIsCurrency0) {
             // range fully ABOVE the current tick owes only currency0
             lower = ((tick / spacing) + 1) * spacing;
@@ -143,14 +165,9 @@ contract FlowstateBeaconSeeder is IUnlockCallback, ReentrancyGuard {
             upper = ((tick / spacing) - 1) * spacing;
             lower = upper - spacing;
         }
-
-        (BalanceDelta delta,) = poolManager.modifyLiquidity(
-            key, ModifyLiquidityParams({tickLower: lower, tickUpper: upper, liquidityDelta: 1, salt: 0}), ""
-        );
-
-        _settleOwed(key.currency0, delta.amount0(), payer);
-        _settleOwed(key.currency1, delta.amount1(), payer);
-        return "";
+        if (lower < TickMath.MIN_TICK || upper > TickMath.MAX_TICK) {
+            revert BeaconRangeOutOfBounds(lower, upper);
+        }
     }
 
     function _settleOwed(Currency currency, int128 amount, address payer) internal {
