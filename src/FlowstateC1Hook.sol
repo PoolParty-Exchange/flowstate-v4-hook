@@ -23,8 +23,11 @@ import {IWETH9} from "./interfaces/IWETH9.sol";
 /// @notice Uniswap V4 custom-curve hook adapting routed BUY flow onto Flowstate C1 pool
 ///         inventory via the pull-exact FlowstateMarket. The hook fully overrides the
 ///         concentrated-liquidity curve (BEFORE_SWAP_RETURNS_DELTA consuming the entire
-///         specified amount), so pools carry zero real V4 liquidity and the market does
-///         100% of the pricing.
+///         specified amount), so pools carry no tradeable V4 liquidity and the market
+///         does 100% of the pricing. The single permitted exception is the visibility
+///         beacon: one liquidityDelta == 1 dust add per pool (see beforeAddLiquidity),
+///         which exists to emit the ModifyLiquidity event some routing indexers key on
+///         and can never participate in pricing.
 ///
 /// @dev BUY-ONLY (scope §4, correction C1): a buy is quote-asset in, inventory token out.
 ///      Both sell-direction paths revert with SellDirectionNotSupported, identically in
@@ -123,6 +126,15 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         Keyed by keccak256(currency0, currency1) in V4 sorted order.
     mapping(bytes32 pairKey => PairConfig config) public pairs;
 
+    /// @notice Visibility beacon: whether a pool has consumed its single permitted
+    ///         liquidityDelta == 1 dust add (JUP-516). Measured 2026-08-08: GMGN's
+    ///         routing index admits pools by ModifyLiquidity history, so one dust add
+    ///         is the difference between invisible and routable there. Permissionless
+    ///         by design: any caller may fire it, the 1-wei cap means no real capital
+    ///         can ever be parked, and the dust never trades (beforeSwap consumes the
+    ///         entire specified amount, so the core curve always runs on zero).
+    mapping(PoolId poolId => bool seeded) public beaconSeeded;
+
     /// @notice Size-adjustment schedule PER MARKET ASSET: notional is measured in raw
     ///         units of the asset the market is called with, so a schedule cannot be
     ///         shared across assets with different decimals/value. For native-quoted
@@ -186,6 +198,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         uint256 spreadAccrued,
         uint256 dustAccrued
     );
+    event BeaconSeeded(PoolId indexed poolId, address indexed sender);
     event BaseSpreadUpdated(Currency indexed currency0, Currency indexed currency1, uint16 baseSpreadBps);
     event BaseSpreadFloorUpdated(uint16 previous, uint16 current);
     event SizeRungsUpdated(Currency indexed quote, SpreadRung[] rungs);
@@ -401,13 +414,24 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         return IHooks.beforeInitialize.selector;
     }
 
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
+    /// @notice Visibility beacon gate (JUP-516): admits exactly ONE liquidityDelta == 1
+    ///         add per pool, from any caller, then closes that pool forever. The
+    ///         ModifyLiquidity event this permits is the measured key into GMGN's
+    ///         routing index. Everything else about the original stray-LP protection
+    ///         survives: no position of real size can ever be created (delta capped at
+    ///         1), the dust never participates in pricing (the custom curve consumes
+    ///         the entire specified amount before the core swap runs), and removals
+    ///         remain unflagged because the only position that can exist is 1 wei.
+    function beforeAddLiquidity(address sender, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata)
         external
-        view
         onlyPoolManager
         returns (bytes4)
     {
-        revert LiquidityNotAllowed();
+        PoolId id = key.toId();
+        if (beaconSeeded[id] || params.liquidityDelta != 1) revert LiquidityNotAllowed();
+        beaconSeeded[id] = true;
+        emit BeaconSeeded(id, sender);
+        return IHooks.beforeAddLiquidity.selector;
     }
 
     /// @dev The custom curve. Consumes the entire specified amount (specifiedDelta =
