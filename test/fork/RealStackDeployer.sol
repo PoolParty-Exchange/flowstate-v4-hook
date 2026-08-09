@@ -101,7 +101,7 @@ interface IFlowstatePoolTest {
     function positions(address user)
         external
         view
-        returns (uint256 tokenPosition, uint256 cashPosition, uint256 claimQ, uint256 claimT);
+        returns (uint256 tokenPosition, uint256 cashPosition, uint256 claimT);
 
     // errors the hook path can surface
     error NoLiquidity();
