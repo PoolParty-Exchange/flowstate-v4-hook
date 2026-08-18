@@ -387,10 +387,11 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (desired == 0) revert AmountTooSmall();
 
         fillableAmount = _fillableBuy(desired);
-        if (fillableAmount < desired) revert FillShortfall();
+        if (fillableAmount == 0) revert NoLiquidity();
 
-        // recompute the pull exactly as priceBuy would for this amount (round UP)
-        quoteCost = (desired * rate + RATE_SCALE - 1) / RATE_SCALE;
+        // recompute the pull exactly as priceBuy would for this amount (round UP).
+        // MUST price fillableAmount, never `desired` (JUP-559, mirrors contracts PR #31).
+        quoteCost = (fillableAmount * rate + RATE_SCALE - 1) / RATE_SCALE;
     }
 
     /// @notice Step 2: factory has pulled `quotePaid` of `asset` to this pool; settle

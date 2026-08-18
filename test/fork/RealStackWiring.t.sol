@@ -370,10 +370,20 @@ contract RealStackDeclineForkTest is RealStackTestBase {
         _assertDeclinesIdentically(bytes4(keccak256("NoLiquidity()")), 1_000e6, "NoLiquidity");
     }
 
-    /// @dev All-or-nothing fill semantics (scope §10): inventory that covers only part
-    ///      of the ask is a typed `FillShortfall`, never a partial fill — a partial fill
-    ///      would strand the swapper's committed quote, which V4 fixes at swap time.
-    function test_PartialInventory_IsFillShortfall_NotAPartialFill() public {
+    /// @dev Fill semantics v2 (JUP-559). Exact-INPUT now partial-fills: the hook charges
+    ///      only what the pool could serve and hands the remainder back with
+    ///      settleFor(sender). Exact-OUTPUT is unchanged and still declines with a typed
+    ///      FillShortfall, because you cannot offset a full requested output while
+    ///      delivering less of it.
+    ///
+    ///      The refund lands OUTSIDE the swapDelta that PoolManager.swap returns, so a
+    ///      caller that settles the returned delta verbatim rather than its live open
+    ///      debt cannot complete the unlock. That is asserted here deliberately: such a
+    ///      caller REVERTS, exactly as it does today for an oversized buy, and never
+    ///      overpays. PoolSwapTest is that strict caller. Routers that settle open debt
+    ///      get the partial fill instead, proven against the real deployed
+    ///      UniversalRouter in test/fork/UniversalRouterPartialFill.t.sol.
+    function test_PartialInventory_PartialFillsForOpenDebtCallers_RevertsForStrictOnes() public {
         _drainInventory();
         _contributeInventory(1_000e18); // covers 500 USDG of demand, not 1,000
 
@@ -382,8 +392,15 @@ contract RealStackDeclineForkTest is RealStackTestBase {
         assertEq(token.balanceOf(swapper), 1_000e18);
 
         _contributeInventory(1_000e18);
-        _assertDeclinesIdentically(bytes4(keccak256("FillShortfall()")), 5_000e6, "FillShortfall exactIn");
 
+        // A strict-delta caller cannot settle a partial fill, so it reverts rather than
+        // paying 5,000 for 500 of inventory. No silent overpayment is possible.
+        vm.prank(freshSender);
+        try this.swapBuyExternal(-5_000e6) {
+            fail();
+        } catch {}
+
+        // exact-output keeps declining with the typed error, in the quoter too
         vm.prank(freshSender);
         try this._quoteExactOutRaw(10_000e18) {
             fail();
