@@ -521,19 +521,28 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         // router's limit and parked there, which (measured, see
         // test/fork/PartialFillFallthrough.t.sol) would otherwise brick the pool
         // permanently because this hook refuses the sell direction that could undo it.
-        // Discriminating an ordinary fill from a short one WITHOUT a second oracle read:
-        // on a full fill the market pulls netQuote less at most the floor/ceil inversion
-        // residue, so `leftover` can never exceed the spread carve. Anything larger is
-        // inventory running out. Ordinary fills therefore keep byte-identical accounting
-        // to before this change, and only genuine short fills take the refund path.
-        // The bound has TWO parts. The spread carve is one. The other is the market's
-        // floor inversion, which discards up to one token-wei of demand; when the rate
-        // exceeds RATE_SCALE a single token-wei costs many quote-wei, so that residue can
-        // legitimately exceed the carve on a perfectly ordinary full fill. Cost per
-        // token-wei is recovered from the returned pair rather than re-read.
+        // Discriminating an ordinary fill from a short one WITHOUT a second oracle read.
+        //
+        // Compare against netQuote, which is what the market was actually asked to price.
+        // On a full fill the market inverts netQuote DOWN to whole token-wei and charges
+        // the exact cost of those, so the unspent remainder is strictly less than the cost
+        // of one token-wei. Anything at or above that is inventory running out.
+        //
+        //   full fill:  tokensOut = floor(netQuote / p),  quotePaid = ceil(tokensOut * p)
+        //               => netQuote - quotePaid < p <= ceil(quotePaid / tokensOut)
+        //
+        // The per-token-wei cost is recovered from the returned pair rather than re-read,
+        // so this tracks the rate the market ACTUALLY used, including the anchor and the
+        // staleness surcharge, neither of which this hook can see directly.
+        //
+        // Do NOT widen this by spreadAccrued. An earlier revision compared `leftover`
+        // against `quoteIn - netQuote + inversionBound`, which cancels to
+        // `netQuote - quotePaid > spreadAccrued + inversionBound` and therefore treated a
+        // genuine shortfall of up to the whole spread as ordinary dust, silently keeping
+        // it. Regression pinned in test/fork/UniversalRouterPartialFill.t.sol.
         uint256 leftover = quoteIn - quotePaid - spreadAccrued;
         uint256 inversionBound = tokensOut == 0 ? 0 : (quotePaid + tokensOut - 1) / tokensOut;
-        if (leftover > quoteIn - netQuote + inversionBound) {
+        if (netQuote - quotePaid > inversionBound) {
             // Native refunds would need an unwrap path this hook does not have
             // (weth9.deposit is one-way), so native-quote pairs stay all-or-nothing.
             if (input.isAddressZero()) revert PartialFillUnsupportedForNativeQuote();

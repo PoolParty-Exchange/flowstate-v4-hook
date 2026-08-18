@@ -119,6 +119,59 @@ contract UniversalRouterPartialFillTest is ForkTestBase {
         assertEq(token.balanceOf(swapper) - tokBefore, 400e18, "pool unusable after a partial fill");
     }
 
+    /// @dev REGRESSION. The short-fill discriminator must compare the unspent NET quote
+    ///      against the one-token-wei inversion residue, and nothing else. An earlier
+    ///      revision compared `leftover` against `quoteIn - netQuote + inversionBound`,
+    ///      which cancels to `netQuote - quotePaid > spreadAccrued + inversionBound`: a
+    ///      genuine shortfall of up to the whole spread was therefore classified as
+    ///      ordinary dust and SILENTLY KEPT by the hook.
+    ///
+    ///      The window only opens when the spread is non-zero AND the rate is high enough
+    ///      that one token-wei costs many quote-wei, which is why the default fixture
+    ///      never revealed it. Both conditions are forced here.
+    ///
+    ///      Disabling the fix (restoring the `quoteIn - netQuote + inversionBound` form)
+    ///      makes this test fail on the `spent < amountIn` assertion, because the hook
+    ///      charges the full input and books the difference as sweepable margin.
+    function test_shortFill_isNotMisreadAsDust_whenSpreadAndRateAreHigh() public {
+        // one token-wei costs many quote-wei: the regime where the floor inversion
+        // discards more than a wei, and where the old bound was too generous
+        _setOracleRate(DUST_ORACLE_RATE);
+        hook.setBaseSpread(Currency.wrap(USDG), Currency.wrap(address(token)), 30);
+        _expireRateCache();
+
+        vm.prank(lister);
+        market.withdrawTokens(pool, 0);
+        // Sized INTO the false-FULL band, which is the whole point. At this rate a
+        // 5,000 USDG ask inverts to 498,504,486 token-wei. With 498,000,000 of inventory
+        // the unspent net quote is 5,044,864: above the one-token-wei inversion bound of
+        // 11 (so genuinely SHORT), but below spreadAccrued + bound = 14,940,012, which is
+        // exactly the window the old comparison misclassified as dust. A larger shortfall
+        // clears both thresholds and would NOT catch the regression.
+        _contributeInventory(498_000_000);
+
+        uint128 amountIn = 5_000e6;
+        uint256 usdgBefore = IERC20(USDG).balanceOf(swapper);
+        uint256 tokBefore = token.balanceOf(swapper);
+
+        _routeThroughUniversalRouter(amountIn);
+
+        uint256 spent = usdgBefore - IERC20(USDG).balanceOf(swapper);
+        uint256 received = token.balanceOf(swapper) - tokBefore;
+        emit log_named_uint("amountIn      ", amountIn);
+        emit log_named_uint("spent         ", spent);
+        emit log_named_uint("received      ", received);
+        emit log_named_uint("hook dust held", hook.accruedDust(Currency.wrap(USDG)));
+
+        // inventory ran out, so this IS short and the remainder belongs to the swapper
+        assertEq(poolContract.tokenBalance(), 0, "inventory should be exhausted");
+        assertEq(received, 498_000_000, "delivered exactly the available inventory");
+        assertLt(spent, amountIn, "SHORT fill was misread as dust and the hook kept the remainder");
+
+        // and what it kept must be spread on what it sold, not the unfilled remainder
+        assertEq(hook.accruedDust(Currency.wrap(USDG)), 0, "hook kept the unfilled remainder as dust");
+    }
+
     /// @dev Control: the same route with an ask INSIDE inventory must be unaffected, so
     ///      we know the partial path did not disturb ordinary full fills.
     function test_realUniversalRouter_fullFillUnchanged() public {
