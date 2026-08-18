@@ -65,6 +65,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     error ManagerReservesExceeded(Currency currency, uint256 requested, uint256 available);
     error SpreadOutOfRange(uint16 bps, uint16 floorBps, uint16 maxBps);
     error TradeTooSmallForSpread(uint256 quoteIn, uint256 spreadBps);
+    error PartialFillUnsupportedForNativeQuote(); // refunding native needs an unwrap path this hook lacks
     error RungScheduleInvalid();
     error SweepDestinationNotSet();
     error EthSweepFailed();
@@ -441,7 +442,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///      notional); the buyer pays market cost * (1 + spreadBps/10_000); the
     ///      spread accrues as margin per quote asset awaiting sweep. Inputs are pool
     ///      identity and trade size ONLY (§5b: no per-caller logic).
-    function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+    function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -457,7 +458,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         bool exactInput = params.amountSpecified < 0;
         (uint256 quoteIn, uint256 tokensOut, uint256 spreadAccrued, uint256 dustAccrued, BeforeSwapDelta hookDelta) =
         exactInput
-            ? _buyExactInput(cfg, input, output, params.amountSpecified)
+            ? _buyExactInput(cfg, input, output, params.amountSpecified, sender)
             : _buyExactOutput(cfg, input, output, params.amountSpecified);
 
         if (spreadAccrued != 0) accruedSpreadMargin[input] += spreadAccrued;
@@ -478,7 +479,13 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///      accounted separately as dust, never folded into spread margin.
     ///      Rung lookup uses quoteIn (the committed notional — the only quote-side
     ///      size known before the market call).
-    function _buyExactInput(PairConfig memory cfg, Currency input, Currency output, int256 amountSpecified)
+    function _buyExactInput(
+        PairConfig memory cfg,
+        Currency input,
+        Currency output,
+        int256 amountSpecified,
+        address sender
+    )
         internal
         returns (uint256 quoteIn, uint256 tokensOut, uint256 spreadAccrued, uint256 dustAccrued, BeforeSwapDelta hookDelta)
     {
@@ -499,7 +506,43 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
             market.buyFromPoolExactQuote(cfg.marketPool, cfg.marketAsset, netQuote, resellerCode, address(this));
         _settle(output, tokensOut);
         spreadAccrued = _ceilBps(quotePaid, spreadBps);
-        dustAccrued = quoteIn - quotePaid - spreadAccrued; // >= 0 by the floor carve (proven in tests)
+
+        // JUP-559 partial fill. The pool may now fill SHORT of netQuote when inventory
+        // runs out, so `leftover` is either the ordinary carve residue (a wei or two) or
+        // the unfilled remainder of a short fill. Either way the swapper is charged only
+        // quotePaid + spread, and the rest is handed back through PoolManager accounting
+        // via settleFor(sender): that shrinks the ROUTER's open debt, and v4-periphery's
+        // SETTLE_ALL pays `_getFullDebt` (the live delta) rather than the amount it
+        // originally specified, so the swapper simply pays less.
+        //
+        // The specified delta below still offsets the FULL amountSpecified, so
+        // amountToSwap == 0 and Pool.swap takes its zero-amount early return. NO residual
+        // reaches the core AMM. That is what keeps the price from being walked to the
+        // router's limit and parked there, which (measured, see
+        // test/fork/PartialFillFallthrough.t.sol) would otherwise brick the pool
+        // permanently because this hook refuses the sell direction that could undo it.
+        // Discriminating an ordinary fill from a short one WITHOUT a second oracle read:
+        // on a full fill the market pulls netQuote less at most the floor/ceil inversion
+        // residue, so `leftover` can never exceed the spread carve. Anything larger is
+        // inventory running out. Ordinary fills therefore keep byte-identical accounting
+        // to before this change, and only genuine short fills take the refund path.
+        // The bound has TWO parts. The spread carve is one. The other is the market's
+        // floor inversion, which discards up to one token-wei of demand; when the rate
+        // exceeds RATE_SCALE a single token-wei costs many quote-wei, so that residue can
+        // legitimately exceed the carve on a perfectly ordinary full fill. Cost per
+        // token-wei is recovered from the returned pair rather than re-read.
+        uint256 leftover = quoteIn - quotePaid - spreadAccrued;
+        uint256 inversionBound = tokensOut == 0 ? 0 : (quotePaid + tokensOut - 1) / tokensOut;
+        if (leftover > quoteIn - netQuote + inversionBound) {
+            // Native refunds would need an unwrap path this hook does not have
+            // (weth9.deposit is one-way), so native-quote pairs stay all-or-nothing.
+            if (input.isAddressZero()) revert PartialFillUnsupportedForNativeQuote();
+            poolManager.sync(input);
+            IERC20(Currency.unwrap(input)).safeTransfer(address(poolManager), leftover);
+            poolManager.settleFor(sender);
+        } else {
+            dustAccrued = leftover;
+        }
         hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), -tokensOut.toInt128());
     }
 
