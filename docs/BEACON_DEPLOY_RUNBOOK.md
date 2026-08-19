@@ -16,16 +16,22 @@ All commands run from `flowstate-v4-hook` on the target branch, with `RH_RPC_URL
 exported and the broadcaster key supplied by the operator (`--private-key` or a
 keystore; the key never lives in this repo).
 
-Staging values used below (Robinhood 4663):
+Staging values used below (Robinhood 4663). Verified on-chain 2026-08-19
+(JUP-570 sweep: an earlier revision of this table pointed at the market retired
+on 2026-08-16 — re-verify FS_MARKET and MARKET_POOL against the live chain
+before every run; MARKET_POOL is `market.poolByToken(PAIR_TOKEN)`):
 
 | name | value |
 |---|---|
 | V4_POOL_MANAGER | 0x8366a39CC670B4001A1121B8F6A443A643e40951 |
-| FS_MARKET | 0xAF3685bE903820cAd6f7cAF29CBC210554eFE067 |
+| FS_MARKET | 0x8eFb662F738D0f5d9f146803FD02A36c6B67e60d |
 | HOOK_OWNER (ops) | 0x5F29890B5b1d005E2dA78aA1687a690562CE5f1b |
 | AEWETH | 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73 |
 | PAIR_TOKEN (CASHCAT) | 0x020bfC650A365f8BB26819deAAbF3E21291018b4 |
-| MARKET_POOL (C1) | 0x96B367B8Ba02ca70096712acdDD03534bCD7cc9F |
+| MARKET_POOL (C1) | 0x1c8Fe931c9be6583d9a2E5C05712a0F6d1e4faeD |
+
+The mined salt, hook address and resulting poolId are regenerated at every
+deploy (step 2) and are deliberately NOT tabled here.
 
 1. **Reseller code on the market first** (once per market): `deploy/manage-reseller.js`
    in PoolParty_Contracts, so hook buys attribute from the first fill.
