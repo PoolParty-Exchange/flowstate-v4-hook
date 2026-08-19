@@ -49,9 +49,15 @@ contract SlimOracleLiveForkTest is Test {
 
     /// @dev The runbook's venue decision, mechanically: deepest initialized hookless
     ///      pool across the standard tiers.
-    /// @dev Returns the two deepest tiers, not one. The slim oracle derives venue
-    ///      identity from the PoolKey (JUP-547) rather than accepting a poolId, and
-    ///      MIN_VENUES == MAX_VENUES == 2, so a feed needs exactly two venues.
+    /// @dev Returns the two DEEPEST initialized tiers by liquidity, and their PoolKey
+    ///      fields. The slim oracle derives venue identity from the PoolKey (JUP-547)
+    ///      rather than accepting a poolId, and MIN_VENUES == MAX_VENUES == 2, so a feed
+    ///      needs exactly two venues.
+    ///
+    ///      Review fix (Wilko): an earlier version claimed "two deepest" while actually
+    ///      taking the FIRST two initialized tiers it walked past. That is a materially
+    ///      different feed, and it would have quietly registered thin books whenever a
+    ///      shallow tier happened to be initialized at a lower fee. Ranked properly now.
     function _findDeepest(address c0, address c1)
         internal
         view
@@ -59,6 +65,7 @@ contract SlimOracleLiveForkTest is Test {
     {
         uint24[4] memory fees = [uint24(100), 500, 3000, 10000];
         int24[4] memory spacings = [int24(1), 10, 60, 200];
+        uint128 secondL;
         for (uint256 i = 0; i < 4; i++) {
             bytes32 id = _poolId(c0, c1, fees[i], spacings[i]);
             (bool s, bytes memory d) =
@@ -68,8 +75,23 @@ contract SlimOracleLiveForkTest is Test {
                 STATE_VIEW.staticcall(abi.encodeWithSelector(IStateViewProbe.getLiquidity.selector, id));
             if (!s2 || d2.length < 32) continue;
             uint128 liq = uint128(uint256(bytes32(d2)));
-            if (liq > bestL) { bestL = liq; best = id; }
-            if (found < 2) { fee2[found] = fees[i]; sp2[found] = spacings[i]; ++found; }
+            if (liq == 0) continue;
+            if (found < 2) ++found;
+
+            if (liq > bestL) {
+                // previous best is demoted to second
+                secondL = bestL;
+                fee2[1] = fee2[0];
+                sp2[1] = sp2[0];
+                bestL = liq;
+                best = id;
+                fee2[0] = fees[i];
+                sp2[0] = spacings[i];
+            } else if (liq > secondL) {
+                secondL = liq;
+                fee2[1] = fees[i];
+                sp2[1] = spacings[i];
+            }
         }
     }
 

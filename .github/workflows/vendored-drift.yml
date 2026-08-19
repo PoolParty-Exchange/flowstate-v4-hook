@@ -5,5 +5,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: C1 vendored sources match their pinned contracts SHA
+        with:
+          submodules: recursive
+      # gate 2 shells out to forge, so the toolchain has to exist
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+      - name: C1 vendored sources and interfaces match their pinned contracts SHA
+        env:
+          # PoolParty_Contracts is private; without this the clone dies before the check
+          CONTRACTS_TOKEN: ${{ secrets.CONTRACTS_READ_TOKEN || secrets.GITHUB_TOKEN }}
         run: ./script/check-vendored-drift.sh

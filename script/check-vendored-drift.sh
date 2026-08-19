@@ -20,6 +20,15 @@ PIN_FILE="test/real/poolparty/.vendored-from"
 # Canonical remote is NOT overridable: an overridable remote lets the gate compare
 # against an attacker-chosen repo and pass.
 CONTRACTS_REPO="https://github.com/PoolParty-Exchange/PoolParty_Contracts.git"
+# PoolParty_Contracts is PRIVATE, so an unauthenticated clone dies before the gate runs
+# (review: Wilko). The TOKEN authenticates; it deliberately cannot change WHICH repo is
+# compared against, which is the property that must not be overridable.
+CONTRACTS_TOKEN="${CONTRACTS_TOKEN:-${GITHUB_TOKEN:-}}"
+if [ -n "$CONTRACTS_TOKEN" ]; then
+  CLONE_URL="https://x-access-token:${CONTRACTS_TOKEN}@github.com/PoolParty-Exchange/PoolParty_Contracts.git"
+else
+  CLONE_URL="$CONTRACTS_REPO"   # works locally via the developer's git credential helper
+fi
 
 [ -f "$PIN_FILE" ] || { echo "missing $PIN_FILE"; exit 1; }
 PIN="$(tr -d '[:space:]' < "$PIN_FILE")"
@@ -30,7 +39,11 @@ PIN="$(tr -d '[:space:]' < "$PIN_FILE")"
 echo "vendored copies pinned to PoolParty_Contracts $PIN"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-git clone -q --filter=blob:none --no-checkout "$CONTRACTS_REPO" "$TMP/c"
+if ! git clone -q --filter=blob:none --no-checkout "$CLONE_URL" "$TMP/c" 2>/dev/null; then
+  echo "cannot clone PoolParty_Contracts. It is private: set CONTRACTS_TOKEN (CI) or"
+  echo "configure a git credential helper (local). FAILING rather than skipping the gate."
+  exit 1
+fi
 git -C "$TMP/c" fetch -q --depth 1 origin "$PIN"
 # Prove we fetched the commit we asked for, not whatever a ref happened to point at.
 got="$(git -C "$TMP/c" rev-parse FETCH_HEAD^{commit})"
@@ -56,8 +69,15 @@ done < <(find test/real/poolparty -name '*.sol' | sort)
 # -------------------------------------------------------------- GATE 2: interfaces
 echo
 echo "gate 2: locally declared interfaces vs real ABI"
-command -v forge >/dev/null || { echo "  forge not on PATH"; exit 1; }
-forge build --skip test >/dev/null 2>&1 || forge build >/dev/null 2>&1 || true
+command -v forge >/dev/null || { echo "  forge not on PATH: gate 2 cannot run"; exit 1; }
+# FAIL CLOSED (review: Wilko). The previous version swallowed build errors with `|| true`
+# and then skipped any interface whose artifact was missing, so a broken build silently
+# disabled the ABI check entirely. That is worse than having no gate, because it reports
+# success.
+if ! forge build >/dev/null 2>&1; then
+  echo "  forge build FAILED: cannot verify interfaces against ABI"
+  exit 1
+fi
 
 python3 - "$TMP" "$PIN" <<'PY' || fail=1
 import json,re,subprocess,sys,pathlib
@@ -84,10 +104,16 @@ def norm(t):
 bad=0
 for iface,contract in TARGETS.items():
     m=re.search(rf"interface\s+{iface}\s*\{{(.*?)\n\}}", src, re.S)
-    if not m: continue
+    if not m:
+        print(f"  MISSING INTERFACE: {iface} not found in RealStackDeployer.sol")
+        bad=1
+        continue
     abi=real_abi(contract)
     if abi is None:
-        print(f"  cannot read out/{contract}.sol/{contract}.json (vendored build missing) - skipping {iface}")
+        # never skip: a missing artifact is exactly how this check would silently
+        # stop protecting anything
+        print(f"  MISSING ARTIFACT: out/{contract}.sol/{contract}.json, cannot verify {iface}")
+        bad=1
         continue
     byname={}
     for e in abi:
