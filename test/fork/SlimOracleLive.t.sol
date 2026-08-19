@@ -49,7 +49,14 @@ contract SlimOracleLiveForkTest is Test {
 
     /// @dev The runbook's venue decision, mechanically: deepest initialized hookless
     ///      pool across the standard tiers.
-    function _findDeepest(address c0, address c1) internal view returns (bytes32 best, uint128 bestL) {
+    /// @dev Returns the two deepest tiers, not one. The slim oracle derives venue
+    ///      identity from the PoolKey (JUP-547) rather than accepting a poolId, and
+    ///      MIN_VENUES == MAX_VENUES == 2, so a feed needs exactly two venues.
+    function _findDeepest(address c0, address c1)
+        internal
+        view
+        returns (bytes32 best, uint128 bestL, uint24[2] memory fee2, int24[2] memory sp2, uint256 found)
+    {
         uint24[4] memory fees = [uint24(100), 500, 3000, 10000];
         int24[4] memory spacings = [int24(1), 10, 60, 200];
         for (uint256 i = 0; i < 4; i++) {
@@ -61,29 +68,30 @@ contract SlimOracleLiveForkTest is Test {
                 STATE_VIEW.staticcall(abi.encodeWithSelector(IStateViewProbe.getLiquidity.selector, id));
             if (!s2 || d2.length < 32) continue;
             uint128 liq = uint128(uint256(bytes32(d2)));
-            if (liq > bestL) {
-                bestL = liq;
-                best = id;
-            }
+            if (liq > bestL) { bestL = liq; best = id; }
+            if (found < 2) { fee2[found] = fees[i]; sp2[found] = spacings[i]; ++found; }
         }
     }
 
     function test_LiveV4Feed_AgreesWithAggregatorAndMeetsGasTarget() public {
         // aeWETH < USDG by address, so aeWETH is currency0 and src (aeWETH) is token0
-        (bytes32 poolId, uint128 depth) = _findDeepest(AEWETH, USDG);
-        if (poolId == bytes32(0)) {
-            emit log_string("no hookless aeWETH/USDG V4 pool at standard tiers, skipping");
+        (bytes32 poolId, uint128 depth, uint24[2] memory fee2, int24[2] memory sp2, uint256 found) = _findDeepest(AEWETH, USDG);
+        if (poolId == bytes32(0) || found < 2) {
+            emit log_string("fewer than MIN_VENUES hookless aeWETH/USDG V4 pools at standard tiers, skipping");
             vm.skip(true);
         }
         emit log_named_uint("discovered pool depth (L)", depth);
 
-        FlowstateSlimOracle.Venue[] memory venues = new FlowstateSlimOracle.Venue[](1);
-        venues[0] = FlowstateSlimOracle.Venue({
-            kind: 2, // KIND_V4
-            target: STATE_VIEW,
-            srcIsToken0: true,
-            poolId: poolId
-        });
+        FlowstateSlimOracle.VenueInput[] memory venues = new FlowstateSlimOracle.VenueInput[](2);
+        for (uint256 i = 0; i < 2; i++) {
+            venues[i] = FlowstateSlimOracle.VenueInput({
+                kind: 2, // KIND_V4
+                target: STATE_VIEW,
+                fee: fee2[i],
+                tickSpacing: sp2[i],
+                hooks: address(0) // hookless pools only
+            });
+        }
         oracle.setFeed(AEWETH, USDG, venues);
 
         uint256 g = gasleft();

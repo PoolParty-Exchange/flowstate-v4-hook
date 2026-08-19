@@ -18,6 +18,7 @@ import "./interface/IInitializableBeaconProxy.sol";
 import "./interface/IUpgradeableBeacon.sol";
 import "./libraries/FlowstateStructs.sol";
 import "./libraries/FlowstateEvents.sol";
+import {Mul512Compare} from "./libraries/Mul512Compare.sol";
 
 /**
  * @title FlowstateMarket
@@ -144,6 +145,12 @@ contract FlowstateMarket is
     error TransferAmountMismatch();
     error ResellerCodeTooLong();
     error FillShortfall();
+    /// @dev Bounded entry points (JUP-544). Each carries the actuals so an
+    ///      integrator's revert decode names the miss, not just the fact of one.
+    error DeadlineExpired(uint256 deadline, uint256 nowTimestamp);
+    error CostAboveBound(uint256 quotePaid, uint256 tokensFilled);
+    error FillBelowBound(uint256 filled, uint256 minFilled);
+    error ProceedsBelowBound(uint256 quoteProceeds, uint256 tokensSold);
 
     // ── constants ────────────────────────────────────────────────────────
     uint256 private constant BPS = 10_000;
@@ -151,7 +158,13 @@ contract FlowstateMarket is
     uint16 public constant DEFAULT_FEE_BPS = 100;  // long-tail default tier
     uint16 public constant PARTNER_SHARE_BPS = 6000; // reseller + bd1 + bd2, always
     uint16 public constant BUYBACK_SHARE_BPS = 4000; // remainder by construction — untouchable
-    uint16 private constant DEFAULT_BAND_BPS = 500; // 5% step (walk band = 2× = 10%) — tightened 2026-07-30
+    // 10% — widened from 500 on measured keeper-gas evidence (real CASHCAT 60s series:
+    // 1 poke/12h at 1000bps vs 7-9 at 500bps; a poke costs ~824k gas). The accepted
+    // cost, stated plainly: an in-band read is believed with NO confirmation, so the
+    // band width IS the atomic flash-loan drain size (scenario I measures 4.00% taken
+    // in one tx at 500bps, 9.00% at 1000bps). Confirmation guards only moves LARGER
+    // than the band.
+    uint16 private constant DEFAULT_BAND_BPS = 1000;
     uint16 private constant MIN_BAND_BPS = 100;
     uint16 private constant MAX_BAND_BPS = 5000;
 
@@ -415,6 +428,56 @@ contract FlowstateMarket is
         nonReentrant
         returns (uint256 tokensFilled, uint256 quotePaid)
     {
+        return _buyFromPool(pool, asset, amount, resellerCode, buyer);
+    }
+
+    /// @notice buyFromPool with caller-side protection (JUP-544): the anchor can
+    ///         move in-band between a quote and its execution, and an unbounded
+    ///         caller pays whatever the execution-block rate says. Every bound is
+    ///         optional; zero disables it.
+    /// @param maxCost bounds the EFFECTIVE RATE pro-rata, not just the total:
+    ///        enforced as quotePaid/tokensFilled <= maxCost/amount, so a PARTIAL
+    ///        fill cannot slip a worse rate under a full-size cost cap (a flat
+    ///        total-cost check is vacuous the moment the fill is short). Callers
+    ///        derive it from their quote: maxCost = quoteAmount plus tolerance.
+    /// @param minTokensFilled floor on the fill itself; set to `amount` for
+    ///        all-or-nothing.
+    /// @param deadline unix seconds; the fill must execute at or before it.
+    function buyFromPoolBounded(
+        address pool,
+        address asset,
+        uint256 amount,
+        string calldata resellerCode,
+        address buyer,
+        uint256 maxCost,
+        uint256 minTokensFilled,
+        uint256 deadline
+    )
+        external
+        whenNotPaused
+        nonReentrant
+        returns (uint256 tokensFilled, uint256 quotePaid)
+    {
+        _checkDeadline(deadline);
+        (tokensFilled, quotePaid) = _buyFromPool(pool, asset, amount, resellerCode, buyer);
+        if (minTokensFilled != 0 && tokensFilled < minTokensFilled) {
+            revert FillBelowBound(tokensFilled, minTokensFilled);
+        }
+        // full-512-bit compare (review): `amount` is caller-supplied and
+        // unbounded, so raw cross multiplication could panic on inputs whose
+        // comparison is perfectly well-defined
+        if (maxCost != 0 && Mul512Compare.gt(quotePaid, amount, maxCost, tokensFilled)) {
+            revert CostAboveBound(quotePaid, tokensFilled);
+        }
+    }
+
+    function _buyFromPool(
+        address pool,
+        address asset,
+        uint256 amount,
+        string calldata resellerCode,
+        address buyer
+    ) private returns (uint256 tokensFilled, uint256 quotePaid) {
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists) revert UnknownPool();
         if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
@@ -436,9 +499,14 @@ contract FlowstateMarket is
     /// @notice Exact-quote-input buy (V4 hook build scope §2.2, additive pair 1/2):
     ///         the caller names the quote spend; the pool inverts to a token amount
     ///         inside its single band-checked oracle read (the view quote path is
-    ///         never involved, so no second cold read exists). All-or-nothing: reverts
-    ///         with the pool's FillShortfall if inventory cannot cover the full
-    ///         inverted amount.
+    ///         never involved, so no second cold read exists). PARTIAL FILL (JUP-559):
+    ///         if inventory cannot cover the full inverted amount, the pool fills what it
+    ///         can and prices exactly that, so `tokensFilled` may be short of the ask and
+    ///         `quotePaid` is the cost of what was DELIVERED, never of what was asked.
+    ///         Only a genuinely empty pool refuses, with NoLiquidity. Callers must charge
+    ///         their own counterparty `quotePaid` and not the amount they committed; see
+    ///         the CALLER OBLIGATION note on FlowstatePool.priceBuyExactQuote.
+    ///         buyFromPoolExactOut is unchanged and remains all-or-nothing.
     /// @dev Pull-exact and fee incidence are unchanged: the factory pulls `quotePaid`
     ///      — the exact oracle cost of the tokens delivered, ≤ quoteIn (the inversion
     ///      rounds tokens DOWN against the buyer, so up to one token-wei's worth of
@@ -459,6 +527,42 @@ contract FlowstateMarket is
         nonReentrant
         returns (uint256 tokensFilled, uint256 quotePaid)
     {
+        return _buyFromPoolExactQuote(pool, asset, quoteIn, resellerCode, buyer);
+    }
+
+    /// @notice buyFromPoolExactQuote with caller-side protection (JUP-544). The
+    ///         cost is already capped at quoteIn by construction, so the exposed
+    ///         axis is the OTHER one: how many tokens the spend still buys after
+    ///         an in-band rate move. minTokensOut is the classic exact-input
+    ///         floor; both bounds optional, zero disables.
+    function buyFromPoolExactQuoteBounded(
+        address pool,
+        address asset,
+        uint256 quoteIn,
+        string calldata resellerCode,
+        address buyer,
+        uint256 minTokensOut,
+        uint256 deadline
+    )
+        external
+        whenNotPaused
+        nonReentrant
+        returns (uint256 tokensFilled, uint256 quotePaid)
+    {
+        _checkDeadline(deadline);
+        (tokensFilled, quotePaid) = _buyFromPoolExactQuote(pool, asset, quoteIn, resellerCode, buyer);
+        if (minTokensOut != 0 && tokensFilled < minTokensOut) {
+            revert FillBelowBound(tokensFilled, minTokensOut);
+        }
+    }
+
+    function _buyFromPoolExactQuote(
+        address pool,
+        address asset,
+        uint256 quoteIn,
+        string calldata resellerCode,
+        address buyer
+    ) private returns (uint256 tokensFilled, uint256 quotePaid) {
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists) revert UnknownPool();
         if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
@@ -510,6 +614,41 @@ contract FlowstateMarket is
         nonReentrant
         returns (uint256 tokensFilled, uint256 quotePaid)
     {
+        return _buyFromPoolExactOut(pool, asset, tokenAmountOut, resellerCode, buyer);
+    }
+
+    /// @notice buyFromPoolExactOut with caller-side protection (JUP-544). The
+    ///         output is exact by construction, so the exposed axis is the cost:
+    ///         maxCost here is an ABSOLUTE cap (no partial fill exists on this
+    ///         path to make it vacuous). Both bounds optional, zero disables.
+    function buyFromPoolExactOutBounded(
+        address pool,
+        address asset,
+        uint256 tokenAmountOut,
+        string calldata resellerCode,
+        address buyer,
+        uint256 maxCost,
+        uint256 deadline
+    )
+        external
+        whenNotPaused
+        nonReentrant
+        returns (uint256 tokensFilled, uint256 quotePaid)
+    {
+        _checkDeadline(deadline);
+        (tokensFilled, quotePaid) = _buyFromPoolExactOut(pool, asset, tokenAmountOut, resellerCode, buyer);
+        if (maxCost != 0 && quotePaid > maxCost) {
+            revert CostAboveBound(quotePaid, tokensFilled);
+        }
+    }
+
+    function _buyFromPoolExactOut(
+        address pool,
+        address asset,
+        uint256 tokenAmountOut,
+        string calldata resellerCode,
+        address buyer
+    ) private returns (uint256 tokensFilled, uint256 quotePaid) {
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists) revert UnknownPool();
         if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
@@ -551,6 +690,45 @@ contract FlowstateMarket is
         nonReentrant
         returns (uint256 tokensSold, uint256 quoteProceeds)
     {
+        return _sellToPool(pool, amount, resellerCode, seller);
+    }
+
+    /// @notice sellToPool with caller-side protection (JUP-544), mirroring the
+    ///         buy side: minQuoteProceeds bounds the EFFECTIVE RATE pro-rata
+    ///         (quoteProceeds/tokensSold >= minQuoteProceeds/amount), so a
+    ///         partial fill cannot slip a worse rate under a full-size floor;
+    ///         minTokensSold floors the fill itself (set to `amount` for
+    ///         all-or-nothing). All bounds optional, zero disables.
+    function sellToPoolBounded(
+        address pool,
+        uint256 amount,
+        string calldata resellerCode,
+        address seller,
+        uint256 minQuoteProceeds,
+        uint256 minTokensSold,
+        uint256 deadline
+    )
+        external
+        whenNotPaused
+        nonReentrant
+        returns (uint256 tokensSold, uint256 quoteProceeds)
+    {
+        _checkDeadline(deadline);
+        (tokensSold, quoteProceeds) = _sellToPool(pool, amount, resellerCode, seller);
+        if (minTokensSold != 0 && tokensSold < minTokensSold) {
+            revert FillBelowBound(tokensSold, minTokensSold);
+        }
+        // full-512-bit compare (review): same unbounded-`amount` reasoning as
+        // the buy side
+        if (minQuoteProceeds != 0 && Mul512Compare.lt(quoteProceeds, amount, minQuoteProceeds, tokensSold)) {
+            revert ProceedsBelowBound(quoteProceeds, tokensSold);
+        }
+    }
+
+    function _sellToPool(address pool, uint256 amount, string calldata resellerCode, address seller)
+        private
+        returns (uint256 tokensSold, uint256 quoteProceeds)
+    {
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists) revert UnknownPool();
         if (seller == address(0)) revert ZeroAddress();
@@ -567,6 +745,13 @@ contract FlowstateMarket is
             seller, fillable, quoteGross, rate, _feeContext(rec.inventoryToken, resellerCode)
         );
         tokensSold = fillable;
+    }
+
+    /// @dev Zero = no deadline. Executable AT the deadline second, expired after.
+    function _checkDeadline(uint256 deadline) private view {
+        if (deadline != 0 && block.timestamp > deadline) {
+            revert DeadlineExpired(deadline, block.timestamp);
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -639,6 +824,34 @@ contract FlowstateMarket is
         if (!poolRecords[pool].exists) revert UnknownPool();
         if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
         IFlowstatePool(pool).pokeAnchor(asset, priceOracle, oracleEpoch);
+    }
+
+    /// @notice Oracle-health probe for monitoring, routed so the caller always gets
+    ///         the CANONICAL oracle rather than having to track migrations itself.
+    ///         `readable == false` means the pool is quoting a frozen `anchorRate`
+    ///         and cannot re-converge until the feed comes back: page on it. A large
+    ///         gap between `freshRate` and `anchorRate` while `anchorBlock` stops
+    ///         advancing means the pool is persistently clamping.
+    /// @dev Non-reverting for an unknown pool or unapproved asset (returns zeros), so
+    ///      a monitor loop can call it blind.
+    function oracleHealth(address pool, address asset)
+        external
+        view
+        returns (bool readable, uint256 freshRate, uint192 anchorRate, uint64 anchorBlock)
+    {
+        if (!poolRecords[pool].exists || !approvedQuoteAssets[asset]) return (false, 0, 0, 0);
+        return IFlowstatePool(pool).oracleHealth(asset, priceOracle);
+    }
+
+    /// @notice The buy-side staleness surcharge in force for (pool, asset), in bps.
+    ///         Zero whenever the pool is pricing off a live read; non-zero whenever it
+    ///         is pricing off an ageing anchor (dead oracle, or a readable read that
+    ///         sits below the anchor). Routed here so monitors get the canonical
+    ///         oracle and epoch, and returns 0 rather than reverting for an unknown
+    ///         pool or asset so a monitor loop can call it blind.
+    function staleSurchargeBps(address pool, address asset) external view returns (uint256) {
+        if (!poolRecords[pool].exists || !approvedQuoteAssets[asset]) return 0;
+        return IFlowstatePool(pool).staleSurchargeBpsOf(asset, priceOracle, oracleEpoch);
     }
 
     /// @notice Legacy-shape compatibility view: pre-multi-asset integrators resolve
@@ -872,8 +1085,12 @@ contract FlowstateMarket is
     // Wiring admin (timelocked lane — §3.7)
     // ────────────────────────────────────────────────────────────────────
 
-    /// @notice Timelocked. Bumps oracleEpoch so every pool reseeds its anchor
-    ///         band-check-free on its next trade (R3) — no per-pool ops needed.
+    /// @notice Timelocked. Bumps oracleEpoch, which every pool RECORDS on its next
+    ///         trade per asset — no per-pool ops needed. Corrected 2026-08-13: the
+    ///         bump no longer causes a band-check-free reseed. The timelock attests
+    ///         to the new oracle's IDENTITY, not to a price read at a block a third
+    ///         party chooses, so the migrated oracle's first read earns adoption
+    ///         under the ordinary band and one-block-confirmation rules.
     function setPriceOracle(address oracle) external onlyRole(TIMELOCK_ROLE) {
         if (oracle == address(0)) revert ZeroAddress();
         address oldOracle = priceOracle;

@@ -43,13 +43,18 @@ library FlowstateStructs {
     ///      accepted anchor write stamps a fresher lastRateTime, which implicitly
     ///      invalidates leftovers from earlier stale episodes without costing the
     ///      hot path a slot-C write.
+    /// @dev Slot layout is FROZEN (beacon-cloned pools; see upgrades.test.js). The
+    ///      2026-08-11 one-block anchor redesign repurposed two members in place
+    ///      rather than reordering: `lastRateBlock` occupies the old `lastRateTime`
+    ///      slot and `pendingBlock` the old `pendingSince`. `__reservedEma` is the
+    ///      retired EMA slot, kept so the layout is unchanged; it is never written.
     struct Anchor {
-        uint192 lastRate;   // last ACCEPTED instantaneous rate
-        uint64 lastRateTime;
-        uint192 emaRate;    // slow anchor: EMA of accepted rates, tau = ANCHOR_TAU
+        uint192 lastRate;      // last ACCEPTED rate
+        uint64 lastRateBlock;  // block of that acceptance (one write per block max)
+        uint192 __reservedEma; // retired (was emaRate) — never read, never written
         uint32 lastRateEpoch;
-        uint192 pendingRate;  // revive reference under public contest (0 = none)
-        uint64 pendingSince;
+        uint192 pendingRate;   // displaced read awaiting one-block confirmation (0 = none)
+        uint64 pendingBlock;   // block the candidate was first seen
     }
 
     /// @notice Per-fill fee context, computed by the factory and passed to the pool

@@ -33,44 +33,78 @@ import "./libraries/FlowstateEvents.sol";
  * contributors (sellers) pay it — they are credited quotePaid − fee. On a SELL
  * (M2) the seller receives quoteGross − fee. Buyers never pay the fee.
  *
- * ANCHOR MODEL (hardened — bopAMM review §3.4 items 1/3/4; items 2 and 5 were
- * considered and rejected). One anchor per quote asset, since token/USDC and
- * token/WETH are different rates. Each anchor stores the last ACCEPTED rate, its
- * timestamp, and an EMA of accepted rates (tau = ANCHOR_TAU). A fresh oracle read
- * must pass BOTH checks:
- *   step band — within anchorBandBps × widen of the last accepted rate, where
- *               widen = 1 + elapsed/60 capped at 4 (max 20% at the 5% default).
- *               Bounds any single jump; an atomic flash-crash reverts against the
- *               pre-attack anchor.
- *   walk band — within anchorBandBps × WALK_BAND_MULT of the EMA (10% at the 5%
- *               default). Bounds CUMULATIVE travel: a patient attacker nudging the
- *               venue price block after block (each step inside the band)
- *               previously walked the anchor arbitrarily far; now the EMA trails
- *               accepted rates with a 1h time constant, so walking at full speed
- *               multiplies price by only e^(walkBand × T / tau) — doubling takes
- *               ~7h of SUSTAINED venue manipulation at defaults, paying venue costs
- *               the whole way. Genuine vertical pumps decline fills until the EMA
- *               catches up — the correct side of the trade-off, because vertical
- *               moves are when oracle-priced depositors get picked off. Pools that
- *               need more room get a wider per-pool band (≤ 50%); the admin
- *               resetAnchor lane is the liveness escape hatch (D3).
- *   freshness — an anchor older than MAX_ANCHOR_AGE declines to trade instead of
- *               silently accepting anything inside the fully-widened band. The
- *               permissionless factory-routed pokeAnchor advances an anchor through
- *               the identical checked path with no trade attached (keeper duty), so
- *               an honest idle pool never goes stale. A pool that DOES go stale
- *               revives through the two-phase public contest documented at
- *               pokeAnchor, or through admin resetAnchor.
- *   monotonic — the anchor timestamp never moves backwards (structural guard).
+ * ANCHOR MODEL (REDESIGNED 2026-08-11 — supersedes the EMA walk band, the 24h
+ * freshness bound and the two-phase stale revive; see the incident note below).
+ * One anchor per quote asset, since token/USDC and token/WETH are different rates.
+ * Each anchor stores the last ACCEPTED rate and the BLOCK it was accepted in.
+ *
+ * TWO RULES, AND ONLY TWO.
+ *
+ *   1. ONE-BLOCK CONFIRMATION (the anti-flash-loan guard, the only manipulation
+ *      defence this contract makes). The anchor advances at most once per block.
+ *      A read within anchorBandBps of the anchor is accepted immediately (a move
+ *      too small to be worth manipulating). A read OUTSIDE that band is not
+ *      believed on sight: it is recorded as a candidate and only becomes the
+ *      anchor when the SAME displaced level is still there in a STRICTLY LATER
+ *      block. A flash loan borrows, displaces the venue, trades and repays inside
+ *      ONE transaction in ONE block, so it can never satisfy that test — the
+ *      attacker moves a venue and pays fees for nothing. Anything that survives
+ *      into the next block required real capital held across blocks, exposed to
+ *      every arbitrageur on the chain; that residual is accepted deliberately
+ *      (decision 2026-08-11), because defending it costs availability and the
+ *      extraction is capped by pool inventory anyway.
+ *
+ *      Measured in BLOCKS, not seconds, on purpose: Robinhood Chain produces ~10
+ *      blocks per second and stamps all of them with the SAME whole-second
+ *      timestamp, so a seconds-based rule cannot resolve a single block there. A
+ *      block count is also self-adjusting across chains — no per-chain table.
+ *
+ *   2. CLAMP, NEVER DECLINE. When the fresh read and the anchor disagree, the
+ *      pool prices on whichever of the two is worse for the party trading against
+ *      depositors, and quotes anyway: buys take max(anchor, fresh), sells take
+ *      min(anchor, fresh). A manipulated-down read therefore cannot buy inventory
+ *      cheap (the buy prices off the anchor) and a manipulated-up read cannot sell
+ *      into the cash side dear — while an honest counterparty on the other side of
+ *      the same move still gets a live, fillable quote. Nothing about ordinary
+ *      market conditions can make the buy path revert: no staleness bound, no
+ *      out-of-band revert, and an unreadable oracle clamps to the anchor rather
+ *      than declining. (The sell/buy-back path still requires a readable oracle,
+ *      since it spends pool cash and no router-inclusion argument applies to it.)
+ *
+ * WHY (incident, 2026-08-09/10). The previous model REVERTED whenever a read fell
+ * outside the bands. CASHCAT moved ~10% down then ~26% up against aeWETH with no
+ * accepted read in between; the EMA could not advance, so the anchor wedged and the
+ * live pool declined every quote and every simulation for the full 24h staleness
+ * bound. Router-facing availability across that period measured ~14%. Aggregators
+ * health-check sources by simulating them, and a source that reverts is dropped:
+ * 0x filled this pool 7 times on 6 Aug, then routed thousands of CASHCAT buys past
+ * it while it reverted. Protecting depositors from ordinary volatility was never
+ * worth that, and was never the depositors' expectation either — the protocol takes
+ * no view on how volatile an inventory token is. The guard now defends the one
+ * thing a venue genuinely cannot survive (an atomic, capital-free drain) and gets
+ * out of the way of everything else.
+ *
  * Seeding is band-check-free BY DEFINITION (there is nothing to check against), so
  * whoever picks the seeding moment picks the price. Therefore seeding is factory-
  * gated only: createPool (the depositor picks the moment) and the admin resetAnchor
  * lane (instant multisig). There is NO permissionless lazy seeding on the trade
- * path. An unseeded asset simply declines. An oracle-address migration at the
- * factory bumps its epoch; a pool seeing a new epoch reseeds band-check-free on its
- * next trade per asset — safe because setPriceOracle is timelocked (announced),
- * never attacker-triggerable.
+ * path. An unseeded asset simply declines.
+ *
+ * ORACLE MIGRATION (corrected 2026-08-13). An oracle-address migration at the
+ * factory bumps its epoch, and a pool seeing a new epoch RECORDS it as a marker
+ * only. It does NOT reseed band-check-free. The earlier rationale — that the
+ * timelocked announcement was itself the human attestation — was wrong: the
+ * announcement attests to the new oracle's IDENTITY, never to a price read at a
+ * block a third party chooses, and the party who chooses is whoever trades first
+ * after the migration. The migrated oracle's first read therefore earns adoption
+ * under the ordinary band and one-block-confirmation rules like any other read.
  */
+/// @dev Minimal surface of the ArbSys precompile (address 0x64 on every
+///      Arbitrum-family chain, Orbit included).
+interface IArbSys {
+    function arbBlockNumber() external view returns (uint256);
+}
+
 contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     using SafeERC20 for IERC20;
 
@@ -82,11 +116,8 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     error AmountTooLarge();
     error AmountTooSmall();
     error NoOracleRate();
-    error RateOutOfBand();
-    error AnchorWalkExceeded();
     error AnchorNotSeeded();
     error AnchorAlreadySeeded();
-    error StaleAnchor();
     error NotAContributor();
     error InsufficientPosition();
     error InvalidBand();
@@ -101,17 +132,46 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     // ── constants ────────────────────────────────────────────────────────
     uint256 private constant BPS = 10_000;
     uint256 private constant RATE_SCALE = 1e18; // quoteCost = amount × rate / 1e18
-    uint256 private constant WIDEN_PERIOD = 60; // seconds per +1 band multiple (R1)
-    uint256 private constant MAX_WIDEN = 4;     // max band multiple (40% at 10% band)
     uint256 private constant MAX_FILL_NODES = 50; // deterministic partial-fill cap
     uint16 private constant MIN_BAND_BPS = 100;
     uint16 private constant MAX_BAND_BPS = 5000;
     uint16 private constant MAX_SPREAD_BPS = 1000; // buy-side spread ceiling: 10%
-    // anchor hardening (items 1/3/4 of the approved §3.4 bundle)
-    uint256 private constant ANCHOR_TAU = 1 hours;      // EMA time constant
-    uint256 private constant MAX_ANCHOR_AGE = 24 hours; // freshness bound (item 1)
-    uint256 private constant WALK_BAND_MULT = 2;        // walk band = 2 × anchorBandBps
-    uint256 private constant REVIVE_WINDOW = 30 minutes; // two-phase revive contest window
+    // Anchor: a displaced read must still be there this many blocks later before it
+    // is believed. ONE is the whole design — it is exactly the width of a flash loan
+    // (single transaction, single block) and nothing more. Raising it would buy
+    // protection against capital-committed multi-block manipulation, which we have
+    // deliberately chosen not to defend (2026-08-11).
+    uint64 private constant CONFIRM_BLOCKS = 1;
+    // ── the block counter itself ─────────────────────────────────────────
+    // On Arbitrum-family chains the EVM's block.number opcode returns the
+    // PARENT chain's height, not the L2's (measured on Robinhood 2026-08-12:
+    // opcode 25,737,724 = Ethereum, ~12s blocks, vs true L2 height 34,384,484
+    // at ~100ms). Every anchor rule here is denominated in L2 blocks — one
+    // block IS the width of a flash loan — so on such chains the counter must
+    // come from ArbSys(0x64).arbBlockNumber(). Chosen per chain when the
+    // implementation is deployed; beacon clones inherit it from the
+    // implementation's code, and _currentBlock() is the ONLY reader either
+    // way, so the two clocks can never mix.
+    IArbSys private constant ARB_SYS = IArbSys(address(100));
+    /// @custom:oz-upgrades-unsafe-allow state-variable-immutable
+    bool private immutable USE_ARB_SYS;
+    // Staleness surcharge (JUP-529). While the oracle CANNOT be read, the buy side
+    // clamps to the last accepted anchor — and without this, it would sell at that
+    // frozen price forever if the market ran up during the outage. So while (and
+    // only while) the read fails, the buy quote worsens by 1bp per this many blocks
+    // since the last accepted read: the frozen price decays into an unattractive one
+    // instead of a standing offer. Purely a function of _currentBlock() and existing
+    // anchor state — no keeper, no admin, no pause, no new storage — and the first
+    // successful read makes it vanish. Ramp chosen (not measured): at RH's ~100ms
+    // L2 blocks, 100 blocks/bp ≈ 6bp/min ≈ 360bp/h, which outruns the measured
+    // CASHCAT drift profile (60s moves: p99 0.93%) within the hour. Slower chains
+    // get fewer bp/hour from the same constant — tune per chain AT DEPLOY, never
+    // via an admin setter (a per-pool intervention lever is the shape we refuse).
+    uint256 private constant STALE_RAMP_BLOCKS_PER_BP = 100;
+    // Past +20% the quote is decorative; stop worsening there (matches the oracle's
+    // SANITY_BPS scale). The pool stays available the whole time — routers keep
+    // simulating a fillable, just increasingly unattractive, quote.
+    uint256 private constant STALE_SURCHARGE_CAP_BPS = 2000;
 
     // ── storage (fresh layout; OZ bases are ERC-7201 namespaced) ─────────
     // slot 0 — identity + flags (single warm slot on the hot path)
@@ -162,7 +222,8 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor() {
+    constructor(bool useArbSys_) {
+        USE_ARB_SYS = useArbSys_;
         _disableInitializers();
     }
 
@@ -196,7 +257,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (asset == address(0) || seedRate == 0) revert InvalidInitParams();
         FlowstateStructs.Anchor storage a = anchors[asset];
         if (a.lastRate != 0) revert AnchorAlreadySeeded();
-        _writeAnchor(a, asset, seedRate, seedRate, seedEpoch);
+        _writeAnchor(a, asset, seedRate, seedEpoch);
         seededAssetList.push(asset);
         emit FlowstateEvents.AnchorReseeded(address(this), asset, seedRate, seedEpoch);
     }
@@ -208,78 +269,32 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         uint256 fresh = _readOracle(asset, oracle);
         FlowstateStructs.Anchor storage a = anchors[asset];
         if (a.lastRate == 0) seededAssetList.push(asset);
-        _writeAnchor(a, asset, uint192(fresh), uint192(fresh), epoch);
+        _writeAnchor(a, asset, uint192(fresh), epoch);
         emit FlowstateEvents.AnchorReseeded(address(this), asset, fresh, epoch);
     }
 
-    /// @notice Freshness keeper (§3.4 item 1): a band-CHECKED, trade-less anchor
-    ///         advance. On a LIVE anchor it runs the identical _resolveRate path a
-    ///         trade runs — same step band, walk band and monotonic checks — so a
-    ///         poke is exactly as constrained as a trade and adds no attack surface.
-    ///         On a STALE anchor it drives the two-phase revive below. Factory-
-    ///         routed so the oracle address and epoch are always the canonical ones
+    /// @notice Trade-less anchor advance, running the IDENTICAL maintenance a trade
+    ///         runs (same band, same one-block confirmation), so a poke is exactly
+    ///         as constrained as a trade and adds no attack surface. Factory-routed
+    ///         so the oracle address and epoch are always the canonical ones
     ///         (permissionless at the market entry point).
-    ///
-    /// TWO-PHASE REVIVE (decided 2026-07-30). A single observation must never revive
-    /// a stale anchor: after a blind day the stored reference is unfit to judge one
-    /// reading, and a momentary venue push could otherwise "return" the price to a
-    /// day-old level and buy inventory at it (the manufactured-reversion attack).
-    /// Instead the first poke records a PENDING reference and starts a public
-    /// contest window. During the window, any poke reading OUTSIDE one (unwidened)
-    /// band of the pending cancels it and becomes the new pending — so keeping a
-    /// fake pending alive requires holding the venue at the fake price for the
-    /// ENTIRE window against every observer in the world, not touching it for one
-    /// block. A poke after the window that still reads within band of the pending
-    /// activates the anchor at the FRESH reading, with the EMA restarted there
-    /// (the blind period invalidates prior history). Trading stays declined
-    /// throughout the contest. Admin resetAnchor remains the human override.
-    /// Residual accepted: on a venue with zero organic flow, holding a price is
-    /// free — but such a pool holds near-worthless inventory, and the slim oracle's
-    /// minimum-depth rule (Phase 3) closes that corner at the source.
+    /// @dev No longer load-bearing. Under the pre-2026-08-11 model an unpoked pool
+    ///      went stale and stopped trading, so a keeper process was mandatory; the
+    ///      anchor now re-converges on its own within one block of the next trade,
+    ///      and an idle pool never declines. Kept because a poke lets an idle pool
+    ///      pre-converge (a large first trade after a long quiet period prices one
+    ///      block sooner) and because it is the cheapest on-chain probe of anchor
+    ///      health. Nothing breaks if nobody ever calls it.
     function pokeAnchor(address asset, address oracle, uint32 epoch) external onlyFactory {
         if (poolPaused) revert PoolIsPaused();
         FlowstateStructs.Anchor storage a = anchors[asset];
         if (a.lastRate == 0) revert AnchorNotSeeded();
-
-        // stale + same epoch ⇒ the revive path. (An epoch bump — timelocked oracle
-        // migration — reseeds unconditionally in _resolveRate, staleness included:
-        // the announced migration IS the human attestation.)
-        if (
-            epoch == a.lastRateEpoch && block.timestamp >= a.lastRateTime
-                && block.timestamp - a.lastRateTime > MAX_ANCHOR_AGE
-        ) {
-            _reviveStep(a, asset, oracle);
-            return;
-        }
-
-        uint256 rate = _resolveRate(asset, oracle, epoch);
-        emit FlowstateEvents.AnchorPoked(address(this), asset, rate, a.emaRate);
-    }
-
-    /// @dev One step of the two-phase revive. Pending validity: pendingSince must
-    ///      postdate lastRateTime — any accepted anchor write implicitly invalidates
-    ///      leftovers from earlier stale episodes (see FlowstateStructs.Anchor).
-    function _reviveStep(FlowstateStructs.Anchor storage a, address asset, address oracle) private {
-        uint256 fresh = _readOracle(asset, oracle);
-
-        bool pendingValid = a.pendingRate != 0 && a.pendingSince > a.lastRateTime;
-        if (!pendingValid || !_withinBand(fresh, a.pendingRate, 0)) {
-            // open a new contest (or cancel-and-replace a contradicted one)
-            a.pendingRate = uint192(fresh);
-            a.pendingSince = uint64(block.timestamp);
-            emit FlowstateEvents.AnchorRevivePending(
-                address(this), asset, fresh, uint64(block.timestamp)
-            );
-            return;
-        }
-
-        if (block.timestamp - a.pendingSince >= REVIVE_WINDOW) {
-            // survived the full public contest — activate at the fresh reading
-            _writeAnchor(a, asset, uint192(fresh), uint192(fresh), a.lastRateEpoch);
-            emit FlowstateEvents.AnchorRevived(address(this), asset, fresh);
-        }
-        // in-window confirmation: deliberately a silent no-op — the pending
-        // reference stays FIXED so it cannot be slow-walked during its own contest
+        // preferHigh is irrelevant here: a poke prices nothing, it only advances the
+        // anchor. Report the ACCEPTED anchor, not the clamped trade rate.
+        bool freshOk;
+        (, freshOk) = _resolveRate(asset, oracle, epoch, true); // maintenance only
+        if (!freshOk) revert NoOracleRate();
+        emit FlowstateEvents.AnchorPoked(address(this), asset, a.lastRate, a.lastRate);
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -344,7 +359,9 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (tokenBalance == 0) revert NoLiquidity();
         if (requestedAmount == 0) revert InvalidAmount();
 
-        rate = _resolveRate(asset, oracle, epoch);
+        // buys price on the HIGHER side; _resolveRate also applies the staleness
+        // surcharge whenever that price comes from the anchor rather than a live read
+        (rate,) = _resolveRate(asset, oracle, epoch, true);
 
         fillableAmount = _fillableBuy(requestedAmount);
         if (fillableAmount == 0) revert NoLiquidity();
@@ -365,10 +382,33 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     ///      fillableAmount. quoteCost ≤ quoteIn always (floor then ceil cannot
     ///      overshoot the integer input); any difference stays with the caller — the
     ///      factory never pulls more than the oracle cost of the tokens delivered.
-    ///      All-or-nothing (scope decision, fill semantics v1): if FIFO capacity cannot
-    ///      cover the full inverted amount, revert FillShortfall — a partial fill would
-    ///      strand the caller's committed quote (V4 swap amounts are fixed once
-    ///      specified). Practical bound mirrors priceBuy's F4 note: quoteIn ×
+    ///      PARTIAL FILL (fill semantics v2, JUP-559): if FIFO capacity cannot cover the
+    ///      full inverted amount, fill what capacity allows and price exactly that.
+    ///      `fillableAmount` may be < the inverted `desired`, and `quoteCost` is then the
+    ///      cost of `fillableAmount`, NOT of `desired`. Only a genuinely empty walk is
+    ///      refused, mirroring priceBuy's NoLiquidity.
+    ///
+    ///      CALLER OBLIGATION: `quoteCost` is the ONLY amount the caller may charge its
+    ///      own counterparty for this leg. A caller that charges the full `quoteIn` while
+    ///      the factory pulled a short `quoteCost` would silently appropriate the
+    ///      difference. The V4 hook discharges this by offsetting the whole specified
+    ///      amount (so no residual reaches the core AMM) and returning the remainder to
+    ///      the swap caller with PoolManager.settleFor.
+    ///
+    ///      Semantics v1 was all-or-nothing on the stated grounds that a partial fill
+    ///      "would strand the caller's committed quote (V4 swap amounts are fixed once
+    ///      specified)". That premise is false: v4-core's swap loop exits at the price
+    ///      limit and builds its delta from `amountSpecified - amountSpecifiedRemaining`,
+    ///      so input a swap does not consume is never charged. The real hazard was
+    ///      different: a PARTIAL BeforeSwapDelta leaves a residual that walks the pool
+    ///      price to the router's limit and PARKS it there, and because the hook refuses
+    ///      the sell direction nothing can move it back, so one such fill bricks the V4
+    ///      pool. Measured, with the fix, in the hook repo:
+    ///      test/fork/PartialFillFallthrough.t.sol shows the parking, and
+    ///      test/fork/UniversalRouterPartialFill.t.sol shows that under the full-offset
+    ///      design the pool price is byte-identical across a short fill.
+    ///
+    ///      Practical bound mirrors priceBuy's F4 note: quoteIn ×
     ///      RATE_SCALE must fit uint256; a pathological quoteIn Panic-reverts, which is
     ///      a liveness refusal, not an exploit.
     function priceBuyExactQuote(address asset, uint256 quoteIn, address oracle, uint32 epoch)
@@ -380,7 +420,9 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (tokenBalance == 0) revert NoLiquidity();
         if (quoteIn == 0) revert InvalidAmount();
 
-        rate = _resolveRate(asset, oracle, epoch);
+        // buys price on the HIGHER side; _resolveRate also applies the staleness
+        // surcharge whenever that price comes from the anchor rather than a live read
+        (rate,) = _resolveRate(asset, oracle, epoch, true);
 
         // invert inside the single read: round DOWN against the buyer
         uint256 desired = (quoteIn * RATE_SCALE) / rate;
@@ -390,7 +432,8 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (fillableAmount == 0) revert NoLiquidity();
 
         // recompute the pull exactly as priceBuy would for this amount (round UP).
-        // MUST price fillableAmount, never `desired` (JUP-559, mirrors contracts PR #31).
+        // MUST price fillableAmount, never `desired`: on a short fill the two differ,
+        // and pricing `desired` would pull the full ask for a partial delivery.
         quoteCost = (fillableAmount * rate + RATE_SCALE - 1) / RATE_SCALE;
     }
 
@@ -523,7 +566,11 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         if (requestedAmount == 0) revert InvalidAmount();
         if (quoteBalance == 0) revert NoLiquidity();
 
-        rate = _resolveRate(buybackAsset, oracle, epoch);
+        bool freshOk;
+        (rate, freshOk) = _resolveRate(buybackAsset, oracle, epoch, false); // sells price LOWER
+        // the buy-back leg spends depositor cash, so unlike the buy path it will not
+        // trade on a clamped anchor when the oracle cannot be read at all
+        if (!freshOk) revert NoOracleRate();
         uint256 rateNet = (rate * (BPS - buySpreadBps)) / BPS;
         if (rateNet == 0) revert AmountTooSmall();
 
@@ -624,6 +671,25 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         _claimQuote(user);
     }
 
+    /// @notice Claim ONE asset's accrued proceeds. The full sweep above is
+    ///         all-or-nothing across assets (asset-blind depositors), which
+    ///         lets a single refusing asset — a USDC-style blocklist freezing
+    ///         the claimant — hold every OTHER asset's proceeds hostage until
+    ///         an upgrade. This lane isolates the failure per asset (JUP-543).
+    function claimQuoteAsset(address asset) external nonReentrant {
+        _claimQuoteAsset(msg.sender, asset);
+    }
+
+    /// @notice Per-asset claim pushed to the ENTITLED account, callable by
+    ///         anyone. Deliberately permissionless (the pokeAnchor shape):
+    ///         funds only ever move to `user`, and a recipient with no claim
+    ///         code of its own — the fee-credit fallback can land credits on
+    ///         contracts like the buyback — must not need us, or an upgrade,
+    ///         to be paid out.
+    function claimQuoteAssetFor(address user, address asset) external nonReentrant {
+        _claimQuoteAsset(user, asset);
+    }
+
     function claimTokens() external nonReentrant {
         _claimTokens(msg.sender);
     }
@@ -644,13 +710,19 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     function _claimQuote(address user) private {
         uint256 length = seededAssetList.length;
         for (uint256 i = 0; i < length; ++i) {
-            address asset = seededAssetList[i];
-            uint256 amount = claimableQuote[asset][user];
-            if (amount == 0) continue;
-            claimableQuote[asset][user] = 0;
-            IERC20(asset).safeTransfer(user, amount);
-            emit FlowstateEvents.ProceedsClaimed(address(this), user, asset, amount);
+            _claimQuoteAsset(user, seededAssetList[i]);
         }
+    }
+
+    /// @dev The single-asset unit both claim lanes share. Zero claimable
+    ///      (including an asset this pool never seeded) is a quiet no-op, per
+    ///      the section header's claimMany contract.
+    function _claimQuoteAsset(address user, address asset) private {
+        uint256 amount = claimableQuote[asset][user];
+        if (amount == 0) return;
+        claimableQuote[asset][user] = 0;
+        IERC20(asset).safeTransfer(user, amount);
+        emit FlowstateEvents.ProceedsClaimed(address(this), user, asset, amount);
     }
 
     function _claimTokens(address user) private {
@@ -727,7 +799,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         returns (bool ok, uint256 fillable, uint256 cost)
     {
         if (poolPaused || tokenBalance == 0 || amount == 0) return (false, 0, 0);
-        (bool rateOk, uint256 rate) = _peekRate(asset, oracle, epoch);
+        (bool rateOk, uint256 rate,,) = _peekRate(asset, oracle, epoch, true);
         if (!rateOk) return (false, 0, 0);
         fillable = _fillableBuy(amount);
         if (fillable == 0) return (false, 0, 0);
@@ -744,8 +816,8 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         returns (bool ok, uint256 fillable, uint256 grossProceeds)
     {
         if (poolPaused || !buyBackEnabled || quoteBalance == 0 || amount == 0) return (false, 0, 0);
-        (bool rateOk, uint256 rate) = _peekRate(buybackAsset, oracle, epoch);
-        if (!rateOk) return (false, 0, 0);
+        (bool rateOk, uint256 rate, bool freshOk,) = _peekRate(buybackAsset, oracle, epoch, false);
+        if (!rateOk || !freshOk) return (false, 0, 0);
         uint256 rateNet = (rate * (BPS - buySpreadBps)) / BPS;
         if (rateNet == 0) return (false, 0, 0);
         uint256 capacity = _capacitySell();
@@ -758,25 +830,70 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         ok = true;
     }
 
+    /// @notice Anchor telemetry. `blockNumber` is the block of the last ACCEPTED
+    ///         read (the anchor advances at most once per block).
     function anchorOf(address asset)
         external
         view
-        returns (uint192 rate, uint64 time, uint192 ema, uint32 epoch)
+        returns (uint192 rate, uint64 blockNumber, uint32 epoch)
     {
         FlowstateStructs.Anchor storage a = anchors[asset];
-        return (a.lastRate, a.lastRateTime, a.emaRate, a.lastRateEpoch);
+        return (a.lastRate, a.lastRateBlock, a.lastRateEpoch);
     }
 
-    /// @notice Two-phase revive state for a stale anchor (keeper telemetry).
-    ///         `valid` is false when the stored pending is a leftover from an
-    ///         earlier stale episode.
-    function pendingReviveOf(address asset)
+    /// @notice Monitoring hook for the clamped pricing model. Under the pre-2026-08-11
+    ///         anchor a broken oracle announced itself by halting the pool; clamping
+    ///         deliberately removed that, so a dead or wildly displaced feed is now
+    ///         SILENT to a trader and has to be watched for explicitly.
+    /// @dev Calls the same `_tryReadOracle` the trade path calls, so a monitor cannot
+    ///      drift from what the pool actually does.
+    /// @return readable false when the oracle reverts, returns zero (every venue
+    ///         failed the depth rules) or returns an out-of-range rate. Page on this:
+    ///         the pool is quoting `anchorRate` indefinitely and cannot re-converge.
+    /// @return freshRate the live read (0 when unreadable).
+    /// @return anchorRate the rate the pool is anchored to right now.
+    /// @return anchorBlock the block that anchor was accepted in. `freshRate` far from
+    ///         `anchorRate` while `anchorBlock` stops advancing means the pool is
+    ///         persistently clamping — normal for a block or two, worth an alert if it
+    ///         lasts, since quotes are then priced off a price the market has left.
+    function oracleHealth(address asset, address oracle)
         external
         view
-        returns (uint192 rate, uint64 since, bool valid)
+        returns (bool readable, uint256 freshRate, uint192 anchorRate, uint64 anchorBlock)
+    {
+        (readable, freshRate) = _tryReadOracle(asset, oracle);
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        return (readable, freshRate, a.lastRate, a.lastRateBlock);
+    }
+
+    /// @notice The buy-side staleness surcharge currently in force, in bps: zero
+    ///         whenever the oracle is readable; while it is not, 1bp per
+    ///         STALE_RAMP_BLOCKS_PER_BP blocks since the last accepted read, capped
+    ///         at STALE_SURCHARGE_CAP_BPS. Monitoring/integrator convenience — the
+    ///         pricing paths compute this themselves from the same inputs, so this
+    ///         view can never disagree with an execution.
+    function staleSurchargeBpsOf(address asset, address oracle, uint32 epoch)
+        external
+        view
+        returns (uint256)
+    {
+        // deliberately DERIVED from the same _peekRate the quoter runs, rather than
+        // re-computed here: a monitor reading a number the pricing path did not
+        // actually apply is the drift this contract refuses to allow anywhere else.
+        (, , , uint256 bps) = _peekRate(asset, oracle, epoch, true);
+        return bps;
+    }
+
+    /// @notice The displaced read currently awaiting one-block confirmation, if any.
+    ///         `valid` is false when the stored candidate predates the last accepted
+    ///         anchor write and is therefore already discarded.
+    function pendingAnchorOf(address asset)
+        external
+        view
+        returns (uint192 rate, uint64 blockNumber, bool valid)
     {
         FlowstateStructs.Anchor storage a = anchors[asset];
-        return (a.pendingRate, a.pendingSince, a.pendingRate != 0 && a.pendingSince > a.lastRateTime);
+        return (a.pendingRate, a.pendingBlock, a.pendingRate != 0 && a.pendingBlock > a.lastRateBlock);
     }
 
     function seededAssets() external view returns (address[] memory) {
@@ -832,124 +949,330 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     // Internals
     // ────────────────────────────────────────────────────────────────────
 
-    /// @dev Rate resolution — normative logic from plan §3.2 plus the §3.4 hardening:
-    ///      1. unseeded asset → decline (seeding is factory-gated, never lazy);
-    ///      2. new factory epoch → reseed band-check-free (timelock-announced event);
-    ///      3. monotonic guard (item 3) — the anchor timestamp never moves backwards;
-    ///      4. same timestamp → cached rate, no oracle call;
-    ///      5. freshness bound (item 1) — an anchor older than MAX_ANCHOR_AGE
-    ///         declines instead of trusting the fully-widened band;
-    ///      6. fresh read → step band vs last accepted rate (widened by elapsed)
-    ///         AND walk band vs the EMA (item 4), then update both.
-    function _resolveRate(address asset, address oracle, uint32 epoch) private returns (uint256) {
+    /// @dev Rate resolution (2026-08-11 redesign). Two independent jobs, kept
+    ///      deliberately separate because they answer different questions:
+    ///
+    ///      (1) ANCHOR MAINTENANCE — "what do we believe the price is?" The anchor
+    ///          advances at most ONCE PER BLOCK. A read inside anchorBandBps of it
+    ///          is believed immediately; a read outside is only a CANDIDATE, and
+    ///          becomes the anchor solely if the same level is still there
+    ///          CONFIRM_BLOCKS later. A flash loan lives inside one transaction in
+    ///          one block, so it can never both open and confirm a candidate.
+    ///
+    ///      (2) PRICING — "what do we charge for THIS trade?" Whenever the fresh
+    ///          read and the anchor disagree, price on the side that favours the
+    ///          pool's depositors: buys take the HIGHER, sells take the LOWER. A
+    ///          manipulated-down read cannot buy inventory cheap, a manipulated-up
+    ///          read cannot sell into the cash side dear, and an honest trader on
+    ///          the other side of the same move still gets a fillable quote.
+    ///
+    ///      Market conditions NEVER revert this function. An unreadable oracle
+    ///      clamps to the anchor and reports freshOk=false so the caller can decide
+    ///      (the buy path quotes anyway; the sell path, which spends pool cash,
+    ///      declines). The only revert is an unseeded asset, which is configuration,
+    ///      not market state.
+    /// @dev The ONE block counter every anchor rule reads (see USE_ARB_SYS above).
+    ///      On non-Arbitrum chains this is block.number; on Arbitrum-family chains
+    ///      it is the real L2 height from the ArbSys precompile.
+    function _currentBlock() private view returns (uint256) {
+        return USE_ARB_SYS ? ARB_SYS.arbBlockNumber() : block.number;
+    }
+
+    /// @dev The anchor's stored block, normalised. A stored value AHEAD of the
+    ///      current block is impossible for this implementation to have written
+    ///      (it only ever stores _currentBlock()), so it can only be foreign
+    ///      state, and there are exactly two ways to get it:
+    ///
+    ///        1. an in-place BEACON UPGRADE over a pre-2026-08-11 pool, where this
+    ///           slot held `lastRateTime`, a unix timestamp (~1.79e9 versus an L2
+    ///           height of ~3.4e7 — measured on the live staging pool);
+    ///        2. an implementation deployed with the WRONG USE_ARB_SYS flag on a
+    ///           chain whose two clocks differ (RH: ArbSys ~3.4e7 vs block.number
+    ///           ~2.6e7, the parent chain's height).
+    ///
+    ///      Both are migration accidents, not market conditions, and both would
+    ///      otherwise be catastrophic in the same two ways: the maintenance gate
+    ///      `blk > lastRateBlock` stays false for years, wedging the anchor at a
+    ///      price the market has left (the exact failure the redesign exists to
+    ///      remove), and the staleness surcharge's block subtraction underflows
+    ///      and PANIC-REVERTS the buy path (breaking the never-revert guarantee
+    ///      outright). Treating it as "long ago" makes the pool heal itself on the
+    ///      very next read under the ordinary band and confirmation rules — no
+    ///      admin step, no keeper, no band-check-free reseed, and the stored RATE
+    ///      is untouched, so nobody can pick a price by timing the migration.
+    function _lastBlock(FlowstateStructs.Anchor storage a, uint256 blk)
+        private
+        view
+        returns (uint256)
+    {
+        uint256 stored = a.lastRateBlock;
+        return stored > blk ? 0 : stored;
+    }
+
+    function _resolveRate(address asset, address oracle, uint32 epoch, bool preferHigh)
+        private
+        returns (uint256 rate, bool freshOk)
+    {
         FlowstateStructs.Anchor storage a = anchors[asset];
         if (a.lastRate == 0) revert AnchorNotSeeded();
 
+        uint256 blk = _currentBlock();
+        uint256 lastBlk = _lastBlock(a, blk);
+        // Same-block cache: the anchor was already accepted from a real read in this
+        // block, so every later trade in the block prices off it and skips the oracle
+        // call entirely. This is also the tightest possible clamp — an intra-block
+        // displacement after an accepted read cannot move the price in EITHER
+        // direction — and it is what makes a multi-trade block cheap.
+        if (epoch == a.lastRateEpoch && blk == lastBlk) {
+            return (a.lastRate, true);
+        }
+
+        uint256 fresh;
+        (freshOk, fresh) = _tryReadOracle(asset, oracle);
+        // clamp: never decline on a dead read. Buys additionally pay the staleness
+        // surcharge, because this price is the anchor and the anchor is ageing.
+        if (!freshOk) {
+            return (preferHigh ? _applyStaleSurcharge(a.lastRate, a) : a.lastRate, false);
+        }
+
+        // Oracle migration (adversarial review 2026-08-13). The timelock attests to
+        // the IDENTITY of the new oracle contract. It cannot attest to a PRICE READ
+        // at a block a third party chooses — and the party who chooses is whoever
+        // trades first after the migration, which is anyone. This branch used to
+        // write that read straight to the anchor AND return it as the trade rate,
+        // above the band check, above confirmation and above the clamp, so the first
+        // post-migration trade priced at an unbounded, attacker-timed read.
+        //
+        // Now the epoch is only a MARKER: record it so this branch cannot re-fire,
+        // discard any candidate opened under the previous oracle (a level observed
+        // through a different feed must not be confirmed by this one), and let the
+        // read earn its way in below under the ordinary rules. A migration that
+        // agrees with the standing anchor is still adopted instantly, because an
+        // in-band read always is; one that disagrees takes a single confirmation.
         if (epoch != a.lastRateEpoch) {
-            uint256 reseeded = _readOracle(asset, oracle);
-            _writeAnchor(a, asset, uint192(reseeded), uint192(reseeded), epoch);
-            emit FlowstateEvents.AnchorReseeded(address(this), asset, reseeded, epoch);
-            return reseeded;
+            uint256 clearedCandidate = a.pendingRate; // 0 when there was none
+            a.lastRateEpoch = epoch;
+            a.pendingRate = 0;
+            a.pendingBlock = 0;
+            // The anchor is ONE fact — "this rate was accepted at this block under
+            // this epoch" — and _writeAnchor always writes the three together.
+            // Recording the epoch alone would split it: an anchor accepted under
+            // the PREVIOUS oracle would start carrying the NEW epoch, and if it was
+            // written in THIS block it would then satisfy the same-block cache
+            // above, so every later trade in the block would be served the old
+            // oracle's price relabelled as the new one, without the new oracle ever
+            // being read. Push the acceptance back one block so the stale anchor
+            // cannot qualify for this epoch's cache, and so maintenance below still
+            // runs and band-checks the new oracle's read.
+            if (lastBlk == blk && blk > 0) {
+                lastBlk = blk - 1;
+                a.lastRateBlock = uint64(lastBlk);
+            }
+            emit FlowstateEvents.OracleEpochRecorded(address(this), asset, epoch, clearedCandidate);
         }
 
-        if (block.timestamp < a.lastRateTime) revert StaleAnchor(); // monotonic (item 3)
-
-        if (block.timestamp == a.lastRateTime) {
-            return a.lastRate; // same-timestamp cache: no oracle call, no new information
+        // (1) maintenance — one write per block, so a single block can never walk
+        //     the anchor twice (which would defeat the confirmation via a staircase).
+        if (blk > lastBlk) {
+            if (_withinBand(fresh, a.lastRate)) {
+                _writeAnchor(a, asset, uint192(fresh), epoch);
+            } else if (
+                a.pendingRate != 0
+                // a candidate from an earlier accepted state, not a leftover: any
+                // anchor write sets lastRateBlock = the current block, which
+                // invalidates every pending recorded at or before it
+                && a.pendingBlock > lastBlk
+                // and it has survived the confirmation gap
+                && blk >= uint256(a.pendingBlock) + CONFIRM_BLOCKS
+                // still the same displaced level, not a fresh excursion
+                && _withinBand(fresh, a.pendingRate)
+            ) {
+                _writeAnchor(a, asset, uint192(fresh), epoch);
+            } else {
+                // open (or replace) the candidate. Replacement matters: an attacker
+                // who moves the venue somewhere NEW restarts their own clock.
+                a.pendingRate = uint192(fresh);
+                a.pendingBlock = uint64(blk);
+            }
         }
 
-        uint256 elapsed = block.timestamp - a.lastRateTime;
-        if (elapsed > MAX_ANCHOR_AGE) revert StaleAnchor(); // freshness bound (item 1)
-
-        uint256 fresh = _readOracle(asset, oracle);
-        if (!_withinBand(fresh, a.lastRate, elapsed)) revert RateOutOfBand();
-
-        uint256 newEma = _advanceEma(a.emaRate, a.lastRate, elapsed);
-        if (!_withinWalkBand(fresh, newEma)) revert AnchorWalkExceeded();
-
-        _writeAnchor(a, asset, uint192(fresh), uint192(newEma), epoch);
-        return fresh;
+        // (2) pricing — conservative side of any disagreement.
+        //
+        //     On the BUY side the surcharge follows the SOURCE of the price, not
+        //     the readability of the oracle (JUP-529 revision, 2026-08-12). If the
+        //     fresh read is at least the anchor we price at it: that is live
+        //     market data (and covers the ordinary case where an in-band read has
+        //     just been absorbed INTO the anchor, leaving the two equal), so
+        //     marking it up would quote above a market we can actually see. If
+        //     the ANCHOR is strictly higher we are pricing off stale
+        //     information, and the markup applies exactly as it does for a dead
+        //     oracle — including when the fresh read is readable but sits far
+        //     BELOW the anchor. Gating the surcharge on `!freshOk` alone let a
+        //     single readable low read strip it for that transaction, so anyone
+        //     who could push one thin venue past the depth floor could buy at the
+        //     bare stale anchor during an outage. Note the ramp is measured from
+        //     the last ACCEPTED write, so in ordinary operation an in-band read
+        //     has just re-stamped the anchor and the surcharge is exactly zero.
+        uint256 anchored = a.lastRate;
+        if (preferHigh) {
+            return fresh >= anchored ? (fresh, true) : (_applyStaleSurcharge(anchored, a), true);
+        }
+        return (fresh < anchored ? fresh : anchored, true);
     }
 
-    /// @dev Band predicate shared by _resolveRate (execution) and _peekRate (preview) —
-    ///      single source of truth so quoter and execution cannot drift.
-    function _withinBand(uint256 fresh, uint256 anchorRef, uint256 elapsed) private view returns (bool) {
-        uint256 widen = 1 + elapsed / WIDEN_PERIOD;
-        if (widen > MAX_WIDEN) widen = MAX_WIDEN;
-        uint256 allowedBps = uint256(anchorBandBps) * widen;
-        uint256 diff = fresh > anchorRef ? fresh - anchorRef : anchorRef - fresh;
-        return diff * BPS <= anchorRef * allowedBps;
+    /// @dev Staleness surcharge (JUP-529), shared verbatim by priceBuy,
+    ///      priceBuyExactQuote and previewBuy so the quoter and the fill can never
+    ///      drift. Only ever called when the oracle read FAILED, so `lastRateBlock`
+    ///      is by construction the last block a read was accepted in. Monotone in
+    ///      _currentBlock() and self-cancelling: the first successful read either
+    ///      prices fresh (surcharge path not taken) or re-anchors.
+    ///
+    ///      The subtraction is taken against the NORMALISED block (`_lastBlock`),
+    ///      never the raw slot. A raw slot ahead of the current block is a
+    ///      migration artifact rather than market state (a pre-2026-08-11 unix
+    ///      timestamp, or a wrong USE_ARB_SYS flag), and subtracting it directly
+    ///      would underflow and Panic-revert the buy path — the one thing this
+    ///      contract promises can never happen. Normalised, such an anchor is
+    ///      treated as if it were set at block zero: on any chain with a
+    ///      meaningful height that saturates the cap, which is the depositor-safe
+    ///      direction (a price of unknown age gets the full defensive markup
+    ///      while the oracle is down), and the anchor heals itself on the first
+    ///      good read regardless.
+    function _staleSurchargeBps(FlowstateStructs.Anchor storage a) private view returns (uint256 bps) {
+        uint256 blk = _currentBlock();
+        bps = (blk - _lastBlock(a, blk)) / STALE_RAMP_BLOCKS_PER_BP;
+        if (bps > STALE_SURCHARGE_CAP_BPS) bps = STALE_SURCHARGE_CAP_BPS;
     }
 
-    /// @dev Walk band (item 4): the fresh rate must sit near the SLOW anchor. No time
-    ///      widening here — widening the walk band with idle time would hand back
-    ///      exactly the cumulative headroom the EMA exists to remove.
-    function _withinWalkBand(uint256 fresh, uint256 ema) private view returns (bool) {
-        uint256 allowedBps = uint256(anchorBandBps) * WALK_BAND_MULT;
-        uint256 diff = fresh > ema ? fresh - ema : ema - fresh;
-        return diff * BPS <= ema * allowedBps;
-    }
-
-    /// @dev Linear-in-elapsed EMA step toward the last ACCEPTED rate (not toward the
-    ///      incoming read — the EMA only ever ingests observations that passed the
-    ///      bands, so a rejected read never drags the reference). elapsed ≥ tau ⇒ the
-    ///      EMA lands exactly on the last accepted rate.
-    function _advanceEma(uint256 ema, uint256 lastAccepted, uint256 elapsed)
+    /// @dev Buy-side application: a WORSE buy quote is a HIGHER rate (the buyer pays
+    ///      more per token), so the markup runs against the clamp's frozen price.
+    ///      Sell side deliberately does not mirror this — it declines outright on an
+    ///      unreadable oracle (NoOracleRate), because it spends depositor cash.
+    function _applyStaleSurcharge(uint256 rate, FlowstateStructs.Anchor storage a)
         private
-        pure
+        view
         returns (uint256)
     {
-        uint256 step = elapsed >= ANCHOR_TAU ? ANCHOR_TAU : elapsed;
-        if (lastAccepted >= ema) {
-            return ema + ((lastAccepted - ema) * step) / ANCHOR_TAU;
-        }
-        return ema - ((ema - lastAccepted) * step) / ANCHOR_TAU;
+        return (rate * (BPS + _staleSurchargeBps(a))) / BPS;
     }
 
-    /// @dev Single writer for anchor state so no code path can update the pair
-    ///      half-way. Values are pre-validated by callers (≤ uint192.max via
-    ///      _readOracle bounds or seed checks).
+    /// @dev Band predicate shared by execution and preview so the quoter and the
+    ///      fill can never drift. No time widening: with one-block confirmation the
+    ///      band is a "small enough not to bother confirming" threshold, not a
+    ///      speed limit, so letting it grow while idle would only weaken it.
+    function _withinBand(uint256 fresh, uint256 anchorRef) private view returns (bool) {
+        uint256 diff = fresh > anchorRef ? fresh - anchorRef : anchorRef - fresh;
+        return diff * BPS <= anchorRef * uint256(anchorBandBps);
+    }
+
+    /// @dev Single writer for anchor state so no path can update it half-way.
+    ///      Setting lastRateBlock also invalidates any outstanding candidate (see
+    ///      the pendingBlock > lastRateBlock test). Values are pre-validated by
+    ///      callers (≤ uint192.max via the oracle read bounds or seed checks).
     function _writeAnchor(
         FlowstateStructs.Anchor storage a,
         address, /* asset — kept for call-site readability */
         uint192 rate,
-        uint192 ema,
         uint32 epoch
     ) private {
         a.lastRate = rate;
-        a.lastRateTime = uint64(block.timestamp);
-        a.emaRate = ema;
+        a.lastRateBlock = uint64(_currentBlock());
         a.lastRateEpoch = epoch;
     }
 
-    /// @dev View twin of _resolveRate: identical rate resolution, no state writes, no
-    ///      reverts (oracle failures return ok=false).
-    function _peekRate(address asset, address oracle, uint32 epoch)
+    /// @dev Non-reverting oracle read. ok=false covers a reverting oracle, a zero
+    ///      rate (every venue failed the slim oracle's depth rules) and an
+    ///      out-of-range rate.
+    function _tryReadOracle(address asset, address oracle)
         private
         view
         returns (bool ok, uint256 rate)
     {
-        FlowstateStructs.Anchor storage a = anchors[asset];
-        if (a.lastRate == 0) return (false, 0);
-
-        if (epoch == a.lastRateEpoch && block.timestamp == a.lastRateTime) {
-            return (true, a.lastRate); // cache hit — execution would not call the oracle either
-        }
-        uint256 fresh;
         try IOracle(oracle).getRate(IERC20(inventoryToken), IERC20(asset), false) returns (uint256 r) {
-            fresh = r;
+            if (r == 0 || r > type(uint192).max) return (false, 0);
+            return (true, r);
         } catch {
             return (false, 0);
         }
-        if (fresh == 0 || fresh > type(uint192).max) return (false, 0);
-        if (epoch != a.lastRateEpoch) return (true, fresh); // execution would reseed band-check-free
+    }
 
-        if (block.timestamp < a.lastRateTime) return (false, 0); // monotonic (item 3)
-        uint256 elapsed = block.timestamp - a.lastRateTime;
-        if (elapsed > MAX_ANCHOR_AGE) return (false, 0); // freshness bound (item 1)
-        if (!_withinBand(fresh, a.lastRate, elapsed)) return (false, 0);
-        if (!_withinWalkBand(fresh, _advanceEma(a.emaRate, a.lastRate, elapsed))) return (false, 0);
-        return (true, fresh);
+    /// @dev View twin of _resolveRate: identical resolution, no state writes. `ok`
+    ///      reports only whether the asset is seeded — market conditions never make
+    ///      a quote unavailable here. `freshOk` mirrors the execution path's oracle
+    ///      read so the sell preview can decline exactly where priceSell would.
+    function _peekRate(address asset, address oracle, uint32 epoch, bool preferHigh)
+        private
+        view
+        returns (bool ok, uint256 rate, bool freshOk, uint256 surchargeBps)
+    {
+        FlowstateStructs.Anchor storage a = anchors[asset];
+        if (a.lastRate == 0) return (false, 0, false, 0);
+
+        uint256 fresh;
+        (freshOk, fresh) = _tryReadOracle(asset, oracle);
+        // mirrors _resolveRate: a dead read clamps to the anchor, and the buy side
+        // pays the staleness surcharge on it
+        if (!freshOk) {
+            uint256 bps = preferHigh ? _staleSurchargeBps(a) : 0;
+            return (true, (a.lastRate * (BPS + bps)) / BPS, false, bps);
+        }
+        // NOTE: no epoch special-case here on purpose (mirrors _resolveRate since
+        // 2026-08-13). A migrated oracle's read is priced by the ordinary rules
+        // below. The ONE place the epoch still matters to this view is the
+        // candidate-confirmation test further down, which must not ratify a
+        // candidate belonging to the previous oracle — see the gate there.
+
+        uint256 blk = _currentBlock();
+        uint256 lastBlk = _lastBlock(a, blk);
+        // Mirror the migration rollback that _resolveRate performs. On an epoch
+        // change, execution pushes an anchor accepted in THIS block back one, so
+        // its maintenance runs and can accept the migrated read. Without the same
+        // adjustment here the view's maintenance was skipped (blk > lastBlk being
+        // false) and it kept quoting the OLD anchor while execution charged the
+        // new in-band rate — a wei-level quoter/execution divergence in exactly
+        // the window the rollback was added for.
+        if (epoch != a.lastRateEpoch && lastBlk == blk && blk > 0) {
+            lastBlk = blk - 1;
+        }
+        // mirror the maintenance step: if execution would accept this read, the
+        // anchor it prices against is the fresh value
+        if (epoch == a.lastRateEpoch && blk == lastBlk) {
+            return (true, a.lastRate, true, 0); // same-block cache (mirrors execution)
+        }
+        uint256 anchored = a.lastRate;
+        if (blk > lastBlk) {
+            if (
+                _withinBand(fresh, a.lastRate)
+                    || (
+                        // A candidate belongs to the oracle that produced it. Execution
+                        // discards it on the epoch bump; this view CANNOT (it writes no
+                        // state), so without this gate the quoter could confirm a stale
+                        // candidate against the NEW oracle's read and quote a price
+                        // execution would never charge. Treat it as already cleared,
+                        // which is exactly what the next state-writing call does.
+                        epoch == a.lastRateEpoch
+                            && a.pendingRate != 0 && a.pendingBlock > lastBlk
+                            && blk >= uint256(a.pendingBlock) + CONFIRM_BLOCKS
+                            && _withinBand(fresh, a.pendingRate)
+                    )
+            ) {
+                anchored = fresh;
+            }
+        }
+        // mirrors _resolveRate's pricing exactly, surcharge included: a buy that
+        // falls back to the anchor pays the staleness markup, a buy that prices
+        // at a higher fresh read does not.
+        if (preferHigh) {
+            if (fresh >= anchored) {
+                rate = fresh;
+            } else {
+                surchargeBps = _staleSurchargeBps(a);
+                rate = (anchored * (BPS + surchargeBps)) / BPS;
+            }
+        } else {
+            rate = fresh < anchored ? fresh : anchored;
+        }
+        ok = true;
     }
 
     /// @dev FIFO fillable walk shared by priceBuy and previewBuy.

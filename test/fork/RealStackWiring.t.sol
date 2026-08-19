@@ -84,7 +84,7 @@ contract RealStackWiringForkTest is RealStackTestBase {
         assertEq(market.poolByPair(address(token), USDG), pool, "pair registry");
         assertEq(poolContract.factory(), address(market), "pool points back at the market");
         assertEq(poolContract.inventoryToken(), address(token));
-        (uint192 seededRate,,,) = poolContract.anchorOf(USDG);
+        (uint192 seededRate,,) = poolContract.anchorOf(USDG);
         assertEq(uint256(seededRate), ORACLE_RATE, "USDG anchor seeded at creation (multi-asset)");
         assertEq(poolContract.tokenBalance(), INITIAL_INVENTORY, "holder-funded inventory");
         assertTrue(address(market) != stack.marketImpl, "market is behind a UUPS proxy");
@@ -119,7 +119,7 @@ contract RealStackWiringForkTest is RealStackTestBase {
     function test_Governance_BeaconOwnedByMarket_SoPoolUpgradeActuallyWorks() public {
         assertEq(stack.beacon.owner(), address(market), "beacon owner is the market proxy");
 
-        address newImpl = deployCode("FlowstatePool.sol:FlowstatePool");
+        address newImpl = deployCode("FlowstatePool.sol:FlowstatePool", abi.encode(true));
         vm.prank(address(stack.tl48));
         market.upgradePoolImplementation(newImpl);
         assertEq(stack.beacon.implementation(), newImpl, "live pools follow the beacon");
@@ -131,7 +131,7 @@ contract RealStackWiringForkTest is RealStackTestBase {
     }
 
     function test_Governance_PoolUpgradeRejectsAnUnauthorisedCaller() public {
-        address newImpl = deployCode("FlowstatePool.sol:FlowstatePool");
+        address newImpl = deployCode("FlowstatePool.sol:FlowstatePool", abi.encode(true));
         vm.prank(makeAddr("attacker"));
         vm.expectRevert();
         market.upgradePoolImplementation(newImpl);
@@ -272,7 +272,7 @@ contract RealStackOracleForkTest is RealStackTestBase {
     ///      anchorBandBps x widen must decline, and it must decline in the quoter and
     ///      the swap alike — the failure shape scope §8 calls acceptable.
     function test_AnchorBand_OutOfBandDeclinesInQuoterAndSwap() public {
-        assertEq(poolContract.anchorBandBps(), 500, "default 5% band (tightened 30 Jul)");
+        assertEq(poolContract.anchorBandBps(), 1000, "default 10% band (anchor redesign, PR #22)");
         // setUp left the anchor 120s stale => widen 3 => 30% allowed. Double the rate.
         oracle.setRate(address(token), USDG, ORACLE_RATE * 2);
 
@@ -288,10 +288,11 @@ contract RealStackOracleForkTest is RealStackTestBase {
 
     /// @dev A move INSIDE the widened band is served, and the anchor advances with it.
     function test_AnchorBand_InBandMoveIsServedAndAdvancesTheAnchor() public {
-        oracle.setRate(address(token), USDG, ORACLE_RATE * 105 / 100); // +5%, inside 30%
+        oracle.setRate(address(token), USDG, ORACLE_RATE * 105 / 100); // +5%, inside the 10% band
+        _expireRateCache(); // else the swap rides the same-block cache and never reads
         vm.prank(swapper);
         _swapBuy(-1_000e6, "");
-        (uint192 anchorRate,,,) = poolContract.anchorOf(USDG);
+        (uint192 anchorRate,,) = poolContract.anchorOf(USDG);
         assertEq(uint256(anchorRate), ORACLE_RATE * 105 / 100, "anchor advanced to the fresh read");
     }
 

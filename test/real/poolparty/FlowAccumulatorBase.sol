@@ -36,12 +36,28 @@ abstract contract FlowAccumulatorBase is Ownable2Step {
     error InsufficientOutput();
     error RescueNotInitiated();
     error RescueNotReady();
+    /// @dev The execution window after maturity has passed; the notice went
+    ///      stale and a fresh initiateRescue must run the full course.
+    error RescueExpired();
+    /// @dev Arming with a zero balance would serve a notice with nothing at
+    ///      risk, which is the arm-early-sweep-later pattern this lane must
+    ///      not permit (JUP-545).
+    error NothingToRescue();
     error NativeTransferFailed();
 
     uint256 public constant RESCUE_DELAY = 7 days;
+    /// @notice How long a matured rescue stays executable. The 7-day delay is
+    ///         a NOTICE, and a notice is only meaningful if it cannot be
+    ///         parked: without an expiry, an armed rescue could sit matured
+    ///         indefinitely and fire the moment it becomes worth firing.
+    uint256 public constant RESCUE_WINDOW = 7 days;
     /// @dev assetIn key address(0) = native.
     mapping(address assetIn => address adapter) public swapAdapters;
     mapping(address asset => uint256 unlockAt) public rescueUnlockAt;
+    /// @notice Amount snapshotted when the rescue was armed. Execution sends at
+    ///         most this: value arriving AFTER the notice was served has had no
+    ///         notice served on it and needs a fresh 7-day cycle (JUP-545).
+    mapping(address asset => uint256 armed) public rescueAmount;
     address public keeper;
     uint256 public minSwapThreshold;
     uint256 public maxSwapPerTx; // 0 = uncapped
@@ -50,7 +66,7 @@ abstract contract FlowAccumulatorBase is Ownable2Step {
     event ThresholdSet(uint256 minSwapThreshold);
     event MaxSwapSet(uint256 maxSwapPerTx);
     event SwapAdapterSet(address indexed assetIn, address adapter);
-    event RescueInitiated(address indexed asset, uint256 unlockAt);
+    event RescueInitiated(address indexed asset, uint256 unlockAt, uint256 amount);
     event RescueCancelled(address indexed asset);
     event RescueExecuted(address indexed asset, address to, uint256 amount);
 
@@ -97,31 +113,45 @@ abstract contract FlowAccumulatorBase is Ownable2Step {
     // ── rescue (two-step, timelocked in-contract — plan R8) ─────────────
 
     function initiateRescue(address asset) external onlyOwner {
+        uint256 amount = asset == address(0) ? address(this).balance : IERC20(asset).balanceOf(address(this));
+        if (amount == 0) revert NothingToRescue();
         uint256 unlockAt = block.timestamp + RESCUE_DELAY;
         rescueUnlockAt[asset] = unlockAt;
-        emit RescueInitiated(asset, unlockAt);
+        rescueAmount[asset] = amount;
+        emit RescueInitiated(asset, unlockAt, amount);
     }
 
     function cancelRescue(address asset) external onlyOwner {
         delete rescueUnlockAt[asset];
+        delete rescueAmount[asset];
         emit RescueCancelled(asset);
     }
 
-    /// @notice Sweeps the FULL balance of `asset` (address(0) = native) to `to`.
+    /// @notice Sweeps the ARMED amount of `asset` (address(0) = native) to `to`:
+    ///         the amount snapshotted when the notice was served, or the current
+    ///         balance if it has since dropped below that. Value accumulated
+    ///         after arming needs a fresh notice; a matured rescue lapses after
+    ///         RESCUE_WINDOW. For a wind-down this means periodic arm/execute
+    ///         cycles rather than one open-ended sweep, which is the point.
     function executeRescue(address asset, address to) external onlyOwner {
         if (to == address(0)) revert ZeroAddress();
         uint256 unlockAt = rescueUnlockAt[asset];
         if (unlockAt == 0) revert RescueNotInitiated();
         if (block.timestamp < unlockAt) revert RescueNotReady();
+        if (block.timestamp > unlockAt + RESCUE_WINDOW) revert RescueExpired();
+        uint256 armed = rescueAmount[asset];
         delete rescueUnlockAt[asset];
+        delete rescueAmount[asset];
 
         uint256 amount;
         if (asset == address(0)) {
             amount = address(this).balance;
+            if (armed < amount) amount = armed;
             (bool ok, ) = to.call{value: amount}("");
             if (!ok) revert NativeTransferFailed();
         } else {
             amount = IERC20(asset).balanceOf(address(this));
+            if (armed < amount) amount = armed;
             IERC20(asset).safeTransfer(to, amount);
         }
         emit RescueExecuted(asset, to, amount);
