@@ -40,8 +40,25 @@ echo "vendored copies pinned to PoolParty_Contracts $PIN"
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 if ! git clone -q --filter=blob:none --no-checkout "$CLONE_URL" "$TMP/c" 2>/dev/null; then
-  echo "cannot clone PoolParty_Contracts. It is private: set CONTRACTS_TOKEN (CI) or"
-  echo "configure a git credential helper (local). FAILING rather than skipping the gate."
+  echo
+  echo "Cannot clone PoolParty_Contracts. It is a PRIVATE repository."
+  if [ "${CI:-}" = "true" ]; then
+    echo
+    echo "  In CI this means the CONTRACTS_READ_TOKEN secret is missing or lacks access."
+    echo "  GITHUB_TOKEN cannot be used here: it is scoped to THIS repository only and"
+    echo "  has no read access to PoolParty_Contracts, which is why falling back to it"
+    echo "  produces an auth error rather than a useful one."
+    echo
+    echo "  Fix: create a fine-grained PAT with Contents:Read on"
+    echo "  PoolParty-Exchange/PoolParty_Contracts, then add it to this repository as"
+    echo "  the secret CONTRACTS_READ_TOKEN."
+  else
+    echo "  Locally: configure a git credential helper with read access, or export"
+    echo "  CONTRACTS_TOKEN."
+  fi
+  echo
+  echo "FAILING rather than skipping. A gate that cannot reach its reference is not a"
+  echo "gate, and this PR exists precisely to stop drift going unnoticed."
   exit 1
 fi
 git -C "$TMP/c" fetch -q --depth 1 origin "$PIN"
