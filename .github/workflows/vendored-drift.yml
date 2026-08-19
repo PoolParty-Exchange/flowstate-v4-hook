@@ -1,0 +1,20 @@
+name: vendored-drift
+on: [push, pull_request]
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # gate 2 shells out to forge, so the toolchain has to exist
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+      - name: C1 vendored sources and interfaces match their pinned contracts SHA
+        env:
+          # PoolParty_Contracts is private and lives in another repository, so
+          # GITHUB_TOKEN is useless here: it is scoped to THIS repo. Falling back to it
+          # only turns "secret not configured" into a confusing auth failure, so do not.
+          CONTRACTS_TOKEN: ${{ secrets.CONTRACTS_READ_TOKEN }}
+        run: ./script/check-vendored-drift.sh

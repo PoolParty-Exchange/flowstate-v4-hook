@@ -80,9 +80,26 @@ library FlowstateEvents {
     event ProceedsClaimed(address indexed pool, address indexed user, address asset, uint256 amount);
 
     // ── anchor lifecycle (reseeds observable — plan R3) ──────────────────
-    /// @dev Emitted on every band-check-FREE anchor write: createPool seeding, the
-    ///      admin resetAnchor lane, and the oracle-epoch reseed. Per (pool, asset).
+    /// @dev Emitted on every band-check-FREE anchor write. Since 2026-08-13 that is
+    ///      EXACTLY TWO lanes, both human-attested: createPool seeding and the admin
+    ///      resetAnchor lane. The oracle-epoch reseed used to be a third and no
+    ///      longer is — a migrated oracle's first read now earns adoption under the
+    ///      ordinary band and confirmation rules (see OracleEpochRecorded).
     event AnchorReseeded(address indexed pool, address indexed asset, uint256 newRate, uint32 epoch);
+    /// @dev A pool has RECORDED a new oracle epoch. Deliberately not "Adopted":
+    ///      no rate is adopted here and none is in effect because of this event.
+    ///      It is a marker, so operators and auditors can see which (pool, asset)
+    ///      pairs have absorbed a migration without inferring it from the ABSENCE
+    ///      of a reseed. The rate that follows earns its way in through the normal
+    ///      band/confirmation path like any other read.
+    /// @param clearedCandidate the displaced level that was awaiting confirmation
+    ///        when the migration landed, discarded because a candidate belongs to
+    ///        the oracle that produced it. Zero when there was none. Emitted for
+    ///        post-hoc analysis: a non-zero value means someone had a candidate
+    ///        open at the moment of a migration, which is worth looking at.
+    event OracleEpochRecorded(
+        address indexed pool, address indexed asset, uint32 epoch, uint256 clearedCandidate
+    );
     /// @dev Emitted by pokeAnchor: a band-CHECKED, trade-less anchor advance (the
     ///      freshness keeper's path). Deliberately distinct from AnchorReseeded so
     ///      monitoring can tell "checked advance" from "unchecked reseed" at topic0.

@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 import "../interface/IOracle.sol";
+import {Mul512Compare} from "../libraries/Mul512Compare.sol";
 
 /**
  * @title FlowstateSlimOracle
@@ -39,12 +40,63 @@ import "../interface/IOracle.sol";
  * anchor machinery (step band, walk band vs EMA, staleness bound) is the defence
  * layer against what a single block's spot can do.
  *
- * MANIPULATION. Fewer venues is a sharper instrument in both directions (roadmap
- * §6 "what could go wrong"): chosen well it is more accurate AND harder to push
- * (depth-weighting means moving the answer requires moving the deep book);
- * chosen badly it is easier. Which venues enter the registry is therefore a real
- * per-token decision, and the minimum-depth floor turns "the book got drained"
- * into a clean decline instead of a confident wrong answer.
+ * MANIPULATION. ⚠️ CORRECTED 2026-08-13 — this header previously claimed that
+ * "depth-weighting means moving the answer requires moving the deep book". THAT
+ * IS FALSE, and it is recorded here rather than quietly deleted because the
+ * claim sat in audited surface and reviewers should see the error next to the
+ * correction.
+ *
+ * The blend weights by in-range L. L can be minted and burned inside ONE
+ * transaction without moving the venue's price, so weight can be RENTED: a
+ * position concentrated into a single tick is counted by _quoteDepthNearPrice as
+ * though it were spread across the whole ±2% band (an overstatement of roughly
+ * two orders of magnitude, since that function assumes constant L across the
+ * band and says so), and the capital is recovered in the same call. Dominating
+ * the blend therefore costs a fee, not depth.
+ *
+ * What that does NOT change: the amount extractable is still bounded by the C1
+ * pools' own anchor band, because a blended rate outside the band is not
+ * believed without surviving a block. What it DOES change is the PRICE of
+ * reaching that bound, which the accepted-residual reasoning had assumed was
+ * proportional to venue depth. See docs ORACLE_WEIGHT_OPTIONS_2026-08-13.md.
+ *
+ * The defence this contract provides today is therefore: the minimum-depth
+ * floor (anti-DUST, turning "the book got drained" into a clean decline rather
+ * than a confident wrong answer), the caller's anchor band, and the structural
+ * guarantee that a registered feed always rests on at least MIN_VENUES = 2
+ * DISTINCT VENUE IDENTITIES (kind, target, poolId) — enforced at registration,
+ * refusing duplicates, and re-checked on EVERY read, because the thinness rules
+ * can exclude a venue live and would otherwise degrade a pair to a single
+ * undefended source in silence. A pair that cannot muster two qualifying books
+ * declines (rate 0) so the caller prices off its anchor instead.
+ *
+ * BE PRECISE ABOUT WHAT THAT BUYS. Identity distinctness is all this contract
+ * can verify: two distinct identities may still be one economic book (a proxy
+ * mirroring another venue's state has a distinct identity and zero
+ * independence — our own test mirror is exactly that shape). INDEPENDENCE of
+ * the two books is an OPERATIONAL REQUIREMENT on whoever registers the feed,
+ * not an on-chain guarantee, and the value of the whole arrangement rests on
+ * it: two venues is the minimum at which venues can DISAGREE, and disagreement
+ * is the only manipulation signal that survives an attacker who can rent
+ * weight. ACTING on that disagreement IS implemented (JUP-546): when
+ * `divergenceThresholdBps` is nonzero and the two qualifying rates sit
+ * strictly further apart than it, the read DECLINES (rate 0) and the caller
+ * prices off its anchor. The check ships DISABLED (threshold 0) until the
+ * measured p99 natural cross-venue divergence (JUP-537) turns into a number.
+ * Changes go through an IN-CONTRACT announce/apply flow: 48-hour delay,
+ * 7-day apply window, apply callable by anyone (the registry owner is the
+ * MULTISIG per the deploy wiring, so the delay lives here rather than being
+ * assumed of the key arrangement); every change is a public, delayed act.
+ * With the check armed,
+ * renting weight on one book is no longer enough — the attacker must move
+ * BOTH books together, which is priced by real depth, not by fees. Still: do
+ * not read this registry as manipulation-proof; read it as manipulation-
+ * BOUNDED by the caller's anchor, over at least two distinct venue identities
+ * whose independence the registering owner is responsible for.
+ *
+ * Which venues enter the registry remains a real per-token decision: fewer
+ * venues is a sharper instrument in both directions, and chosen badly it is
+ * easier to push, not harder.
  *
  * PERMISSIONLESS BY CONSTRUCTION (revised 2026-07-31 after design review). The
  * registry is an ACCELERATOR, never a gate:
@@ -72,6 +124,18 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
     error FeedDisagreesWithFallback(uint256 feedRate, uint256 fallbackRate);
     error InvalidVenue();
     error TooManyVenues();
+    /// @dev Venue count outside [MIN_VENUES, MAX_VENUES] at registration.
+    error InvalidVenueCount();
+    /// @dev Announce/apply flow for the divergence threshold (review round 2).
+    error NoThresholdAnnounced();
+    error ThresholdNotReady();
+    error ThresholdAnnouncementExpired();
+    /// @dev The same venue identity registered twice. MIN_VENUES exists to
+    ///      obtain two readings that CAN disagree; two readings of one
+    ///      identity never can. (Identity distinctness is what the chain can
+    ///      check; independence of the books is the registrant's duty — see
+    ///      the MANIPULATION header note.)
+    error DuplicateVenue();
     error VenueTokensMismatch();
 
     /// @notice Venue kinds. V3: any UniswapV3Pool-shaped contract (slot0/liquidity/
@@ -82,6 +146,20 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
 
     uint256 private constant RATE_SCALE = 1e18;
     uint256 private constant Q96 = 1 << 96;
+    /// @notice A feed must carry at least this many DISTINCT venue identities,
+    ///         AT REGISTRATION AND ON EVERY READ. Two is the minimum at which
+    ///         venues can disagree, and disagreement is the only signal that
+    ///         survives an attacker renting in-range L (see the MANIPULATION
+    ///         note in the header): weight can be bought cheaply, agreement
+    ///         between genuinely independent books cannot. Independence itself
+    ///         is the registrant's operational duty — the chain verifies
+    ///         identities, not economics. Enforcing the count only at
+    ///         registration would be the weaker half of the claim, because the
+    ///         depth floor can exclude a venue LIVE and silently degrade a
+    ///         two-venue pair to one. A pair that cannot muster two qualifying
+    ///         venues is not one this registry can defend, and declines
+    ///         (rate 0) so the caller prices off its anchor instead.
+    uint256 public constant MIN_VENUES = 2;
     uint256 public constant MAX_VENUES = 2; // the slimness invariant, enforced
     uint256 public constant SANITY_BPS = 2_000; // registration-time max deviation vs the fallback (20%)
 
@@ -90,6 +168,24 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
         address target;    // V3: the pool. V4: the StateView.
         bool srcIsToken0;  // orientation, resolved once at registration
         bytes32 poolId;    // V4 only
+    }
+
+    /// @notice Registration input (JUP-547). Identity is DERIVED, never
+    ///         trusted: the V4 poolId is computed from the PoolKey — the
+    ///         currencies are the pair being registered, address-sorted as v4
+    ///         requires, with fee/tickSpacing/hooks supplied here — so a
+    ///         caller cannot register a poolId whose book is some OTHER pair,
+    ///         and orientation falls out of the address sort. For V3 the pool
+    ///         contract itself is the identity and the PoolKey fields must be
+    ///         zero (a nonzero one is always a mistake, usually a V4 venue
+    ///         mis-kinded — the same junk-must-not-differentiate rule that
+    ///         previously guarded supplied poolIds, now structural).
+    struct VenueInput {
+        uint8 kind;        // KIND_V3 | KIND_V4
+        address target;    // V3: the pool. V4: the StateView.
+        uint24 fee;        // V4 PoolKey.fee; 0 for V3
+        int24 tickSpacing; // V4 PoolKey.tickSpacing; 0 for V3
+        address hooks;     // V4 PoolKey.hooks; 0 for V3
     }
 
     struct PairFeed {
@@ -115,6 +211,25 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
     ///         never looser.
     uint16 public mcRatioFloorBps;
 
+    /// @notice The divergence check's LIVE threshold in bps (JUP-546): with
+    ///         two qualifying venues whose rates sit STRICTLY further apart
+    ///         than this (measured against the lower rate), the read declines
+    ///         and the caller anchors. 0 = check DISABLED — the default until
+    ///         JUP-537's p99 measurement produces the number. Changes go
+    ///         through the announce/apply flow below: the registry owner is
+    ///         the MULTISIG (deploy wiring, runbook §2), so the 48-hour delay
+    ///         is enforced HERE, in-contract, rather than assumed of the
+    ///         owner's key arrangement.
+    uint256 public divergenceThresholdBps;
+    /// @notice The announced next threshold, applying no earlier than
+    ///         `divergenceThresholdEta` and lapsing THRESHOLD_APPLY_WINDOW
+    ///         after it — an announcement cannot be parked and fired later,
+    ///         the same rule the rescue lane follows.
+    uint256 public pendingDivergenceThresholdBps;
+    uint64 public divergenceThresholdEta; // 0 = nothing announced
+    uint64 public constant THRESHOLD_DELAY = 48 hours;
+    uint64 public constant THRESHOLD_APPLY_WINDOW = 7 days;
+
     /// @notice The permissionless fallback (the general-purpose aggregator).
     ///         Unregistered pairs read it verbatim; registered pairs never do.
     ///         address(0) = no fallback (unregistered pairs simply decline).
@@ -122,6 +237,9 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
 
     event FeedSet(address indexed src, address indexed dst, uint256 venueCount);
     event FeedCleared(address indexed src, address indexed dst);
+    event DivergenceThresholdAnnounced(uint256 bps, uint64 eta);
+    event DivergenceThresholdCancelled();
+    event DivergenceThresholdSet(uint256 bps);
     event MinQuoteDepthSet(address indexed quote, uint128 minDepth);
     event McRatioFloorSet(uint16 ratioBps);
 
@@ -142,27 +260,59 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
     ///         not silently on the hot path.
     /// @dev The registry is intentionally per-(src,dst) directional: C1 pools only
     ///      ever read token→quote. Register the direction you serve.
-    function setFeed(address src, address dst, Venue[] calldata venues) external onlyOwner {
-        if (venues.length == 0 || venues.length > MAX_VENUES) revert TooManyVenues();
-        PairFeed storage feed = feeds[_pairKey(src, dst)];
-        delete feed.venues;
+    function setFeed(address src, address dst, VenueInput[] calldata venues) external onlyOwner {
+        if (venues.length < MIN_VENUES || venues.length > MAX_VENUES) revert InvalidVenueCount();
+        // Resolve FIRST, then dedupe over the RESOLVED identities (kind, target,
+        // poolId): since JUP-547 nothing in the identity is caller-supplied — the
+        // V4 poolId is derived from the PoolKey and V3's is structurally zero —
+        // so junk input can no longer make one book look like two (the hole the
+        // pre-derivation ordering had to guard against explicitly).
+        Venue[] memory resolved = new Venue[](venues.length);
         for (uint256 i = 0; i < venues.length; ++i) {
-            Venue calldata v = venues[i];
+            VenueInput calldata v = venues[i];
             if (v.target == address(0)) revert InvalidVenue();
             if (v.kind == KIND_V3) {
+                // the pool contract IS the identity; PoolKey fields are V4-only
+                if (v.fee != 0 || v.tickSpacing != 0 || v.hooks != address(0)) revert InvalidVenue();
                 address t0 = IUniV3PoolMinimal(v.target).token0();
                 address t1 = IUniV3PoolMinimal(v.target).token1();
                 bool srcIs0 = src == t0 && dst == t1;
                 bool srcIs1 = src == t1 && dst == t0;
                 if (!srcIs0 && !srcIs1) revert VenueTokensMismatch();
-                feed.venues.push(Venue(KIND_V3, v.target, srcIs0, bytes32(0)));
+                resolved[i] = Venue(KIND_V3, v.target, srcIs0, bytes32(0));
             } else if (v.kind == KIND_V4) {
-                (uint160 sqrtP,,,) = IStateViewMinimal(v.target).getSlot0(v.poolId);
-                if (sqrtP == 0) revert InvalidVenue(); // uninitialized / typo'd poolId
-                feed.venues.push(Venue(KIND_V4, v.target, v.srcIsToken0, v.poolId));
+                // v4 sorts currencies by address; the pair being registered IS
+                // the currency pair, so both the poolId and the orientation are
+                // derived — a poolId belonging to some other pair is now
+                // unconstructible rather than merely unchecked
+                (address c0, address c1) = src < dst ? (src, dst) : (dst, src);
+                bytes32 poolId = keccak256(abi.encode(c0, c1, v.fee, v.tickSpacing, v.hooks));
+                (uint160 sqrtP,,,) = IStateViewMinimal(v.target).getSlot0(poolId);
+                if (sqrtP == 0) revert InvalidVenue(); // no initialized (src,dst) pool with these params
+                resolved[i] = Venue(KIND_V4, v.target, src == c0, poolId);
             } else {
                 revert InvalidVenue();
             }
+        }
+        // MIN_VENUES is about the ABILITY TO DISAGREE, not arithmetic: two
+        // readings of the same book agree by construction, so a duplicate would
+        // satisfy the count while defeating the entire reason for it. Distinct
+        // identities are what this check can verify; it cannot verify the two
+        // books are economically independent — that is the registrant's duty
+        // (see the MANIPULATION header note). MAX_VENUES == 2 makes this a
+        // single comparison; revisit if it grows.
+        for (uint256 i = 0; i < resolved.length; ++i) {
+            for (uint256 j = i + 1; j < resolved.length; ++j) {
+                if (
+                    resolved[i].kind == resolved[j].kind && resolved[i].target == resolved[j].target
+                        && resolved[i].poolId == resolved[j].poolId
+                ) revert DuplicateVenue();
+            }
+        }
+        PairFeed storage feed = feeds[_pairKey(src, dst)];
+        delete feed.venues;
+        for (uint256 i = 0; i < resolved.length; ++i) {
+            feed.venues.push(resolved[i]);
         }
         // Registration sanity check (decided 31 Jul, auditor layer 3): when a
         // fallback aggregator exists and answers, the new feed's blended rate must
@@ -205,6 +355,43 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
         emit McRatioFloorSet(ratioBps);
     }
 
+    /// @notice Announce an arm, move or disarm of the divergence check
+    ///         (0 disarms). No upper bound: an absurdly large threshold is
+    ///         equivalent to disarmed (the read-time compare is full-512-bit,
+    ///         so it cannot panic), and a too-tight one degrades to the anchor,
+    ///         never to a wrong price — both are safe-side failures. The
+    ///         48-hour delay makes every change a public act regardless of how
+    ///         the owner key is held; the flow-first consequence, accepted
+    ///         explicitly: loosening a too-tight threshold ALSO takes 48 hours,
+    ///         during which affected pairs quote defensively off their anchors.
+    function announceDivergenceThreshold(uint256 bps) external onlyOwner {
+        pendingDivergenceThresholdBps = bps;
+        uint64 eta = uint64(block.timestamp) + THRESHOLD_DELAY;
+        divergenceThresholdEta = eta;
+        emit DivergenceThresholdAnnounced(bps, eta);
+    }
+
+    function cancelDivergenceThreshold() external onlyOwner {
+        delete pendingDivergenceThresholdBps;
+        delete divergenceThresholdEta;
+        emit DivergenceThresholdCancelled();
+    }
+
+    /// @notice Apply the announced threshold: callable by ANYONE once the
+    ///         delay has run (the pokeAnchor shape — the protocol must not
+    ///         need us to finish a public act), within the apply window.
+    function applyDivergenceThreshold() external {
+        uint64 eta = divergenceThresholdEta;
+        if (eta == 0) revert NoThresholdAnnounced();
+        if (block.timestamp < eta) revert ThresholdNotReady();
+        if (block.timestamp > eta + THRESHOLD_APPLY_WINDOW) revert ThresholdAnnouncementExpired();
+        uint256 bps = pendingDivergenceThresholdBps;
+        divergenceThresholdBps = bps;
+        delete pendingDivergenceThresholdBps;
+        delete divergenceThresholdEta;
+        emit DivergenceThresholdSet(bps);
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // IOracle
     // ────────────────────────────────────────────────────────────────────
@@ -233,7 +420,10 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
         uint256 ratioBps = mcRatioFloorBps;
         uint256 supply = ratioBps == 0 ? 0 : _tryEffectiveSupply(address(srcToken));
         uint256 weighted; // Σ rate_i × L_i
-        uint256 totalL;   // Σ L_i — same-pair venues share L units, so weights compare
+        uint256 totalL;   // Σ L_i
+        uint256 qualifying; // venues that cleared BOTH thinness rules on THIS read — same-pair venues share L units, so weights compare
+        uint256 rateA; // the two qualifying rates, kept for the divergence
+        uint256 rateB; // check below (MIN_VENUES == MAX_VENUES == 2)
         for (uint256 i = 0; i < n; ++i) {
             Venue storage v = feed.venues[i];
             (bool ok, uint160 sqrtPriceX96, uint128 liquidity) = _read(v);
@@ -253,8 +443,41 @@ contract FlowstateSlimOracle is IOracle, Ownable2Step {
                     if (depth < mcFloor) continue;
                 }
             }
-            weighted += r * liquidity;
+            if (qualifying == 0) rateA = r;
+            else rateB = r;
+            // M8: a pathological venue (extreme rate × extreme L) would
+            // overflow the weighted sum and REVERT the read; would-overflow
+            // instead DECLINES like every other unpriceable state, so the
+            // caller anchors and surcharges rather than losing the read path
+            if (r > type(uint256).max / liquidity) return 0;
+            uint256 term = r * liquidity;
+            if (weighted > type(uint256).max - term) return 0;
+            weighted += term;
             totalL += liquidity;
+            unchecked { ++qualifying; }
+        }
+        // MIN_VENUES is a READ-TIME invariant, not just a registration one: the
+        // thinness rules above can exclude a venue live, which would silently
+        // reduce a registered pair to a single source and leave nothing for the
+        // cross-venue comparison to compare against. Decline instead — the caller
+        // clamps to its anchor and prices defensively, which is the honest answer
+        // when the registry can no longer back the guarantee it advertises.
+        if (qualifying < MIN_VENUES) return 0;
+        // The divergence check (JUP-546): disagreement is the one manipulation
+        // signal an attacker who can rent in-range L cannot fake away — weight
+        // is cheap, agreement between independent books is not. Strictly beyond
+        // the threshold (measured against the LOWER rate, the conservative
+        // denominator) the pair declines and the caller prices off its anchor;
+        // the blend never averages a dispute. Threshold 0 = check disarmed
+        // (the default until JUP-537's measurement sets the number).
+        uint256 t = divergenceThresholdBps;
+        if (t != 0) {
+            (uint256 lo, uint256 hi) = rateA < rateB ? (rateA, rateB) : (rateB, rateA);
+            // full-512-bit compare (review): the threshold is unbounded by
+            // design ("absurdly large equals disarmed"), which is only true if
+            // the arithmetic cannot panic — raw t·lo could, turning a
+            // disarmed-equivalent setting into a bricked read
+            if (Mul512Compare.gt(hi - lo, 10_000, t, lo)) return 0;
         }
         if (totalL == 0) return 0;
         rate = weighted / totalL;

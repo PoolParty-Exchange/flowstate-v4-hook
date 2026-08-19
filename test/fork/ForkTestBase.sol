@@ -203,7 +203,13 @@ abstract contract ForkTestBase is RealStackDeployer {
     /// @dev Advance past FlowstatePool's same-timestamp rate cache so the next trade
     ///      performs a genuine oracle read + band check. 120s also widens the band to
     ///      3x, which is irrelevant at a constant rate but keeps the fixture honest.
+    /// @dev The rate cache is keyed on the BLOCK the anchor was accepted in, not on a
+    ///      timestamp (anchor redesign, PR #22). Warping time alone therefore expires
+    ///      nothing: RH produces many blocks per second, so timestamp and block moved
+    ///      apart. Roll the block as well, and keep the warp so any genuinely
+    ///      time-based staleness also advances.
     function _expireRateCache() internal {
+        vm.roll(block.number + 1);
         vm.warp(block.timestamp + 120);
     }
 

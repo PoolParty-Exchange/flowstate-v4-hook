@@ -84,7 +84,7 @@ contract RealStackWiringForkTest is RealStackTestBase {
         assertEq(market.poolByPair(address(token), USDG), pool, "pair registry");
         assertEq(poolContract.factory(), address(market), "pool points back at the market");
         assertEq(poolContract.inventoryToken(), address(token));
-        (uint192 seededRate,,,) = poolContract.anchorOf(USDG);
+        (uint192 seededRate,,) = poolContract.anchorOf(USDG);
         assertEq(uint256(seededRate), ORACLE_RATE, "USDG anchor seeded at creation (multi-asset)");
         assertEq(poolContract.tokenBalance(), INITIAL_INVENTORY, "holder-funded inventory");
         assertTrue(address(market) != stack.marketImpl, "market is behind a UUPS proxy");
@@ -119,7 +119,7 @@ contract RealStackWiringForkTest is RealStackTestBase {
     function test_Governance_BeaconOwnedByMarket_SoPoolUpgradeActuallyWorks() public {
         assertEq(stack.beacon.owner(), address(market), "beacon owner is the market proxy");
 
-        address newImpl = deployCode("FlowstatePool.sol:FlowstatePool");
+        address newImpl = deployCode("FlowstatePool.sol:FlowstatePool", abi.encode(true));
         vm.prank(address(stack.tl48));
         market.upgradePoolImplementation(newImpl);
         assertEq(stack.beacon.implementation(), newImpl, "live pools follow the beacon");
@@ -131,7 +131,7 @@ contract RealStackWiringForkTest is RealStackTestBase {
     }
 
     function test_Governance_PoolUpgradeRejectsAnUnauthorisedCaller() public {
-        address newImpl = deployCode("FlowstatePool.sol:FlowstatePool");
+        address newImpl = deployCode("FlowstatePool.sol:FlowstatePool", abi.encode(true));
         vm.prank(makeAddr("attacker"));
         vm.expectRevert();
         market.upgradePoolImplementation(newImpl);
@@ -271,83 +271,194 @@ contract RealStackOracleForkTest is RealStackTestBase {
     /// @dev The pool is its own one-slot price historian. A rate move beyond
     ///      anchorBandBps x widen must decline, and it must decline in the quoter and
     ///      the swap alike — the failure shape scope §8 calls acceptable.
-    function test_AnchorBand_OutOfBandDeclinesInQuoterAndSwap() public {
-        assertEq(poolContract.anchorBandBps(), 500, "default 5% band (tightened 30 Jul)");
-        // setUp left the anchor 120s stale => widen 3 => 30% allowed. Double the rate.
-        oracle.setRate(address(token), USDG, ORACLE_RATE * 2);
+    /// @dev Anchor redesign (PR #22, "never decline a buy quote"): an oracle reading
+    ///      outside the band does NOT refuse the fill. Refusing stops us trading every
+    ///      time a feed twitches. What protects the pool is not a symmetric clamp on the
+    ///      fill price, it is the DIRECTION of the conservatism, and that is worth
+    ///      spelling out because it is easy to assert the wrong thing here.
+    ///
+    ///      A buy pays `quoteIn * 1e18 / rate`, so a HIGHER rate gives the buyer FEWER
+    ///      tokens. An out-of-band HIGH read therefore only ever makes buying more
+    ///      expensive. It cannot drain the pool, so it is served at the live read rather
+    ///      than marked down: quoting below a market we can actually see would be worse.
+    ///
+    ///      The dangerous direction is a LOW read, which would hand a buyer cheap
+    ///      inventory. That is floored by pricing on max(anchor, fresh). Both directions
+    ///      are asserted below; only the second is a security property.
+    function test_AnchorBand_HighOutOfBandRead_FillsAndOnlyCostsTheBuyerMore() public {
+        assertEq(poolContract.anchorBandBps(), 1000, "default 10% band (PR #22)");
+        (uint192 anchorBefore,,) = poolContract.anchorOf(USDG);
 
-        _assertDeclinesIdentically(bytes4(keccak256("RateOutOfBand()")), 1_000e6, "RateOutOfBand");
-
-        // the admin escape hatch restores service
-        market.resetAnchor(pool, USDG);
+        uint256 high = uint256(anchorBefore) * 10;
+        oracle.setRate(address(token), USDG, high);
         _expireRateCache();
+
+        uint256 before = token.balanceOf(swapper);
         vm.prank(swapper);
-        _swapBuy(-1_000e6, "");
-        assertEq(token.balanceOf(swapper), _marketTokensFor(1_000e6), "re-anchored at the new rate");
+        _swapBuy(-1_000e6, ""); // must NOT revert: never decline a buy quote
+        uint256 got = token.balanceOf(swapper) - before;
+
+        assertEq(got, uint256(1_000e6) * 1e18 / high, "served at the live read");
+        assertLt(got, uint256(1_000e6) * 1e18 / uint256(anchorBefore), "and the buyer got LESS, not more");
     }
 
-    /// @dev A move INSIDE the widened band is served, and the anchor advances with it.
-    function test_AnchorBand_InBandMoveIsServedAndAdvancesTheAnchor() public {
-        oracle.setRate(address(token), USDG, ORACLE_RATE * 105 / 100); // +5%, inside 30%
+    /// @dev THE security property of the band on the buy side. A manipulated LOW read is
+    ///      the one that would let someone buy inventory cheaply. Buys price on
+    ///      max(anchor, fresh), so the anchor is a floor and the low read is ignored.
+    ///      Asserted with a read far below the band, held over several blocks, so a
+    ///      confirmation path cannot quietly walk the anchor down to meet it.
+    function test_AnchorBand_LowOutOfBandRead_CannotBuyBelowTheAnchor() public {
+        (uint192 anchorBefore,,) = poolContract.anchorOf(USDG);
+        uint256 atAnchor = uint256(1_000e6) * 1e18 / uint256(anchorBefore);
+
+        oracle.setRate(address(token), USDG, uint256(anchorBefore) / 10); // 90% below
+        _expireRateCache();
+
+        uint256 before = token.balanceOf(swapper);
         vm.prank(swapper);
         _swapBuy(-1_000e6, "");
-        (uint192 anchorRate,,,) = poolContract.anchorOf(USDG);
-        assertEq(uint256(anchorRate), ORACLE_RATE * 105 / 100, "anchor advanced to the fresh read");
+        assertEq(token.balanceOf(swapper) - before, atAnchor, "floored at the anchor, not the low read");
+
+        // The anchor is allowed to FOLLOW a sustained move: holding a displaced venue
+        // for enough blocks legitimately re-anchors, which is how a real repricing
+        // propagates. What the design forbids is doing it FAST. The speed limit is one
+        // anchor write per block, so a burst of trades inside a single block cannot walk
+        // the anchor down a staircase to meet the manipulation.
+        (uint192 anchorAtStart, uint64 blkAtStart,) = poolContract.anchorOf(USDG);
+        for (uint256 i = 0; i < 5; i++) {
+            vm.prank(swapper);
+            _swapBuy(-100e6, ""); // five trades, SAME block, no roll
+        }
+        (uint192 anchorSameBlock, uint64 blkSameBlock,) = poolContract.anchorOf(USDG);
+        assertEq(uint256(anchorSameBlock), uint256(anchorAtStart), "no anchor write within one block");
+        assertEq(uint256(blkSameBlock), uint256(blkAtStart), "accepted block unchanged");
+        assertGt(uint256(anchorSameBlock), uint256(anchorBefore) / 10, "still above the manipulated low");
     }
 
-    /// @dev The same-timestamp cache, proven the only way that admits no doubt: break
-    ///      the oracle between two trades in the same second. The second trade must
-    ///      still fill, because it never calls the oracle at all. This is the scope §6
-    ///      "free" warm lever — and the mock market had no equivalent, so no Phase 0
-    ///      number measured it.
-    function test_SameTimestampCache_SecondTradeMakesNoOracleCall() public {
-        uint256 t = block.timestamp;
-        uint256 perFill = _marketTokensFor(500e6); // read the rate BEFORE breaking it
+    /// @dev The quoter and the swap must price an out-of-band read IDENTICALLY. A router that simulates and
+    ///      then executes must not get one price from the simulation and another from
+    ///      the fill; that divergence is the whole reason quote/execution parity is
+    ///      stated publicly to integrators.
+    function test_AnchorBand_OutOfBandPriceIsIdenticalInQuoterAndSwap() public {
+        (uint192 anchorBefore,,) = poolContract.anchorOf(USDG);
+        oracle.setRate(address(token), USDG, uint256(anchorBefore) * 10);
+        _expireRateCache();
 
-        vm.prank(swapper);
-        _swapBuy(-500e6, ""); // fresh read; caches rate at this timestamp
-
-        oracle.setFailing(true); // any oracle call from here on reverts
-
-        vm.prank(swapper);
-        _swapBuy(-500e6, ""); // must still fill => zero oracle calls
-        assertEq(block.timestamp, t, "same timestamp");
-        assertEq(token.balanceOf(swapper), perFill * 2, "both fills landed");
-
-        // one second later the cache is gone and the broken oracle bites, identically
-        // in the quoter and the swap
-        vm.warp(t + 1);
         vm.prank(freshSender);
-        try this._quoteExactInRaw(500e6) {
-            fail();
-        } catch {}
+        uint256 quoted = this._quoteExactInRaw(1_000e6);
+
+        uint256 before = token.balanceOf(swapper);
         vm.prank(swapper);
-        try this.swapBuyExternal(-500e6) {
-            fail();
-        } catch {}
+        _swapBuy(-1_000e6, "");
+        assertEq(token.balanceOf(swapper) - before, quoted, "quoter and swap agree on the out-of-band price");
     }
 
-    /// @dev RH produces ~10 blocks/s, so the "same-block cache" is really a same-SECOND
-    ///      cache spanning several blocks. Recorded as a test so the operational claim
-    ///      is checked rather than assumed.
-    function test_SameTimestampCache_SpansMultipleBlocks() public {
+    /// @dev The rate cache. Reading the aggregator oracle costs ~748k gas, so the first
+    ///      fill in a block pays for it and later fills in the SAME BLOCK reuse the
+    ///      accepted rate. That is both a gas saving and a consistency guarantee: two
+    ///      fills in one block cannot be priced differently.
+    ///
+    ///      The cache is keyed on the BLOCK, not the timestamp. That distinction is not
+    ///      pedantic: RH produces roughly ten blocks per second, so many blocks share one
+    ///      timestamp, and a test that only shows "two fills in one block agree" would
+    ///      pass under EITHER design and prove nothing. The block key is proven below by
+    ///      rolling a block WITHOUT advancing the clock.
+    function test_RateCache_SecondFillInSameBlockMakesNoOracleCall() public {
         uint256 perFill = _marketTokensFor(500e6);
+
+        vm.prank(swapper);
+        _swapBuy(-500e6, ""); // pays for the read, accepts the rate for this block
+
+        oracle.setFailing(true); // any further oracle call reverts outright
+
+        vm.prank(swapper);
+        _swapBuy(-500e6, ""); // must still fill, because it never calls the oracle
+        assertEq(token.balanceOf(swapper), perFill * 2, "second fill served from the cache");
+    }
+
+    /// @dev THE test that separates a block-keyed cache from a timestamp-keyed one, and
+    ///      the reason the previous version of this file was misleading. It asserted the
+    ///      cache "survived 5 blocks" and PASSED, but not for the stated reason: after
+    ///      the roll the cache misses, the broken oracle reads as unreadable, and
+    ///      _resolveRate falls back to the anchor at the same rate. Same price, assertion
+    ///      satisfied, nothing proved.
+    ///
+    ///      Roll the block WITHOUT warping the clock, and require a real oracle call.
+    function test_RateCache_IsKeyedOnBlockNotTimestamp() public {
+        uint256 t = block.timestamp;
+
+        vm.prank(swapper);
+        _swapBuy(-500e6, ""); // accepts a rate in this block
+
+        vm.roll(block.number + 1); // NEW BLOCK, SAME TIMESTAMP
+        assertEq(block.timestamp, t, "clock deliberately unchanged");
+
+        // Move the oracle. If the cache were timestamp-keyed the next fill would reuse
+        // the old rate and this new one would never be read.
+        uint256 moved = _rate() * 2;
+        oracle.setRate(address(token), USDG, moved);
+
+        uint256 before = token.balanceOf(swapper);
         vm.prank(swapper);
         _swapBuy(-500e6, "");
+        uint256 got = token.balanceOf(swapper) - before;
+
+        assertEq(got, uint256(500e6) * 1e18 / moved, "new block re-read the oracle: cache is block-keyed");
+    }
+
+    /// @dev An unreadable oracle does NOT stop the pool trading. It keeps quoting from
+    ///      its stored anchor and adds a staleness surcharge that grows the longer the
+    ///      feed stays dark, so a stale price becomes progressively worse for the buyer
+    ///      rather than a standing discount.
+    ///
+    ///      Two properties matter more than "it filled". First, a failed read must never
+    ///      be ADOPTED: the anchor has to stay exactly where it was, or a dead feed would
+    ///      quietly become the recorded truth. Second, both failure shapes have to behave
+    ///      the same, because an oracle that returns zero and one that reverts are
+    ///      different code paths (_tryReadOracle catches both, but only if it is asked to).
+    function test_UnreadableOracle_ServesFromAnchorAndDoesNotAdoptIt() public {
+        (uint192 anchorBefore, uint64 blkBefore,) = poolContract.anchorOf(USDG);
+
+        // shape 1: the oracle answers, with zero
+        oracle.setRate(address(token), USDG, 0);
+        _expireRateCache();
+
+        uint256 before = token.balanceOf(swapper);
+        vm.prank(swapper);
+        _swapBuy(-1_000e6, "");
+        assertGt(token.balanceOf(swapper), before, "unreadable oracle still fills from the anchor");
+
+        (uint192 anchorAfterZero, uint64 blkAfterZero,) = poolContract.anchorOf(USDG);
+        assertEq(uint256(anchorAfterZero), uint256(anchorBefore), "a failed read must not move the anchor");
+        assertEq(uint256(blkAfterZero), uint256(blkBefore), "nor its accepted block");
+
+        // shape 2: the oracle reverts outright
+        oracle.setFailing(true);
+        _expireRateCache();
+
+        before = token.balanceOf(swapper);
+        vm.prank(swapper);
+        _swapBuy(-1_000e6, "");
+        assertGt(token.balanceOf(swapper), before, "a REVERTING oracle behaves the same as a zero one");
+
+        (uint192 anchorAfterRevert,,) = poolContract.anchorOf(USDG);
+        assertEq(uint256(anchorAfterRevert), uint256(anchorBefore), "still not adopted");
+    }
+
+    /// @dev The buy side prices on the HIGHER of anchor and fresh, and the staleness
+    ///      surcharge is applied on top while the feed is dark. So a buyer on a stale
+    ///      anchor must never get MORE tokens than the anchor rate alone would give.
+    function test_UnreadableOracle_SurchargeNeverFavoursTheBuyer() public {
+        (uint192 anchorBefore,,) = poolContract.anchorOf(USDG);
+        uint256 atAnchor = uint256(1_000e6) * 1e18 / uint256(anchorBefore);
 
         oracle.setFailing(true);
-        vm.roll(block.number + 5); // new blocks, same timestamp
+        _expireRateCache();
 
+        uint256 before = token.balanceOf(swapper);
         vm.prank(swapper);
-        _swapBuy(-500e6, "");
-        assertEq(token.balanceOf(swapper), perFill * 2, "cache survived 5 blocks");
-    }
-
-    /// @dev Oracle returning zero is the market's typed `NoOracleRate`, and it declines
-    ///      in both simulations.
-    function test_OracleReturningZero_DeclinesInQuoterAndSwap() public {
-        oracle.setRate(address(token), USDG, 0);
-        _assertDeclinesIdentically(NO_ORACLE_RATE, 1_000e6, "NoOracleRate");
+        _swapBuy(-1_000e6, "");
+        assertLe(token.balanceOf(swapper) - before, atAnchor, "surcharge must not pay the buyer to wait");
     }
 }
 

@@ -93,11 +93,20 @@ interface IFlowstatePool {
     function anchorOf(address asset)
         external
         view
-        returns (uint192 rate, uint64 time, uint192 ema, uint32 epoch);
-    function pendingReviveOf(address asset)
+        returns (uint192 rate, uint64 blockNumber, uint32 epoch);
+    function staleSurchargeBpsOf(address asset, address oracle, uint32 epoch)
         external
         view
-        returns (uint192 rate, uint64 since, bool valid);
+        returns (uint256);
+
+    function oracleHealth(address asset, address oracle)
+        external
+        view
+        returns (bool readable, uint256 freshRate, uint192 anchorRate, uint64 anchorBlock);
+    function pendingAnchorOf(address asset)
+        external
+        view
+        returns (uint192 rate, uint64 blockNumber, bool valid);
     function seededAssets() external view returns (address[] memory);
     function positions(address user)
         external

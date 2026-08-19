@@ -93,8 +93,9 @@ interface IFlowstatePoolTest {
     function poolPaused() external view returns (bool);
     function claimableQuote(address asset, address user) external view returns (uint256);
     function claimQuote() external;
-    function anchorOf(address asset) external view returns (uint192 rate, uint64 time, uint192 ema, uint32 epoch);
-    function previewBuy(uint256 amount, address oracle, uint32 epoch)
+    function anchorOf(address asset) external view returns (uint192 rate, uint64 blockNumber, uint32 epoch);
+    function pendingAnchorOf(address asset) external view returns (uint192 rate, uint64 blockNumber, bool live);
+    function previewBuy(address asset, uint256 amount, address oracle, uint32 epoch)
         external
         view
         returns (bool ok, uint256 fillable, uint256 cost);
@@ -156,13 +157,23 @@ abstract contract RealStackDeployer is Test {
         internal
         returns (RealStack memory s)
     {
+        // The pool reads its block clock from ArbSys(0x64): RH is an Arbitrum Orbit
+        // chain where block.number returns the PARENT height. That precompile does not
+        // exist on a fork, so etch it HERE rather than in a setUp, because several
+        // suites override setUp entirely and would otherwise deploy a pool whose every
+        // _currentBlock call reverts. Mock returns block.number.
+        // Etch UNCONDITIONALLY. On a fork of RH the precompile address already carries
+        // code, so a "only if empty" guard skips the mock and leaves the real precompile,
+        // which does not answer under forking.
+        vm.etch(address(0x64), hex"4360005260206000f3");
+
         address[] memory single = new address[](1);
         single[0] = admin;
         s.tl48 = new TimelockController(48 hours, single, single, address(0));
         s.tl24 = new TimelockController(24 hours, single, single, address(0));
         s.tl12 = new TimelockController(12 hours, single, single, address(0));
 
-        s.poolImpl = deployCode("FlowstatePool.sol:FlowstatePool");
+        s.poolImpl = deployCode("FlowstatePool.sol:FlowstatePool", abi.encode(true));
         s.beacon = new UpgradeableBeacon(s.poolImpl, address(this));
         s.template = deployCode("InitializableBeaconProxy.sol:InitializableBeaconProxy");
 
