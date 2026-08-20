@@ -186,9 +186,10 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     );
     event PairUnregistered(Currency indexed currency0, Currency indexed currency1);
     event ResellerCodeUpdated(string previous, string current);
-    /// @dev quoteIn is the buyer's gross payment (market cost + spread + dust). The
-    ///      accrual components are emitted per fill so the O1 attribution indexer can
-    ///      reconcile per-router margin against sweeps without tracing.
+    /// @dev quoteIn is the buyer's requested/committed input. On an exact-input short
+    ///      fill it is NOT the realised payment: the unspent remainder is returned via
+    ///      PoolManager accounting. Join this event to the market's PoolBuy by
+    ///      transaction hash; actual charge is quotePaid + spreadAccrued + dustAccrued.
     event BuyExecuted(
         PoolId indexed poolId,
         Currency quote,
@@ -468,15 +469,16 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         return (IHooks.beforeSwap.selector, hookDelta, 0);
     }
 
-    /// @dev exactInput spread carve: the swapper's specified quoteIn is taken and
-    ///      charged in full; the market is committed netQuote = floor(quoteIn *
+    /// @dev exactInput spread carve: the swapper's specified quoteIn is taken into
+    ///      the hook, while the market is committed netQuote = floor(quoteIn *
     ///      10_000 / (10_000 + spreadBps)) — floored so the carve can never eat into
     ///      what the spread is owed — and prices tokens on that remainder. The spread
     ///      then accrues on the RECOMPUTED oracle cost the market actually pulled
     ///      (quotePaid <= netQuote), as ceil(quotePaid * spreadBps / 10_000): never
     ///      undercollects, exceeds the exact bps product by < 1 wei. Whatever is left
-    ///      of quoteIn (carve residue + the market's floor/ceil inversion dust) is
-    ///      accounted separately as dust, never folded into spread margin.
+    ///      of quoteIn on an ordinary full fill (carve residue + the market's
+    ///      floor/ceil inversion dust) is accounted separately as dust, never folded
+    ///      into spread margin. A short fill returns its unspent remainder below.
     ///      Rung lookup uses quoteIn (the committed notional — the only quote-side
     ///      size known before the market call).
     function _buyExactInput(
