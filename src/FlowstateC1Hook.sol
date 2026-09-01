@@ -156,6 +156,13 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         runbook re-sets spreads after raising the floor).
     uint16 public baseSpreadFloorBps;
 
+    /// @notice Spread applied to pairs the trusted Market auto-registers inside
+    ///         createPool (JUP-587). 16 bps = launch parity with the manually
+    ///         registered CASHCAT/HOODRAT pairs. If the floor is later raised above
+    ///         this value the market path self-heals by charging the floor instead
+    ///         of reverting inside createPool.
+    uint16 public marketRegistrationSpreadBps = 16;
+
     /// @notice Reseller code passed to the market on each buy ("" = none).
     string public resellerCode;
 
@@ -202,6 +209,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     event BeaconSeeded(PoolId indexed poolId, address indexed sender);
     event BaseSpreadUpdated(Currency indexed currency0, Currency indexed currency1, uint16 baseSpreadBps);
     event BaseSpreadFloorUpdated(uint16 previous, uint16 current);
+    event MarketRegistrationSpreadUpdated(uint16 previous, uint16 current);
     event SizeRungsUpdated(Currency indexed quote, SpreadRung[] rungs);
     event SweepDestinationUpdated(address previous, address current);
     event MarginSwept(
@@ -266,6 +274,29 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     {
         if (marketPool == address(0)) revert ZeroAddress();
         _checkBaseSpread(baseSpreadBps);
+        _registerPair(quote, token, marketPool, baseSpreadBps);
+    }
+
+    /// @notice Market-trusted auto-registration fired inside createPool (JUP-587;
+    ///         Wilko GO 24 Aug: deliberately narrow — no venue discovery, no oracle
+    ///         feed work, ERC-20 quotes only). IDEMPOTENT: an already-registered
+    ///         pair is left untouched, however it is tuned, so a market call can
+    ///         never clobber owner configuration. Spread = the configured market
+    ///         registration spread, floored at baseSpreadFloorBps so a later floor
+    ///         raise degrades to a wider spread instead of a createPool-time revert.
+    function registerPairFromMarket(Currency quote, Currency token, address marketPool) external {
+        if (msg.sender != address(market)) revert NotMarket();
+        if (quote.isAddressZero()) revert NativeQuoteUnsupported();
+        if (marketPool == address(0)) revert ZeroAddress();
+        (Currency s0, Currency s1) = _sort(quote, token);
+        if (pairs[_pairKey(s0, s1)].registered) return;
+        uint16 spread = marketRegistrationSpreadBps;
+        uint16 floor = baseSpreadFloorBps;
+        if (spread < floor) spread = floor;
+        _registerPair(quote, token, marketPool, spread);
+    }
+
+    function _registerPair(Currency quote, Currency token, address marketPool, uint16 baseSpreadBps) internal {
         // native quote (v1 decision, 2026-07-30): served by wrapping into weth9, so
         // the market-side asset for a native pair IS the wrapper
         address marketAsset;
@@ -311,6 +342,16 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         if (floorBps > MAX_SPREAD_BPS) revert SpreadOutOfRange(floorBps, 0, MAX_SPREAD_BPS);
         emit BaseSpreadFloorUpdated(baseSpreadFloorBps, floorBps);
         baseSpreadFloorBps = floorBps;
+    }
+
+    /// @notice Retune the spread used by market auto-registration (JUP-587).
+    ///         Already-registered pairs are untouched (retune those per-pair via
+    ///         setBaseSpread). Bounded by the hard cap only; the floor is applied
+    ///         lazily at registration time so this can never make createPool revert.
+    function setMarketRegistrationSpread(uint16 bps) external onlyOwner {
+        if (bps > MAX_SPREAD_BPS) revert SpreadOutOfRange(bps, 0, MAX_SPREAD_BPS);
+        emit MarketRegistrationSpreadUpdated(marketRegistrationSpreadBps, bps);
+        marketRegistrationSpreadBps = bps;
     }
 
     /// @notice Replace the size-adjustment schedule for a quote asset. Input must be
