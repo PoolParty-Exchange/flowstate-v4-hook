@@ -46,6 +46,8 @@ interface IFlowstateMarketTest {
     function contributeTokens(address pool, uint256 amount, address contributionOwner) external;
     function withdrawTokens(address pool, uint256 amount) external;
     function poolByPair(address token, address quote) external view returns (address);
+    function poolRecords(address pool) external view returns (address inventoryToken, bool exists);
+    function approvedQuoteAssets(address asset) external view returns (bool);
     function poolBeacon() external view returns (address);
     function priceOracle() external view returns (address);
     function oracleEpoch() external view returns (uint32);
@@ -65,6 +67,7 @@ interface IFlowstateMarketTest {
 
     // admin
     function setQuoteAsset(address asset, bool approved) external;
+    function setTrustedHook(address hook) external;
     function setFeeBps(address token, uint16 feeBps) external;
     function setAnchorBand(address pool, uint16 bandBps) external;
     function resetAnchor(address pool, address asset) external;

@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {FlowstateC1Hook} from "../../src/FlowstateC1Hook.sol";
+import {MockInventoryToken} from "../mocks/MockInventoryToken.sol";
 import {ForkTestBase} from "./ForkTestBase.sol";
 
 /// @notice JUP-587: the market-trusted auto-registration path used by createPool.
@@ -54,6 +55,7 @@ contract RegisterFromMarketTest is ForkTestBase {
 
     function test_registersFreshPairWithConfiguredSpread() public {
         assertFalse(_pairRegistered(aewethKey), "fixture: aeWETH pair must start unregistered");
+        market.setQuoteAsset(AEWETH, true);
 
         vm.prank(address(market));
         hook.registerPairFromMarket(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool);
@@ -96,6 +98,7 @@ contract RegisterFromMarketTest is ForkTestBase {
     // -- spread configuration --------------------------------------------------
 
     function test_setMarketRegistrationSpread_appliesToNextRegistration() public {
+        market.setQuoteAsset(AEWETH, true);
         vm.expectEmit(false, false, false, true, address(hook));
         emit MarketRegistrationSpreadUpdated(16, 40);
         hook.setMarketRegistrationSpread(40);
@@ -125,10 +128,29 @@ contract RegisterFromMarketTest is ForkTestBase {
         // a createPool auto-registration failure on every new pool).
         hook.setBaseSpreadFloor(50);
         assertLt(hook.marketRegistrationSpreadBps(), 50);
+        market.setQuoteAsset(AEWETH, true);
 
         vm.prank(address(market));
         hook.registerPairFromMarket(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool);
         assertEq(_pairSpread(aewethKey), 50, "floor not applied");
+    }
+
+    function test_marketCreatePoolAutoRegistrationStillSucceedsWithValidation() public {
+        vm.prank(address(stack.tl48));
+        market.setTrustedHook(address(hook));
+
+        MockInventoryToken newToken = new MockInventoryToken();
+        oracle.setRate(address(newToken), USDG, ORACLE_RATE);
+        newToken.mint(lister, 100e18);
+        vm.startPrank(lister);
+        newToken.approve(address(market), type(uint256).max);
+        address newPool = market.createPool(address(newToken), 100e18, 0);
+        vm.stopPrank();
+
+        bytes32 key = _key(USDG, address(newToken));
+        assertTrue(_pairRegistered(key), "createPool hook registration failed");
+        assertEq(_pairPool(key), newPool, "createPool registered the wrong Market pool");
+        assertTrue(hook.isPairReady(Currency.wrap(USDG), Currency.wrap(address(newToken))));
     }
 
     // -- owner path unchanged --------------------------------------------------

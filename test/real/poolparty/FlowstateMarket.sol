@@ -11,6 +11,7 @@ import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/proxy/Clones.sol";
 import "@openzeppelin/contracts/proxy/beacon/IBeacon.sol";
 
+import "./interface/IFlowstateC1Hook.sol";
 import "./interface/IOracle.sol";
 import "./interface/IFlowstatePool.sol";
 import "./interface/IFlowstateBuyFunder.sol";
@@ -101,7 +102,7 @@ import {Mul512Compare} from "./libraries/Mul512Compare.sol";
  *
  * ADMIN-SURFACE INVENTORY (scope doc §11 — deliberately minimal, all event-emitting):
  * instant multisig: setFeeBps (hard-capped ≤100), setQuoteAsset, reseller registry
- * (EOA-only, shares sum to 6000), setAnchorBand, setPriceSource (parked), setBuyBack,
+ * (chain-specific recipients, shares sum to 6000), setAnchorBand, setPriceSource (parked), setBuyBack,
  * resetAnchor, setFrozen (single address, block-only), pausePool/unpause;
  * 48h timelock: upgradeToAndCall (UUPS) + upgradePoolImplementation (beacon),
  * setPriceOracle (epoch reseed), setPoolBeacon/template, setBuybackReceiver;
@@ -133,7 +134,6 @@ contract FlowstateMarket is
     error NoOracleRate();
     error InvalidBand();
     error FeeExceedsCap();
-    error NotEOA();
     error BDWalletRequired();
     error SharesMustSumToPartnerShare();
     error Bd2ShareWithoutWallet();
@@ -193,7 +193,10 @@ contract FlowstateMarket is
     mapping(address => bool) public frozen;                           // slot 10
     address[] private quoteAssetList;                                 // slot 11 (ever-approved, dedup'd)
     mapping(address => bool) private inQuoteAssetList;                // slot 12
-    uint256[38] private __gap;
+    /// @dev JUP-587: the V4 hook createPool auto-registers new pairs with.
+    ///      address(0) = feature off (createPool behaves exactly as pre-upgrade).
+    address public trustedHook;                                       // slot 13
+    uint256[37] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -340,6 +343,27 @@ contract FlowstateMarket is
 
         poolRecords[pool] = FlowstateStructs.PoolRecord(token, true);
         poolByToken[token] = pool;
+
+        // JUP-587: open the new pool's V4 doorway in the same transaction — one
+        // registration per approved asset with the trusted hook. try/catch per
+        // pair: a hook fault (or the feature being off) must NEVER block pool
+        // creation; the failure event is the off-chain provisioner's repair
+        // signal. Registered after poolByToken is set so the hook can read the
+        // registry if it chooses to. All approved assets are registered, seeded
+        // or not: an asset seeded later via resetAnchor then quotes through an
+        // already-open lane instead of waiting for an operator to notice.
+        address hook = trustedHook;
+        if (hook != address(0)) {
+            for (uint256 i = 0; i < length; ++i) {
+                address asset = quoteAssetList[i];
+                if (!approvedQuoteAssets[asset]) continue;
+                try IFlowstateC1Hook(hook).registerPairFromMarket(asset, token, pool) {
+                    emit FlowstateEvents.HookPairAutoRegistered(pool, token, asset);
+                } catch {
+                    emit FlowstateEvents.HookPairAutoRegistrationFailed(pool, token, asset);
+                }
+            }
+        }
 
         uint256 actual = _pullToPool(token, pool, amount);
         IFlowstatePool(pool).creditTokenContribution(msg.sender, actual);
@@ -925,13 +949,13 @@ contract FlowstateMarket is
         uint16 bd2ShareBps
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _checkCode(code);
-        _requireEOA(wallet);
+        _requireRecipient(wallet);
         if (bd1 == address(0)) revert BDWalletRequired();
-        _requireEOA(bd1);
+        _requireRecipient(bd1);
         if (bd2 == address(0)) {
             if (bd2ShareBps != 0) revert Bd2ShareWithoutWallet();
         } else {
-            _requireEOA(bd2);
+            _requireRecipient(bd2);
         }
         _checkShareSum(resellerShareBps, bd1ShareBps, bd2ShareBps);
 
@@ -961,7 +985,7 @@ contract FlowstateMarket is
         onlyRole(DEFAULT_ADMIN_ROLE)
     {
         FlowstateStructs.ResellerConfig storage rc = _registered(code);
-        _requireEOA(newWallet); // EOA re-check on every update path (R9)
+        _requireRecipient(newWallet);
         address old = rc.wallet;
         rc.wallet = newWallet;
         emit FlowstateEvents.ResellerWalletUpdated(code, old, newWallet);
@@ -974,14 +998,14 @@ contract FlowstateMarket is
         FlowstateStructs.ResellerConfig storage rc = _registered(code);
         address old;
         if (slot == 1) {
-            _requireEOA(newWallet); // bd1 is mandatory — cannot be cleared (R9)
+            _requireRecipient(newWallet); // bd1 is mandatory — cannot be cleared
             old = rc.bd1;
             rc.bd1 = newWallet;
         } else if (slot == 2) {
             if (newWallet == address(0)) {
                 if (rc.bd2ShareBps != 0) revert Bd2ShareWithoutWallet();
             } else {
-                _requireEOA(newWallet);
+                _requireRecipient(newWallet);
             }
             old = rc.bd2;
             rc.bd2 = newWallet;
@@ -1124,6 +1148,18 @@ contract FlowstateMarket is
         emit FlowstateEvents.BuybackReceiverUpdated(receiver);
     }
 
+    /// @notice Timelocked (protocol wiring lane). The V4 hook that createPool
+    ///         auto-registers each new (approved asset, token) pair with — JUP-587,
+    ///         kept deliberately narrow per Wilko's 24 Aug GO: no on-chain venue
+    ///         discovery, no oracle-feed selection; V4 pool init, beacons and feeds
+    ///         stay with the off-chain provisioner. Unlike the other wiring setters
+    ///         address(0) is deliberately LEGAL here: it is the kill-switch, and a
+    ///         kill-switch must not need an upgrade to reach.
+    function setTrustedHook(address hook) external onlyRole(TIMELOCK_ROLE) {
+        emit FlowstateEvents.TrustedHookUpdated(trustedHook, hook);
+        trustedHook = hook;
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Internals
     // ────────────────────────────────────────────────────────────────────
@@ -1172,12 +1208,13 @@ contract FlowstateMarket is
         if (!rc.registered) revert ResellerNotRegistered();
     }
 
-    /// @dev EOA-only rule: smart wallets are not address-portable across chains;
-    ///      fees sent to a non-portable address on another chain are unrecoverable.
-    ///      Re-run on EVERY wallet write, not just registration (R9).
-    function _requireEOA(address account) private view {
+    /// @dev Fee recipients are chain-specific configuration. Safes, smart-contract
+    ///      wallets and EIP-7702/delegated addresses are valid recipients; the
+    ///      contract enforces only the structural non-zero invariant. JUP-581
+    ///      validates the intended recipient against the exact target chain and
+    ///      deployed Market generation before proposing an admin transaction.
+    function _requireRecipient(address account) private pure {
         if (account == address(0)) revert ZeroAddress();
-        if (account.code.length != 0) revert NotEOA();
     }
 
     function _checkShareSum(uint16 r, uint16 b1, uint16 b2) private pure {

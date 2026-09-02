@@ -578,10 +578,11 @@ contract RealStackDeclineForkTest is RealStackTestBase {
         _swapBuy(-1_000e6, "");
     }
 
-    /// @dev A pool the hook points at that the market does not know is a typed
-    ///      `UnknownPool` from the market, surfaced identically in both paths.
-    function test_UnregisteredMarketPool_DeclinesIdentically() public {
-        hook.registerPair(Currency.wrap(USDG), Currency.wrap(address(token)), makeAddr("not-a-pool"), 0);
-        _assertDeclinesIdentically(bytes4(keccak256("UnknownPool()")), 1_000e6, "UnknownPool");
+    /// @dev JUP-609 rejects an unknown Market pool at registration instead of storing
+    ///      a route that can only decline later during quote/swap execution.
+    function test_UnregisteredMarketPool_IsRejectedAtRegistration() public {
+        address unknownPool = makeAddr("not-a-pool");
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.MarketPoolNotRecognized.selector, unknownPool));
+        hook.registerPair(Currency.wrap(USDG), Currency.wrap(address(token)), unknownPool, 0);
     }
 }
