@@ -148,6 +148,7 @@ contract BeaconSeederForkTest is ForkTestBase {
 
     function test_Beacon_IsPerPool_NotGlobal() public {
         // second pair on the same C1 pool: aeWETH quote (multi-asset), same hook
+        market.setQuoteAsset(AEWETH, true);
         hook.registerPair(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool, 0);
         (Currency c0, Currency c1) = AEWETH < address(token)
             ? (Currency.wrap(AEWETH), Currency.wrap(address(token)))

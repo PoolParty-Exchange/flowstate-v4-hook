@@ -15,6 +15,13 @@ pragma solidity ^0.8.26;
 ///      then delivers the tokens to `buyer`. The pair is all-or-nothing with a typed
 ///      FillShortfall revert; each entry point performs exactly ONE oracle read.
 interface IFlowstateMarketMinimal {
+    /// @notice Canonical Market registry entry for a Flowstate pool.
+    /// @dev The public mapping getter returns the PoolRecord fields in declaration order.
+    function poolRecords(address pool) external view returns (address inventoryToken, bool exists);
+
+    /// @notice Whether an asset is currently approved as executable quote input.
+    function approvedQuoteAssets(address asset) external view returns (bool);
+
     /// @notice Legacy exact-output buy (partial-fill semantics; kept for reference —
     ///         the hook's swap paths use the pair below).
     /// @return tokensFilled tokens delivered (may be < amount on inventory caps).

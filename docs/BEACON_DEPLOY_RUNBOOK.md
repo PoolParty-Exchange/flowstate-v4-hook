@@ -42,8 +42,12 @@ deploy (step 2) and are deliberately NOT tabled here.
 3. **Deploy hook + register pair + reseller code**:
    `SALT=.. EXPECTED_HOOK=.. V4_POOL_MANAGER=.. FS_MARKET=.. HOOK_OWNER=.. AEWETH=.. PAIR_TOKEN=.. MARKET_POOL=.. RESELLER_CODE=v4hook BASE_SPREAD_BPS=30 forge script script/DeployHook.s.sol --rpc-url $RH_RPC_URL --broadcast`
    The script reverts if the deployed address differs from the mined one.
-   `registerPair` performs the market `forceApprove` — no separate approval step
-   exists or is needed (verified: no pool can initialize before registration).
+   `registerPair` first verifies the Market recognizes `MARKET_POOL`, binds it to
+   `PAIR_TOKEN`, and currently approves the resolved quote asset; it then performs the
+   market `forceApprove`, so no separate approval step exists or is needed. Confirm
+   `isPairReady` before initialization. A later quote-asset revocation or a
+   `baseSpreadFloorBps` increase above the stored spread makes the pair non-ready until
+   the Market approval is restored or `setBaseSpread` retunes it.
 4. **Deploy the seeder** (unprivileged, stateless, once per chain):
    `V4_POOL_MANAGER=.. FS_MARKET=.. forge script script/DeployBeaconSeeder.s.sol --rpc-url $RH_RPC_URL --broadcast`
 5. **Initialize the V4 pool** (starts the discovery clock):

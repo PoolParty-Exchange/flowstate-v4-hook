@@ -659,17 +659,34 @@ contract SpreadConfigForkTest is SpreadTestBase {
         hook.registerPair(usdg, Currency.wrap(AEWETH), pool, 0);
     }
 
-    /// @dev Raising the floor deliberately does NOT retro-check registered pairs, and
-    ///      the swap path never re-validates config: an existing pair keeps trading at
-    ///      its old spread until the runbook re-sets it.
-    function test_RaisingFloor_DoesNotRetroBreakExistingPairsOrSwaps() public {
+    /// @dev Raising the floor leaves owner tuning untouched but lazily closes the route
+    ///      until its stored spread is brought back into compliance.
+    function test_RaisingFloor_MakesPairNonReadyUntilSpreadIsRetuned() public {
         hook.setBaseSpread(usdg, Currency.wrap(address(token)), 5);
+        assertTrue(hook.isPairReady(usdg, Currency.wrap(address(token))));
         hook.setBaseSpreadFloor(50);
 
-        assertEq(hook.spreadBpsFor(usdg, Currency.wrap(address(token)), 1e6), 5, "stored spread unchanged");
+        assertFalse(hook.isPairReady(usdg, Currency.wrap(address(token))));
+        bytes32 key = keccak256(abi.encode(poolKey.currency0, poolKey.currency1));
+        (,,, uint16 storedSpread,) = hook.pairs(key);
+        assertEq(storedSpread, 5, "floor raise must not silently mutate owner tuning");
+
+        try this.swapBuyBelowRaisedFloor(-1_000e6) {
+            fail();
+        } catch (bytes memory reason) {
+            assertTrue(_containsSelector(reason, FlowstateC1Hook.SpreadOutOfRange.selector));
+        }
+
+        hook.setBaseSpread(usdg, Currency.wrap(address(token)), 50);
+        assertTrue(hook.isPairReady(usdg, Currency.wrap(address(token))));
+        assertEq(hook.spreadBpsFor(usdg, Currency.wrap(address(token)), 1e6), 50);
         vm.prank(swapper);
-        _swapBuy(-1_000e6, ""); // hot path does not re-check the floor
+        _swapBuy(-1_000e6, "");
         assertGt(hook.accruedSpreadMargin(usdg), 0);
+    }
+
+    function swapBuyBelowRaisedFloor(int256 amountSpecified) external {
+        _swapBuy(amountSpecified, "");
     }
 
     function test_BaseSpread_RejectsAboveHardCap() public {

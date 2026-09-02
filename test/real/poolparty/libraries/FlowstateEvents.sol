@@ -155,6 +155,13 @@ library FlowstateEvents {
     event PriceOracleUpdated(address oldOracle, address newOracle, uint32 newEpoch);
     event BuybackReceiverUpdated(address receiver);
 
+    // ── JUP-587: createPool hook auto-registration ───────────────────────
+    event TrustedHookUpdated(address oldHook, address newHook);
+    event HookPairAutoRegistered(address indexed pool, address indexed token, address indexed asset);
+    /// @dev The provisioner's repair signal: a pool was created whose V4 doorway
+    ///      could not be opened in-transaction. Creation itself never reverts for this.
+    event HookPairAutoRegistrationFailed(address indexed pool, address indexed token, address indexed asset);
+
     // ── compliance (public-by-design) ────────────────────────────────────
     event AddressFrozen(address indexed account);
     event AddressUnfrozen(address indexed account);

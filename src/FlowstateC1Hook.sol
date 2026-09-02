@@ -61,6 +61,10 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     error LiquidityNotAllowed();
     error SellDirectionNotSupported();
     error NativeQuoteUnsupported(); // registerPair with a native quote on a chain with no weth9 configured
+    error MarketStateUnverifiable();
+    error MarketPoolNotRecognized(address marketPool);
+    error MarketInventoryMismatch(address marketPool, address expectedInventory, address actualInventory);
+    error MarketQuoteAssetNotApproved(address marketPool, address quoteAsset);
     error UnexpectedNativeSender(address sender);
     error ManagerReservesExceeded(Currency currency, uint256 requested, uint256 available);
     error SpreadOutOfRange(uint16 bps, uint16 floorBps, uint16 maxBps);
@@ -149,11 +153,10 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         than a mid-size one). Empty schedule = baseSpread only (ship default).
     mapping(Currency quote => SpreadRung[] rungs) internal _sizeRungs;
 
-    /// @notice Config-time floor on baseSpreadBps (the per-chain oracle-drift floor,
+    /// @notice Current floor on baseSpreadBps (the per-chain oracle-drift floor,
     ///         scope §5: 10 bps BSC / 16 bps RH / 23 bps Base — set operationally at
-    ///         deploy). Checked in registerPair/setBaseSpread only, NEVER on the hot
-    ///         path; raising it does not retro-check already-registered pairs (the
-    ///         runbook re-sets spreads after raising the floor).
+    ///         deploy). Checked when configuring and when testing readiness/executing,
+    ///         so raising it lazily disables older below-floor pairs until retuned.
     uint16 public baseSpreadFloorBps;
 
     /// @notice Spread applied to pairs the trusted Market auto-registers inside
@@ -266,9 +269,11 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     // -------------------------------------------------------------------------
 
     /// @notice Register a (quote, token) pair, wiring it to its FlowstateMarket pool.
+    ///         The Market registry must recognize marketPool, bind it to token, and
+    ///         currently approve the resolved ERC-20 quote asset.
     ///         Grants the market a standing quote-asset allowance so the pull-exact
     ///         transferFrom never pays approval gas on the hot path. baseSpreadBps is
-    ///         floor- and cap-checked here (config time), never on the hot path.
+    ///         floor- and cap-checked both here and by the shared readiness gate.
     function registerPair(Currency quote, Currency token, address marketPool, uint16 baseSpreadBps)
         external
         onlyOwner
@@ -307,6 +312,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         } else {
             marketAsset = Currency.unwrap(quote);
         }
+        _validateMarketWiring(marketPool, Currency.unwrap(token), marketAsset);
         (Currency c0, Currency c1) = _sort(quote, token);
         bool quoteIsCurrency0 = Currency.unwrap(quote) == Currency.unwrap(c0);
         pairs[_pairKey(c0, c1)] = PairConfig({
@@ -337,8 +343,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         emit BaseSpreadUpdated(c0, c1, baseSpreadBps);
     }
 
-    /// @notice Set the per-chain oracle-drift floor for baseSpreadBps (config-time
-    ///         check only; does not retro-check registered pairs).
+    /// @notice Set the per-chain oracle-drift floor for baseSpreadBps. Existing pairs
+    ///         below a raised floor retain their configured spread but become non-ready
+    ///         and non-executable until the owner retunes them.
     function setBaseSpreadFloor(uint16 floorBps) external onlyOwner {
         if (floorBps > MAX_SPREAD_BPS) revert SpreadOutOfRange(floorBps, 0, MAX_SPREAD_BPS);
         emit BaseSpreadFloorUpdated(baseSpreadFloorBps, floorBps);
@@ -432,6 +439,20 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         return pairs[_pairKey(c0, c1)].registered;
     }
 
+    /// @notice Whether the pair is registered, at or above the current spread floor,
+    ///         and still coherently wired to the Market's canonical pool registry and
+    ///         current quote-asset approval state. Returns false if Market reads fail.
+    function isPairReady(Currency currencyA, Currency currencyB) external view returns (bool) {
+        (Currency c0, Currency c1) = _sort(currencyA, currencyB);
+        PairConfig memory cfg = pairs[_pairKey(c0, c1)];
+        if (!cfg.registered || cfg.baseSpreadBps < baseSpreadFloorBps || cfg.baseSpreadBps > MAX_SPREAD_BPS) {
+            return false;
+        }
+        Currency inventory = cfg.quoteIsCurrency0 ? c1 : c0;
+        (MarketWiringStatus status,) = _marketWiringStatus(cfg.marketPool, Currency.unwrap(inventory), cfg.marketAsset);
+        return status == MarketWiringStatus.Valid;
+    }
+
     /// @notice The stored rung schedule for a quote asset.
     function sizeRungs(Currency quote) external view returns (SpreadRung[] memory) {
         return _sizeRungs[quote];
@@ -443,7 +464,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     function spreadBpsFor(Currency quote, Currency token, uint256 quoteNotional) external view returns (uint256) {
         (Currency c0, Currency c1) = _sort(quote, token);
         PairConfig memory cfg = pairs[_pairKey(c0, c1)];
-        if (!cfg.registered) revert PairNotRegistered();
+        _requirePairReady(cfg, c0, c1);
         return _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), quoteNotional);
     }
 
@@ -453,7 +474,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
 
     function beforeInitialize(address, PoolKey calldata key, uint160) external view onlyPoolManager returns (bytes4) {
         if (key.fee != 0) revert LpFeeMustBeZero();
-        if (!pairs[_pairKey(key.currency0, key.currency1)].registered) revert PairNotRegistered();
+        _requirePairReady(pairs[_pairKey(key.currency0, key.currency1)], key.currency0, key.currency1);
         return IHooks.beforeInitialize.selector;
     }
 
@@ -490,7 +511,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         PairConfig memory cfg = pairs[_pairKey(key.currency0, key.currency1)];
-        if (!cfg.registered) revert PairNotRegistered();
+        _requirePairReady(cfg, key.currency0, key.currency1);
 
         (Currency input, Currency output) =
             params.zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
@@ -744,13 +765,62 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         poolManager.settle();
     }
 
-    /// @dev Config-time only (scope §5): baseSpread must clear the per-chain
-    ///      oracle-drift floor and sit under the hard cap. Deliberately NOT checked
-    ///      on the hot path — a swap never re-validates config.
+    /// @dev baseSpread must clear the current per-chain oracle-drift floor and sit
+    ///      under the hard cap. Shared by config-time checks and the readiness gate.
     function _checkBaseSpread(uint16 bps) internal view {
         if (bps < baseSpreadFloorBps || bps > MAX_SPREAD_BPS) {
             revert SpreadOutOfRange(bps, baseSpreadFloorBps, MAX_SPREAD_BPS);
         }
+    }
+
+    enum MarketWiringStatus {
+        Valid,
+        Unverifiable,
+        UnknownPool,
+        InventoryMismatch,
+        QuoteNotApproved
+    }
+
+    function _marketWiringStatus(address marketPool, address expectedInventory, address quoteAsset)
+        internal
+        view
+        returns (MarketWiringStatus status, address actualInventory)
+    {
+        bool exists;
+        try market.poolRecords(marketPool) returns (address inventoryToken, bool poolExists) {
+            actualInventory = inventoryToken;
+            exists = poolExists;
+        } catch {
+            return (MarketWiringStatus.Unverifiable, address(0));
+        }
+        if (!exists) return (MarketWiringStatus.UnknownPool, actualInventory);
+        if (actualInventory != expectedInventory) return (MarketWiringStatus.InventoryMismatch, actualInventory);
+
+        try market.approvedQuoteAssets(quoteAsset) returns (bool approved) {
+            if (!approved) return (MarketWiringStatus.QuoteNotApproved, actualInventory);
+        } catch {
+            return (MarketWiringStatus.Unverifiable, actualInventory);
+        }
+        return (MarketWiringStatus.Valid, actualInventory);
+    }
+
+    function _validateMarketWiring(address marketPool, address expectedInventory, address quoteAsset) internal view {
+        (MarketWiringStatus status, address actualInventory) =
+            _marketWiringStatus(marketPool, expectedInventory, quoteAsset);
+        if (status == MarketWiringStatus.Valid) return;
+        if (status == MarketWiringStatus.Unverifiable) revert MarketStateUnverifiable();
+        if (status == MarketWiringStatus.UnknownPool) revert MarketPoolNotRecognized(marketPool);
+        if (status == MarketWiringStatus.InventoryMismatch) {
+            revert MarketInventoryMismatch(marketPool, expectedInventory, actualInventory);
+        }
+        revert MarketQuoteAssetNotApproved(marketPool, quoteAsset);
+    }
+
+    function _requirePairReady(PairConfig memory cfg, Currency c0, Currency c1) internal view {
+        if (!cfg.registered) revert PairNotRegistered();
+        _checkBaseSpread(cfg.baseSpreadBps);
+        Currency inventory = cfg.quoteIsCurrency0 ? c1 : c0;
+        _validateMarketWiring(cfg.marketPool, Currency.unwrap(inventory), cfg.marketAsset);
     }
 
     /// @dev Total spread bps: base + size-adjustment rung. First rung whose ceiling
