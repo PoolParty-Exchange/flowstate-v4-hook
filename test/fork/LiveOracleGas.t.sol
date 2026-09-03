@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 import {ForkTestBase} from "./ForkTestBase.sol";
-import {ITestSpotOracle} from "./RealStackDeployer.sol";
+import {ITestSpotOracle, AnchorFloorInput} from "./RealStackDeployer.sol";
 import {FlowstateC1Hook} from "../../src/FlowstateC1Hook.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -58,7 +58,11 @@ contract LiveOracleGasForkTest is ForkTestBase {
         deal(AEWETH, lister, LIVE_INVENTORY);
         vm.startPrank(lister);
         inv.approve(address(market), type(uint256).max);
-        pool = market.createPool(AEWETH, LIVE_INVENTORY, 0);
+        {
+            AnchorFloorInput[] memory floors = new AnchorFloorInput[](1);
+            floors[0] = AnchorFloorInput({asset: USDG, minRate: 1}); // live listing: any positive seed rate consents
+            pool = market.createPool(AEWETH, LIVE_INVENTORY, 0, floors);
+        }
         vm.stopPrank();
 
         (address hookAddress, bytes32 salt) = HookMiner.find(

@@ -18,6 +18,12 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 // byte-identical to the hook that will be deployed.
 // ---------------------------------------------------------------------------
 
+/// @dev ABI twin of FlowstateStructs.AnchorFloor for the 0.8.26 test side.
+struct AnchorFloorInput {
+    address asset;
+    uint192 minRate;
+}
+
 interface IFlowstateMarketTest {
     struct Quote {
         bool available;
@@ -39,11 +45,12 @@ interface IFlowstateMarketTest {
         address emergencyTimelock12
     ) external;
 
-    // registry / liquidity
-    function createPool(address token, uint256 amount, uint16 anchorBandBps)
+    // registry / liquidity (JUP-611: deposits carry the consent floors)
+    function createPool(address token, uint256 amount, uint16 anchorBandBps, AnchorFloorInput[] calldata floors)
         external
         returns (address pool);
-    function contributeTokens(address pool, uint256 amount, address contributionOwner) external;
+    function contributeTokens(address pool, uint256 amount, address contributionOwner, AnchorFloorInput[] calldata floors)
+        external;
     function withdrawTokens(address pool, uint256 amount) external;
     function poolByPair(address token, address quote) external view returns (address);
     function poolRecords(address pool) external view returns (address inventoryToken, bool exists);
@@ -98,7 +105,7 @@ interface IFlowstatePoolTest {
     function claimQuote() external;
     function anchorOf(address asset) external view returns (uint192 rate, uint64 blockNumber, uint32 epoch);
     function pendingAnchorOf(address asset) external view returns (uint192 rate, uint64 blockNumber, bool live);
-    function previewBuy(address asset, uint256 amount, address oracle, uint32 epoch)
+    function previewBuy(address asset, uint256 amount, address oracle, uint32 epoch, uint256 floor)
         external
         view
         returns (bool ok, uint256 fillable, uint256 cost);

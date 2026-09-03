@@ -34,6 +34,7 @@ contract NativeQuoteForkTest is ForkTestBase {
         // the SAME C1 pool gains an aeWETH anchor (late-seeding lane: admin resetAnchor)
         oracle.setRate(address(token), AEWETH, RATE_W);
         market.setQuoteAsset(AEWETH, true);
+        vm.prank(address(stack.tl48)); // JUP-611 (#40): resetAnchor is behind the 48h TIMELOCK_ROLE
         market.resetAnchor(pool, AEWETH);
 
         // native-quoted V4 pool on the SAME hook, wired to the SAME C1 pool

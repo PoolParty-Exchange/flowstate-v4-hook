@@ -29,9 +29,8 @@ pair, slice 2 = fee rungs + sweep, slice 3 = real-market wiring, this document).
 - `src/interfaces/IFlowstateMarketMinimal.sol` — the market surface the hook consumes:
   the scope §2.2 entry-point pair, `buyFromPoolExactQuote` (exact-input in quote terms)
   and `buyFromPoolExactOut` (exact-output twin with the `IFlowstateBuyFunder.fundBuy`
-  funding callback), plus the canonical `poolRecords` and `approvedQuoteAssets` reads
-  used by JUP-609 registration/readiness validation. Legacy `buyFromPool` remains
-  declared for reference; the hook's swap paths use only the exact-input/output pair.
+  funding callback). Legacy `buyFromPool` remains declared for reference; the hook's
+  swap paths use only the pair.
 - `src/interfaces/IFlowstateBuyFunder.sol` — the funding-callback interface the hook
   implements (mirror of the PoolParty_Contracts original).
 - `test/real/poolparty/` — **byte-identical vendored copies** of the real Flowstate
@@ -47,29 +46,24 @@ pair, slice 2 = fee rungs + sweep, slice 3 = real-market wiring, this document).
   the V4 pool against the real PoolManager. It also carries the ArbSys precompile mock
   helper (`mockArbSys()`), which the V4Quoter path does not need (verified).
 
-**`test/mocks/MockFlowstateMarket.sol` is deleted.** There is no second trading
-implementation of the market interface in this repo. The vendored Market fixture also
-includes the focused JUP-587 auto-registration delta from `PoolParty_Contracts` main at
-`b67e3eb4`, so hook validation is exercised through the real registry-write-then-call
-ordering and per-pair `try/catch` used by `createPool`.
+**`test/mocks/MockFlowstateMarket.sol` is deleted.** There is no second implementation
+of the market interface left in this repo, so there is nothing left to drift.
 
 ## Vendoring: how the real contracts get into a Foundry test
 
 PoolParty_Contracts is a Hardhat repo. Three options were on the table (vendor the
 sources, remap to the sibling repo, or compile artifacts and `vm.etch`). **Chosen:
-vendored sources**, because it lets a reviewer read exactly what the fixture deploys and
-compare it against the source of truth directly.
+vendored sources**, because it is the only option where a reviewer can read exactly what
+was deployed and `diff` it against the source of truth in one command:
 
 ```bash
-git diff 959e867 b67e3eb4 -- contracts/FlowstateMarket.sol \
-    contracts/libraries/FlowstateEvents.sol contracts/interface/IFlowstateC1Hook.sol
+diff -r test/real/poolparty \
+        ../PoolParty_Contracts/contracts   # only "Only in" lines should appear
 ```
 
-The fixture is based on `PoolParty_Contracts` **origin/main @ `959e867`** (the merge of
-PR #8, the exact-quote pair, and PR #9, governance + the 12h emergency lane), with the
-focused JUP-587 Market/interface/event delta from `b67e3eb4` applied so `createPool`
-auto-registration is tested at its real registry-write ordering. Vendored:
-`FlowstateMarket`, `FlowstatePool`, `FlowBridgeCollector`,
+The copies are byte-identical to `PoolParty_Contracts` **`integrate/jup-602-611-612-619` @ `7829879`** (3 Sep 2026: the stacked branch behind contracts PR #43, carrying #38 + #40 + #41 + #42; this pin moves back to `origin/main` once #43 merges, and the drift gate holds it to whatever commit `.vendored-from` names). Before that it was **origin/main @ `959e867`**
+(the merge of PR #8, the exact-quote pair, and PR #9, governance + the 12h emergency
+lane). Vendored: `FlowstateMarket`, `FlowstatePool`, `FlowBridgeCollector`,
 `FlowAccumulatorBase`, `proxy/InitializableBeaconProxy`, `libraries/{FlowstateStructs,
 FlowstateEvents}`, `interface/{IOracle, IFlowstatePool, IFlowstateBuyFunder,
 IInitializableBeaconProxy, IUpgradeableBeacon, IFlowAdapters}`. Refreshing them is a
@@ -207,13 +201,6 @@ gap), and every config setter is owner-gated and sits outside the swap path.
 `spreadBps = baseSpread[pair] + sizeAdjustment(quote notional)`
 
 - `baseSpread` is per pair, set at `registerPair` and retunable via `setBaseSpread`.
-- Manual `registerPair` is accepted only when the configured Market's canonical
-  `poolRecords` entry exists, names the V4 inventory/output token, and
-  `approvedQuoteAssets` currently approves the resolved quote asset (the wrapper for
-  native V4 quote currency). Bad or unreadable Market wiring fails with typed errors.
-- Trusted `registerPairFromMarket` remains Market-only and idempotent; a pre-existing
-  owner configuration returns untouched. Fresh Market registrations use the same
-  validator after JUP-587 has written the canonical pool record.
 - `sizeAdjustment` is a per-quote-asset schedule of `(notionalCeiling, extraBps)`
   rungs (`setSizeRungs`). Rungs are keyed per quote asset because the ceiling is in
   raw units and raw notionals are not comparable across decimals.
@@ -226,11 +213,9 @@ gap), and every config setter is owner-gated and sits outside the swap path.
   anything else raises `RungScheduleInvalid`. Zero ceilings and duplicates are
   rejected by the same rule.
 - `baseSpreadFloorBps` (the per-chain oracle-drift floor: 10 BSC / 16 RH / 23 Base)
-  is enforced at configuration and by the current readiness/execution gate. Raising
-  the floor does not mutate stored owner tuning or iterate the registry: an existing
-  below-floor pair becomes non-ready and swaps fail with `SpreadOutOfRange` until
-  `setBaseSpread` restores compliance. `isPairReady` exposes the same floor and Market
-  wiring invariants used by initialization, spread quoting, and swap execution.
+  is enforced **at config time only**, in `registerPair`/`setBaseSpread`. The hot
+  path never re-validates config, and raising the floor deliberately does not
+  retro-break registered pairs — the runbook re-sets their spreads.
 
 ### Rounding: the hook never undercollects
 

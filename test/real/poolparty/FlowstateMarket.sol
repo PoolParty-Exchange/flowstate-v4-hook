@@ -20,6 +20,7 @@ import "./interface/IUpgradeableBeacon.sol";
 import "./libraries/FlowstateStructs.sol";
 import "./libraries/FlowstateEvents.sol";
 import {Mul512Compare} from "./libraries/Mul512Compare.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
  * @title FlowstateMarket
@@ -145,6 +146,18 @@ contract FlowstateMarket is
     error TransferAmountMismatch();
     error ResellerCodeTooLong();
     error FillShortfall();
+    // FS-R0-C-01b seller-side consent floors
+    error FloorRequired(); // empty list, zero minRate, unapproved asset, or duplicate asset
+    error SeedBelowFloor(address asset, uint256 rate, uint256 minRate);
+    error AnchorBelowFloor(address asset, uint256 anchorRate, uint256 minRate);
+    error FloorMissingForAsset(address asset); // pool carries an anchor the contributor did not consent to
+    error FloorForUnseededAsset(address asset); // contributor consented to an asset the pool has no anchor for
+    /// @dev JUP-612: a token-side contribution must itself be worth at least the
+    ///      inventory floor in at least one floored, seeded asset (valued at that
+    ///      asset's durable anchor). `asset` is the first floored seeded asset
+    ///      checked, for the error's benefit.
+    error ContributionBelowFloor(address asset, uint256 value, uint256 floor); // `floor` = the threshold applied: max(inventoryFloor, minContribution)
+    error PoolNotPaused(); // compactDust is a paused-pool maintenance step (Wilko round 3)
     /// @dev Bounded entry points (JUP-544). Each carries the actuals so an
     ///      integrator's revert decode names the miss, not just the fact of one.
     error DeadlineExpired(uint256 deadline, uint256 nowTimestamp);
@@ -184,19 +197,35 @@ contract FlowstateMarket is
     address public priceOracle;                                       // slot 2
     uint32 public oracleEpoch;                                        // slot 2 (packed)
     address public buybackReceiver;                                   // slot 3
-    bool public freezeEnabled;                                        // slot 4
-    mapping(address => uint16) public feeBpsOverride;                 // slot 5 (0 ⇒ default)
-    mapping(address => bool) public approvedQuoteAssets;              // slot 6
-    mapping(string => FlowstateStructs.ResellerConfig) private resellers; // slot 7
-    mapping(address => FlowstateStructs.PoolRecord) public poolRecords;   // slot 8
-    mapping(address => address) public poolByToken;                   // slot 9
-    mapping(address => bool) public frozen;                           // slot 10
-    address[] private quoteAssetList;                                 // slot 11 (ever-approved, dedup'd)
-    mapping(address => bool) private inQuoteAssetList;                // slot 12
+    bool public freezeEnabled;                                        // slot 3 (packed after buybackReceiver)
+    mapping(address => uint16) public feeBpsOverride;                 // slot 4 (0 ⇒ default)
+    mapping(address => bool) public approvedQuoteAssets;              // slot 5
+    mapping(string => FlowstateStructs.ResellerConfig) private resellers; // slot 6
+    mapping(address => FlowstateStructs.PoolRecord) public poolRecords;   // slot 7
+    mapping(address => address) public poolByToken;                   // slot 8
+    mapping(address => bool) public frozen;                           // slot 9
+    address[] private quoteAssetList;                                 // slot 10 (ever-approved, dedup'd)
+    mapping(address => bool) private inQuoteAssetList;                // slot 11
     /// @dev JUP-587: the V4 hook createPool auto-registers new pairs with.
     ///      address(0) = feature off (createPool behaves exactly as pre-upgrade).
-    address public trustedHook;                                       // slot 13
-    uint256[37] private __gap;
+    address public trustedHook;                                       // slot 12
+    /// @dev JUP-612: per-quote-asset inventory floor, in that asset's units (so
+    ///      20 USDG = 20e6, 0.008 aeWETH = 8e15). A pool whose reachable inventory
+    ///      is worth less than this at the trade rate is EMPTY: quotes answer
+    ///      available = false, buys revert NoLiquidity, maxBuy answers zero. A
+    ///      restock above it reopens the pool in the same block; a price move
+    ///      across it closes or reopens without any call. 0 = no floor (legacy).
+    ///      Founder decision 2 Sep 2026: $20 equivalent, retuned rarely.
+    mapping(address => uint256) public inventoryFloor;                // slot 13
+    /// @dev JUP-619: per-quote-asset MINIMUM DEPOSIT, in that asset's units. A
+    ///      token-side contribution must be worth at least max(inventoryFloor,
+    ///      minContribution) in at least one seeded asset that has either set,
+    ///      valued at that asset's durable anchor. 0 = fall back to the floor.
+    ///      Founder decision 3 Sep 2026: $100 equivalent (a smaller position has
+    ///      no price-impact pain that a C1 deposit would relieve), so 100e6 USDG
+    ///      and 4e16 aeWETH at ~$2,500.
+    mapping(address => uint256) public minContribution;               // slot 14
+    uint256[35] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -304,7 +333,12 @@ contract FlowstateMarket is
     ///      contributions are balance-diff safe, but buyers of a FoT token pay oracle
     ///      price for more than they receive. Listing discretion, not a code check.
     /// @param anchorBandBps 0 ⇒ default 1000 (10%); otherwise bounded [100, 5000].
-    function createPool(address token, uint256 amount, uint16 anchorBandBps)
+    function createPool(
+        address token,
+        uint256 amount,
+        uint16 anchorBandBps,
+        FlowstateStructs.AnchorFloor[] calldata floors
+    )
         external
         whenNotPaused
         nonReentrant
@@ -312,6 +346,8 @@ contract FlowstateMarket is
     {
         if (token == address(0)) revert ZeroAddress();
         if (poolByToken[token] != address(0)) revert PoolAlreadyExists();
+        uint256 floorCount = floors.length;
+        if (floorCount == 0) revert FloorRequired();
 
         uint16 band = anchorBandBps == 0 ? DEFAULT_BAND_BPS : anchorBandBps;
         if (band < MIN_BAND_BPS || band > MAX_BAND_BPS) revert InvalidBand();
@@ -322,24 +358,36 @@ contract FlowstateMarket is
             abi.encodeCall(IFlowstatePool.initialize, (token, address(this), band))
         );
 
-        // listability rule: a token is listable iff the aggregator returns a usable
-        // direct rate against AT LEAST ONE approved asset — each usable read seeds
-        // that asset's anchor (the pool emits AnchorReseeded per seeded asset).
-        // try/catch per asset: one unpriceable pairing must not block the others.
+        // FS-R0-C-01b: the genesis anchor is band-check-free by definition, so its
+        // value is the CREATOR's to accept, not the market's to validate. Only the
+        // assets the creator listed are seeded, each against the creator's own floor.
+        // A read below the floor means the venue is displaced at the moment of
+        // creation (a sandwich, or a flash the creator did not choose): the honest
+        // creator reverts instead of being born poisoned, and nothing is claimed for
+        // the token. Assets the creator did not list stay unseeded — buys in them
+        // revert AnchorNotSeeded — until an admin resetAnchor seeds them.
+        // listability rule: listable iff the aggregator returns a usable direct rate
+        // against AT LEAST ONE consented asset. try/catch per asset: one unpriceable
+        // pairing must not block the others (a below-floor read is NOT unpriceable,
+        // it is refused).
         uint256 seeded;
-        uint256 length = quoteAssetList.length;
-        for (uint256 i = 0; i < length; ++i) {
-            address asset = quoteAssetList[i];
-            if (!approvedQuoteAssets[asset]) continue; // approval since revoked
-            try IOracle(priceOracle).getRate(IERC20(token), IERC20(asset), false) returns (uint256 r) {
+        for (uint256 i = 0; i < floorCount; ++i) {
+            FlowstateStructs.AnchorFloor calldata f = floors[i];
+            if (f.minRate == 0 || !approvedQuoteAssets[f.asset]) revert FloorRequired();
+            for (uint256 j = 0; j < i; ++j) {
+                if (floors[j].asset == f.asset) revert FloorRequired();
+            }
+            try IOracle(priceOracle).getRate(IERC20(token), IERC20(f.asset), false) returns (uint256 r) {
                 if (r == 0 || r > type(uint192).max) continue;
-                IFlowstatePool(pool).seedAnchor(asset, uint192(r), oracleEpoch);
+                if (r < f.minRate) revert SeedBelowFloor(f.asset, r, f.minRate);
+                IFlowstatePool(pool).seedAnchor(f.asset, uint192(r), oracleEpoch);
                 ++seeded;
             } catch {
                 continue;
             }
         }
         if (seeded == 0) revert NoOracleRate();
+        uint256 length = quoteAssetList.length;
 
         poolRecords[pool] = FlowstateStructs.PoolRecord(token, true);
         poolByToken[token] = pool;
@@ -366,6 +414,7 @@ contract FlowstateMarket is
         }
 
         uint256 actual = _pullToPool(token, pool, amount);
+        _requireContributionAboveFloor(pool, actual);
         IFlowstatePool(pool).creditTokenContribution(msg.sender, actual);
 
         emit FlowstateEvents.PoolCreated(token, pool, msg.sender, actual, band);
@@ -377,7 +426,17 @@ contract FlowstateMarket is
     ///        auth link between the two: aggregators/APIs list on behalf of users, and
     ///        crediting someone else's address spends the caller's own tokens (gift
     ///        semantics) — "position inflation" is economically self-defeating (R10).
-    function contributeTokens(address pool, uint256 amount, address contributionOwner)
+    /// @notice Add inventory to an existing pool. `floors` is the contributor's consent
+    ///         to the pool's CURRENT anchors (FS-R0-C-01b): one entry per seeded quote
+    ///         asset, each naming the lowest anchor the contributor will fund against.
+    ///         Reverts if any anchor sits below its floor, if a seeded asset has no
+    ///         floor, or if a floor names an asset the pool has not seeded.
+    function contributeTokens(
+        address pool,
+        uint256 amount,
+        address contributionOwner,
+        FlowstateStructs.AnchorFloor[] calldata floors
+    )
         external
         whenNotPaused
         nonReentrant
@@ -385,10 +444,85 @@ contract FlowstateMarket is
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists) revert UnknownPool();
         if (contributionOwner == address(0)) revert ZeroAddress();
+        _requireAnchorConsent(pool, floors);
 
         uint256 actual = _pullToPool(rec.inventoryToken, pool, amount);
+        _requireContributionAboveFloor(pool, actual);
         IFlowstatePool(pool).creditTokenContribution(contributionOwner, actual);
         emit FlowstateEvents.TokensContributed(pool, contributionOwner, actual);
+    }
+
+    /// @dev JUP-612 minimum contribution. Why: a fill reaches only the first
+    ///      MAX_FILL_NODES FIFO nodes, and below the floor every buy refuses, so 50
+    ///      one-wei nodes parked at the head of the queue would close the pool and
+    ///      could never be bought away — a restock behind them would stay unreachable
+    ///      for ever (Robin, 3 Sep 2026). The rule that removes the shape: a node is
+    ///      only accepted if it is itself worth at least the floor in at least one
+    ///      floored, seeded asset, valued at that asset's DURABLE anchor (never the
+    ///      fresh read, which a flash loan can move). Assets with no floor impose
+    ///      nothing, so with every floor at 0 this is a no-op (legacy behaviour).
+    ///      The same $20 that keeps a pool listed is the least a deposit can be.
+    ///      JUP-619 raises the bar above the floor: the threshold is
+    ///      max(inventoryFloor, minContribution) per asset, so the least a holder
+    ///      can deposit is a position worth listing, not merely one that keeps the
+    ///      pool open.
+    function _requireContributionAboveFloor(address pool, uint256 actual) private view {
+        address[] memory seeded = IFlowstatePool(pool).seededAssets();
+        uint256 n = seeded.length;
+        address firstFloored;
+        uint256 firstValue;
+        uint256 firstFloor;
+        for (uint256 i = 0; i < n; ++i) {
+            address asset = seeded[i];
+            uint256 floor = _depositThreshold(asset);
+            if (floor == 0 || !approvedQuoteAssets[asset]) continue;
+            (uint192 anchorRate,,) = IFlowstatePool(pool).anchorOf(asset);
+            uint256 value = Math.mulDiv(actual, anchorRate, 1e18);
+            if (value >= floor) return; // clears the floor in this asset: accepted
+            if (firstFloored == address(0)) {
+                firstFloored = asset;
+                firstValue = value;
+                firstFloor = floor;
+            }
+        }
+        if (firstFloored != address(0)) revert ContributionBelowFloor(firstFloored, firstValue, firstFloor);
+        // no floored asset seeded ⇒ nothing to enforce
+    }
+
+    /// @dev The per-asset value a token-side deposit must clear (and a partial
+    ///      withdrawal must leave), in `asset` units: JUP-619 = the larger of the
+    ///      inventory floor and the minimum deposit.
+    function _depositThreshold(address asset) internal view returns (uint256) {
+        uint256 floor = inventoryFloor[asset];
+        uint256 minimum = minContribution[asset];
+        return minimum > floor ? minimum : floor;
+    }
+
+    /// @dev The smallest position a PARTIAL withdrawal may leave, in inventory-token
+    ///      units: the deposit threshold converted at each floored seeded asset's
+    ///      DURABLE anchor (stored state, no oracle read, so exits never depend on a
+    ///      live price), taking the least demanding asset — the mirror of "a deposit
+    ///      clears the threshold in at least one asset". 0 when no seeded asset has
+    ///      a threshold. Rounds UP so a residual that values to one wei under the
+    ///      threshold is refused, not accepted.
+    function _minResidualTokens(address pool) private view returns (uint256 minResidual) {
+        address[] memory seeded = IFlowstatePool(pool).seededAssets();
+        uint256 n = seeded.length;
+        for (uint256 i = 0; i < n; ++i) {
+            address asset = seeded[i];
+            uint256 threshold = _depositThreshold(asset);
+            if (threshold == 0 || !approvedQuoteAssets[asset]) continue;
+            (uint192 anchorRate,,) = IFlowstatePool(pool).anchorOf(asset);
+            if (anchorRate == 0) continue;
+            // Never revert here (Wilko review): this runs on EVERY withdrawal, and a
+            // full exit must succeed under any admin-configured threshold. A product
+            // that cannot fit saturates to "any partial is refused", which is the
+            // conservative reading, and a full exit ignores minResidual anyway.
+            uint256 tokens = threshold > type(uint256).max / 1e18
+                ? type(uint256).max
+                : Math.mulDiv(threshold, 1e18, anchorRate, Math.Rounding.Ceil);
+            if (minResidual == 0 || tokens < minResidual) minResidual = tokens;
+        }
     }
 
     /// @notice Quote-side (cash) contribution — reverts unless the pool's buy-back is
@@ -413,10 +547,39 @@ contract FlowstateMarket is
 
     /// @notice Withdraw an unsold token-side position. Pass amount = 0 for the full
     ///         position. (Replaces legacy cancelPool; nonReentrant per audit fix.)
+    /// @dev JUP-612 (Wilko review): a partial withdrawal may not leave less than the
+    ///      deposit minimum behind (see _minResidualTokens); a full withdrawal
+    ///      (amount == 0, or the whole position) is never gated.
     function withdrawTokens(address pool, uint256 amount) external nonReentrant {
         if (!poolRecords[pool].exists) revert UnknownPool();
-        (uint256 withdrawn, bool nowEmpty) = IFlowstatePool(pool).withdrawTokensFor(msg.sender, amount);
+        (uint256 withdrawn, bool nowEmpty) =
+            IFlowstatePool(pool).withdrawTokensFor(msg.sender, amount, _minResidualTokens(pool));
         emit FlowstateEvents.TokensWithdrawn(pool, msg.sender, withdrawn, nowEmpty);
+    }
+
+    /// @notice JUP-612 compaction (Wilko review rounds 2 and 3, 3 Sep 2026): move
+    ///         token-side FIFO nodes smaller than the deposit minimum (valued at the
+    ///         durable anchor, the same number withdrawTokens uses) out of the queue
+    ///         and onto their owners' claim ledgers, at most `maxNodes` from the head.
+    ///         The activation path for pools that hold pre-floor dust, and the repair
+    ///         path after a price crash turns real nodes into dust.
+    ///
+    ///         ADMIN-ONLY and PAUSED-ONLY (round 3): on an active pool a permissionless
+    ///         call would let a later depositor evict a smaller LIVE position — one
+    ///         that fell under a raised minimum or a moved price — and jump the queue.
+    ///         Behind DEFAULT_ADMIN_ROLE and a paused pool it is an operator's
+    ///         maintenance step, never a trading-time lever. It moves no value: the
+    ///         evicted owner claims the same tokens with claimTokens at any time.
+    ///
+    ///         Activation order for the floor / minimum (Wilko): pausePool → upgrade →
+    ///         setInventoryFloor + setMinContribution → compactDust until
+    ///         DustCompacted.nodes == 0 → unpause. Configure BEFORE compacting: with
+    ///         both thresholds at zero this call is a no-op.
+    function compactDust(address pool, uint256 maxNodes) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        if (!poolRecords[pool].exists) revert UnknownPool();
+        if (!IFlowstatePool(pool).poolPaused()) revert PoolNotPaused();
+        (uint256 nodes, uint256 amount) = IFlowstatePool(pool).evictDust(_minResidualTokens(pool), maxNodes);
+        emit FlowstateEvents.DustCompacted(pool, msg.sender, nodes, amount);
     }
 
     /// @notice Withdraw unspent quote-side funds. Pass amount = 0 for the full position.
@@ -426,6 +589,56 @@ contract FlowstateMarket is
         emit FlowstateEvents.QuoteWithdrawn(
             pool, msg.sender, IFlowstatePool(pool).buybackAsset(), withdrawn, cashSideEmpty
         );
+    }
+
+    /// @dev FS-R0-C-01b contribute-side consent. Two properties are load-bearing:
+    ///      (1) it checks the DURABLE anchor `lastRate`, never max(fresh, anchor). A
+    ///          poisoned-low anchor behind an honest fresh read passes a max() check
+    ///          and is simply manipulated low again at buy time, when max() collapses
+    ///          to the poison. The durable value is the one the contribution will be
+    ///          sold against.
+    ///      (2) floors must cover EVERY seeded asset, and only seeded assets. Anchors
+    ///          are per quote asset and buys name the asset, so one poisoned anchor is
+    ///          enough to sell the contribution cheap through that asset while the
+    ///          others read honest. A contributor who consented to USDG alone has not
+    ///          consented at all.
+    ///      Seeded-asset counts are bounded by the approved-asset list, so the nested
+    ///      scan is a handful of iterations.
+    function _requireAnchorConsent(address pool, FlowstateStructs.AnchorFloor[] calldata floors) internal view {
+        address[] memory seeded = IFlowstatePool(pool).seededAssets();
+        uint256 n = seeded.length;
+        uint256 m = floors.length;
+        // shape first (deterministic error precedence): no duplicates, no zero floors,
+        // no floors for assets the pool has not seeded
+        for (uint256 j = 0; j < m; ++j) {
+            address asset = floors[j].asset;
+            if (floors[j].minRate == 0) revert FloorRequired();
+            for (uint256 k = 0; k < j; ++k) {
+                if (floors[k].asset == asset) revert FloorRequired();
+            }
+            bool seededAsset;
+            for (uint256 i = 0; i < n; ++i) {
+                if (seeded[i] == asset) {
+                    seededAsset = true;
+                    break;
+                }
+            }
+            if (!seededAsset) revert FloorForUnseededAsset(asset);
+        }
+        // then consent: every seeded asset must carry a floor, and its DURABLE anchor
+        // must sit at or above it
+        for (uint256 i = 0; i < n; ++i) {
+            address asset = seeded[i];
+            bool found;
+            for (uint256 j = 0; j < m; ++j) {
+                if (floors[j].asset != asset) continue;
+                found = true;
+                (uint192 anchorRate,,) = IFlowstatePool(pool).anchorOf(asset);
+                if (anchorRate < floors[j].minRate) revert AnchorBelowFloor(asset, anchorRate, floors[j].minRate);
+                break;
+            }
+            if (!found) revert FloorMissingForAsset(asset);
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -510,13 +723,14 @@ contract FlowstateMarket is
         if (freezeEnabled && (frozen[msg.sender] || frozen[buyer])) revert AccountFrozen();
 
         uint256 rate;
+        uint256 floor = inventoryFloor[asset];
         (tokensFilled, quotePaid, rate) =
-            IFlowstatePool(pool).priceBuy(asset, amount, priceOracle, oracleEpoch);
+            IFlowstatePool(pool).priceBuy(asset, amount, priceOracle, oracleEpoch, floor);
 
-        IERC20(asset).safeTransferFrom(msg.sender, pool, quotePaid);
+        _pullQuoteExact(asset, pool, quotePaid);
 
         IFlowstatePool(pool).settleBuy(
-            buyer, asset, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
+            buyer, asset, tokensFilled, quotePaid, rate, floor, _feeContext(rec.inventoryToken, resellerCode)
         );
     }
 
@@ -595,13 +809,14 @@ contract FlowstateMarket is
         if (freezeEnabled && (frozen[msg.sender] || frozen[buyer])) revert AccountFrozen();
 
         uint256 rate;
+        uint256 floor = inventoryFloor[asset];
         (tokensFilled, quotePaid, rate) =
-            IFlowstatePool(pool).priceBuyExactQuote(asset, quoteIn, priceOracle, oracleEpoch);
+            IFlowstatePool(pool).priceBuyExactQuote(asset, quoteIn, priceOracle, oracleEpoch, floor);
 
-        IERC20(asset).safeTransferFrom(msg.sender, pool, quotePaid);
+        _pullQuoteExact(asset, pool, quotePaid);
 
         IFlowstatePool(pool).settleBuy(
-            buyer, asset, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
+            buyer, asset, tokensFilled, quotePaid, rate, floor, _feeContext(rec.inventoryToken, resellerCode)
         );
     }
 
@@ -681,8 +896,9 @@ contract FlowstateMarket is
         if (freezeEnabled && (frozen[msg.sender] || frozen[buyer])) revert AccountFrozen();
 
         uint256 rate;
+        uint256 floor = inventoryFloor[asset];
         (tokensFilled, quotePaid, rate) =
-            IFlowstatePool(pool).priceBuy(asset, tokenAmountOut, priceOracle, oracleEpoch);
+            IFlowstatePool(pool).priceBuy(asset, tokenAmountOut, priceOracle, oracleEpoch, floor);
         if (tokensFilled != tokenAmountOut) revert FillShortfall();
 
         IERC20 quote = IERC20(asset);
@@ -695,10 +911,10 @@ contract FlowstateMarket is
         ) {
             IFlowstateBuyFunder(msg.sender).fundBuy(asset, quotePaid);
         }
-        quote.safeTransferFrom(msg.sender, pool, quotePaid);
+        _pullQuoteExact(asset, pool, quotePaid);
 
         IFlowstatePool(pool).settleBuy(
-            buyer, asset, tokensFilled, quotePaid, rate, _feeContext(rec.inventoryToken, resellerCode)
+            buyer, asset, tokensFilled, quotePaid, rate, floor, _feeContext(rec.inventoryToken, resellerCode)
         );
     }
 
@@ -786,8 +1002,12 @@ contract FlowstateMarket is
     ///         exactly what buyFromPool would pull in the same block with the same
     ///         args (the consistency invariant aggregators route on). `available ==
     ///         false` on any non-quotable state: unknown pool, unapproved or unseeded
-    ///         asset, pause, empty, band-out, stale anchor, oracle failure. Freeze
-    ///         status is per-caller and deliberately not reflected.
+    ///         asset, pause, empty, band-out, stale anchor, oracle failure. "Empty"
+    ///         is the JUP-612 rule: the reachable inventory is worth less than the
+    ///         asset's inventoryFloor at the trade rate — so available == true means
+    ///         "this pool holds at least the floor of sellable inventory", which is
+    ///         the reading integrators always gave it. Size the leg with maxBuy.
+    ///         Freeze status is per-caller and deliberately not reflected.
     function quoteBuyFromPool(address pool, address asset, uint256 amount)
         external
         view
@@ -796,7 +1016,7 @@ contract FlowstateMarket is
         FlowstateStructs.PoolRecord memory rec = poolRecords[pool];
         if (!rec.exists || !approvedQuoteAssets[asset] || paused()) return q;
         (bool ok, uint256 fillable, uint256 cost) =
-            IFlowstatePool(pool).previewBuy(asset, amount, priceOracle, oracleEpoch);
+            IFlowstatePool(pool).previewBuy(asset, amount, priceOracle, oracleEpoch, inventoryFloor[asset]);
         if (!ok) return q;
         uint16 feeBps = _feeBpsOf(rec.inventoryToken);
         q = FlowstateStructs.Quote({
@@ -807,6 +1027,36 @@ contract FlowstateMarket is
             feeBps: feeBps,
             quoteAsset: asset
         });
+    }
+
+    /// @notice JUP-612: the largest exact-output this pool can fill in `asset` right
+    ///         now, and the quote it costs — "read the limit, size the leg to it".
+    ///         When maxTokens > 0 it is exactly the largest `tokenAmountOut`
+    ///         buyFromPoolExactOut will fill in this block (maxTokens + 1 reverts
+    ///         FillShortfall) and maxQuote is what that fill pulls. Applies every
+    ///         POOL-STATE rule the fill applies — market pause, pool pause, asset
+    ///         approval, anchor seeding, the MAX_FILL_NODES FIFO cap and the
+    ///         inventory floor — so a router that models this venue off chain from
+    ///         maxBuy cannot quote a size the pool then refuses. It cannot see
+    ///         caller-side conditions (freeze status, the caller's balance or
+    ///         allowance, a deadline or bound the caller sets). (0, 0) whenever the
+    ///         pool is not quotable, which is exactly when quoteBuyFromPool answers
+    ///         available == false; a buy in that state reverts (NoLiquidity for the
+    ///         floor/empty case, PoolIsPaused or an oracle error for the others).
+    ///         Never reverts on pool state; like quoteBuyFromPool it relies on the
+    ///         pool's previewBuy being non-reverting by construction. The Quote struct
+    ///         and quoteBuyFromPool are unchanged.
+    function maxBuy(address pool, address asset)
+        external
+        view
+        returns (uint256 maxTokens, uint256 maxQuote)
+    {
+        if (!poolRecords[pool].exists || !approvedQuoteAssets[asset] || paused()) return (0, 0);
+        (bool ok, uint256 fillable, uint256 cost) = IFlowstatePool(pool).previewBuy(
+            asset, type(uint256).max, priceOracle, oracleEpoch, inventoryFloor[asset]
+        );
+        if (!ok) return (0, 0);
+        return (fillable, cost);
     }
 
     /// @notice Non-reverting quote for a sell. `quoteAmount` is the seller-visible
@@ -929,6 +1179,29 @@ contract FlowstateMarket is
     ///      getApprovedQuoteAssets view; entries are never removed (revocation is the
     ///      mapping flipping false — the loops skip revoked entries), so re-approval
     ///      cannot duplicate and list growth is admin-bounded.
+    /// @notice JUP-612: per-asset inventory floor, in `asset` units. Instant admin
+    ///         lane like the fee tier: the floor is an economic threshold (what
+    ///         inventory is worth listing), not protocol wiring. Takes effect on the
+    ///         next quote and the next fill; no pool call, no pause, no unpause.
+    ///         0 clears it (legacy rule: only a walk with nothing in it is empty).
+    ///         Settable before the asset is approved so a listing goes live with
+    ///         its floor already in force.
+    function setInventoryFloor(address asset, uint256 floor) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (asset == address(0)) revert ZeroAddress();
+        inventoryFloor[asset] = floor;
+        emit FlowstateEvents.InventoryFloorSet(asset, floor);
+    }
+
+    /// @notice JUP-619: per-asset minimum deposit, in `asset` units. Same lane and
+    ///         semantics as setInventoryFloor; applies to createPool and
+    ///         contributeTokens through the max(floor, minimum) threshold. 0 clears
+    ///         it (the floor alone then bounds deposits).
+    function setMinContribution(address asset, uint256 minimum) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (asset == address(0)) revert ZeroAddress();
+        minContribution[asset] = minimum;
+        emit FlowstateEvents.MinContributionSet(asset, minimum);
+    }
+
     function setQuoteAsset(address asset, bool approved) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (asset == address(0)) revert ZeroAddress();
         approvedQuoteAssets[asset] = approved;
@@ -1045,7 +1318,16 @@ contract FlowstateMarket is
     ///         pool's creation (or unpriceable at creation) is seeded here — behind
     ///         the admin role on purpose, because a first observation is band-check-
     ///         free by definition and its moment must never be attacker-chosen.
-    function resetAnchor(address pool, address asset) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    /// @dev JUP-611 (Wilko review, 3 Sep 2026): moved from the instant admin lane to
+    ///      the 48h TIMELOCK_ROLE. The consent floors a seller sets at deposit are
+    ///      checked against the durable anchor; an instant, band-check-free reseed
+    ///      could overwrite that anchor the block after consent was given, which
+    ///      would make the consent decorative. Behind the timelock, a reseed is
+    ///      announced 48h ahead, inside the same window a seller has to withdraw.
+    ///      Liveness cost is nil since the 2026-08-11 redesign: anchors re-converge
+    ///      on their own within one block of the next trade, so this lane is now
+    ///      only the late-seeding path for assets approved after a pool was created.
+    function resetAnchor(address pool, address asset) external onlyRole(TIMELOCK_ROLE) {
         if (!poolRecords[pool].exists) revert UnknownPool();
         if (!approvedQuoteAssets[asset]) revert QuoteAssetNotApproved();
         IFlowstatePool(pool).resetAnchor(asset, priceOracle, oracleEpoch);
@@ -1170,6 +1452,18 @@ contract FlowstateMarket is
         IERC20(token).safeTransferFrom(msg.sender, pool, amount);
         actual = IERC20(token).balanceOf(pool) - before;
         if (actual == 0) revert NothingReceived();
+    }
+
+    /// @dev Buy-side quote pull with EXACT-receipt enforcement (FS-R0-H-02). settleBuy
+    ///      credits the NOMINAL quotePaid and prices token delivery against it, so the
+    ///      pool must receive quotePaid to the wei. A fee-on-transfer / deflationary
+    ///      quote asset delivers less and would leave the contributor claim ledger
+    ///      insolvent (claimableQuote > pool balance); reject it here, exactly as the
+    ///      SELL path rejects taxed inventory via the same error. This makes the
+    ///      "approved quote assets are vetted no-fee-on-transfer" policy an enforced
+    ///      invariant rather than an off-chain assumption.
+    function _pullQuoteExact(address asset, address pool, uint256 quotePaid) private {
+        if (_pullToPool(asset, pool, quotePaid) != quotePaid) revert TransferAmountMismatch();
     }
 
     function _feeBpsOf(address token) private view returns (uint16 feeBps) {

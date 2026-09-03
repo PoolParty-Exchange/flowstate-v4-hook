@@ -19,19 +19,22 @@ interface IFlowstatePool {
     // ── liquidity (factory has already moved assets in; balance-diff measured) ──
     function creditTokenContribution(address owner, uint256 actualAmount) external;
     function creditQuoteContribution(address owner, uint256 actualAmount) external;
-    function withdrawTokensFor(address owner, uint256 amount)
+    function withdrawTokensFor(address owner, uint256 amount, uint256 minResidual)
         external
         returns (uint256 withdrawn, bool nowEmpty);
+    function evictDust(uint256 minResidual, uint256 maxNodes)
+        external
+        returns (uint256 evictedNodes, uint256 evictedAmount);
     function withdrawQuoteFor(address owner, uint256 amount)
         external
         returns (uint256 withdrawn, bool cashSideEmpty);
 
     // ── trading ──────────────────────────────────────────────────────────
-    function priceBuy(address asset, uint256 requestedAmount, address oracle, uint32 epoch)
+    function priceBuy(address asset, uint256 requestedAmount, address oracle, uint32 epoch, uint256 floor)
         external
         returns (uint256 fillableAmount, uint256 quoteCost, uint256 rate);
 
-    function priceBuyExactQuote(address asset, uint256 quoteIn, address oracle, uint32 epoch)
+    function priceBuyExactQuote(address asset, uint256 quoteIn, address oracle, uint32 epoch, uint256 floor)
         external
         returns (uint256 fillableAmount, uint256 quoteCost, uint256 rate);
 
@@ -41,6 +44,7 @@ interface IFlowstatePool {
         uint256 fillAmount,
         uint256 quotePaid,
         uint256 rate,
+        uint256 floor,
         FlowstateStructs.FeeContext calldata ctx
     ) external;
 
@@ -79,7 +83,7 @@ interface IFlowstatePool {
     function setPriceSource(uint8 source) external;
 
     // ── views ────────────────────────────────────────────────────────────
-    function previewBuy(address asset, uint256 amount, address oracle, uint32 epoch)
+    function previewBuy(address asset, uint256 amount, address oracle, uint32 epoch, uint256 floor)
         external
         view
         returns (bool ok, uint256 fillable, uint256 cost);
@@ -90,6 +94,7 @@ interface IFlowstatePool {
     function inventoryToken() external view returns (address);
     function buybackAsset() external view returns (address);
     function tokenBalance() external view returns (uint256);
+    function poolPaused() external view returns (bool);
     function anchorOf(address asset)
         external
         view

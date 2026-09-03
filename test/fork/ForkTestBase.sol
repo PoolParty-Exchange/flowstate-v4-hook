@@ -16,7 +16,7 @@ import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FlowstateC1Hook} from "../../src/FlowstateC1Hook.sol";
 import {MockInventoryToken} from "../mocks/MockInventoryToken.sol";
-import {RealStackDeployer, IFlowstateMarketTest, IFlowstatePoolTest, ITestSpotOracle} from "./RealStackDeployer.sol";
+import {RealStackDeployer, IFlowstateMarketTest, IFlowstatePoolTest, ITestSpotOracle, AnchorFloorInput} from "./RealStackDeployer.sol";
 
 /// @notice Base for all RH-mainnet-fork tests.
 ///
@@ -36,6 +36,15 @@ import {RealStackDeployer, IFlowstateMarketTest, IFlowstatePoolTest, ITestSpotOr
 ///         oracle rate 5e5 => 1 FLOWMOCK costs 0.5 USDG, i.e. 1 USDG buys 2 FLOWMOCK —
 ///         arithmetically IDENTICAL to the Phase 0 mock's 2e12/1 rate, so every existing
 ///         size expectation carries over unchanged.
+interface IOracleRate {
+    function getRate(address src, address dst, bool useWrappers) external view returns (uint256);
+}
+
+interface IPoolAnchors {
+    function seededAssets() external view returns (address[] memory);
+    function anchorOf(address asset) external view returns (uint192 rate, uint64 blockNumber, uint32 epoch);
+}
+
 abstract contract ForkTestBase is RealStackDeployer {
     // -- Robinhood Chain (4663) canonical addresses, verified 2026-07-28 ------
     address constant POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
@@ -179,16 +188,35 @@ abstract contract ForkTestBase is RealStackDeployer {
         token.mint(lister, amount);
         vm.startPrank(lister);
         token.approve(address(market), type(uint256).max);
-        created = market.createPool(address(token), amount, 0);
+        created = market.createPool(address(token), amount, 0, _seedFloors(address(token)));
         vm.stopPrank();
+    }
+
+    /// @dev JUP-611 consent floors for a fresh listing: the oracle's current rate per
+    ///      approved asset it can price (the seed rate is the natural floor).
+    function _seedFloors(address inventoryToken) internal view returns (AnchorFloorInput[] memory floors) {
+        floors = new AnchorFloorInput[](1);
+        uint256 r = IOracleRate(market.priceOracle()).getRate(inventoryToken, USDG, false);
+        floors[0] = AnchorFloorInput({asset: USDG, minRate: uint192(r)});
+    }
+
+    /// @dev JUP-611 consent floors for a top-up: the pool's current durable anchors.
+    function _consentFloors(address marketPool) internal view returns (AnchorFloorInput[] memory floors) {
+        address[] memory assets = IPoolAnchors(marketPool).seededAssets();
+        floors = new AnchorFloorInput[](assets.length);
+        for (uint256 i = 0; i < assets.length; i++) {
+            (uint192 rate,,) = IPoolAnchors(marketPool).anchorOf(assets[i]);
+            floors[i] = AnchorFloorInput({asset: assets[i], minRate: rate});
+        }
     }
 
     /// @dev Top up the SAME lister's position (FlowstatePool merges repeat deposits from
     ///      one owner into a single FIFO node, so this never grows the node walk).
     function _contributeInventory(uint256 amount) internal {
         token.mint(lister, amount);
+        AnchorFloorInput[] memory floors = _consentFloors(pool); // before the prank: the view calls would consume it
         vm.prank(lister);
-        market.contributeTokens(pool, amount, lister);
+        market.contributeTokens(pool, amount, lister, floors);
     }
 
     /// @dev Move the oracle and re-anchor the pool. A bare rate change would trip the
@@ -196,6 +224,7 @@ abstract contract ForkTestBase is RealStackDeployer {
     ///      exposes for exactly this is the admin `resetAnchor`.
     function _setOracleRate(uint256 newRate) internal {
         oracle.setRate(address(token), USDG, newRate);
+        vm.prank(address(stack.tl48)); // JUP-611 (#40): resetAnchor is behind the 48h TIMELOCK_ROLE
         market.resetAnchor(pool, USDG);
         _expireRateCache();
     }

@@ -26,6 +26,19 @@ library FlowstateStructs {
     /// @dev Multi-asset change: a pool is keyed by its inventory token alone; the
     ///      quote asset became a per-trade parameter, so the record no longer
     ///      carries one.
+    /// @notice Seller-side consent floor for one quote asset's anchor (FS-R0-C-01b).
+    /// @dev `minRate` is in the anchor's own units: quote-asset units per 1e18 token
+    ///      units, the same figure `anchorOf(asset)` returns. The party whose inventory
+    ///      is at risk states the lowest anchor it will fund inventory against; the
+    ///      market refuses to seed (createPool) or to credit inventory (contributeTokens)
+    ///      below it. This is consent, not validation: the market cannot verify that a
+    ///      price is honest, because every observation it takes is at a moment the
+    ///      caller chose. A floor of 0 is never accepted.
+    struct AnchorFloor {
+        address asset;
+        uint192 minRate;
+    }
+
     struct PoolRecord {
         address inventoryToken;        // slot A
         bool exists;                   // slot A

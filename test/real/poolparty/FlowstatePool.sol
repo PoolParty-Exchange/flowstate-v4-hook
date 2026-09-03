@@ -5,6 +5,7 @@ import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import "./interface/IOracle.sol";
 import "./libraries/FlowstateStructs.sol";
@@ -128,6 +129,9 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     error InvalidWindowConfig();
     error InvalidPriceSource();
     error FillShortfall();
+    /// @dev JUP-612 (Wilko review): a PARTIAL withdrawal may not leave a position
+    ///      smaller than the deposit minimum. Full exits are always allowed.
+    error ResidualBelowMinimum(uint256 remaining, uint256 minimum);
 
     // ── constants ────────────────────────────────────────────────────────
     uint256 private constant BPS = 10_000;
@@ -313,9 +317,67 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         isHidden = false;
     }
 
+    /// @notice JUP-612 compaction (Wilko review, 3 Sep 2026): move token-side FIFO
+    ///         nodes smaller than `minResidual` out of the queue and onto their
+    ///         owners' claim ledger, walking from the head over at most `maxNodes`
+    ///         nodes. Why: the floor and the deposit minimum stop NEW dust, but dust
+    ///         staged before the floor is switched on (or created by a price crash)
+    ///         would sit at the head, close the pool, and, because below the floor no
+    ///         buy can consume it, make a real restock at node 51 unreachable for
+    ///         ever. Eviction is the migration path: nothing is taken from anyone
+    ///         (the owner claims the same tokens with claimTokens, any time), the
+    ///         node merely loses a queue position it could never have sold from.
+    ///         Factory-only; the factory gates it to DEFAULT_ADMIN_ROLE on a PAUSED
+    ///         pool (round 3: on an active pool a rival depositor could evict a live
+    ///         position that fell under a raised minimum and jump the queue). A node
+    ///         at or above the minimum is never touched; with minResidual == 0
+    ///         nothing is.
+    function evictDust(uint256 minResidual, uint256 maxNodes)
+        external
+        onlyFactory
+        returns (uint256 evictedNodes, uint256 evictedAmount)
+    {
+        if (minResidual == 0) return (0, 0);
+        uint256 idx = tokenHead;
+        uint256 visited;
+        while (idx != 0 && visited < maxNodes) {
+            FlowstateStructs.Node storage node = tokenNodes[idx];
+            uint256 nextIdx = node.next;
+            uint256 amount = node.amount;
+            if (amount < minResidual) {
+                address owner = node.addr;
+                _removeFromList(tokenNodes, tokenIndex, owner, false);
+                claimableTokens[owner] += amount;
+                tokenBalance -= amount;
+                unchecked {
+                    ++evictedNodes;
+                }
+                evictedAmount += amount;
+                emit FlowstateEvents.DustEvicted(address(this), owner, amount);
+            }
+            idx = nextIdx;
+            unchecked {
+                ++visited;
+            }
+        }
+        if (tokenBalance == 0) isHidden = true;
+    }
+
     /// @param amount pass 0 to withdraw the full position.
-    /// @dev Deliberately callable while paused — never trap exits (D-M2-1).
-    function withdrawTokensFor(address owner, uint256 amount)
+    /// @param minResidual smallest position a PARTIAL withdrawal may leave behind,
+    ///        in inventory-token units (0 = no rule). The factory derives it from
+    ///        the deposit minimum at the durable anchor, so "deposit the minimum,
+    ///        then withdraw down to 1 wei from 50 addresses" cannot rebuild the FIFO
+    ///        dust wall that the deposit rule exists to prevent (Wilko, 3 Sep 2026).
+    ///        A FULL withdrawal ignores it: exits are never trapped, and a holder
+    ///        whose position has fallen under the minimum simply takes all of it.
+    /// @dev Deliberately callable while paused — never trap exits (D-M2-1). The
+    ///      `nowEmpty` flag here is the literal zero test, NOT the JUP-612 priced
+    ///      rule: exits are pure position accounting and must never depend on an
+    ///      oracle read (a dead oracle must not be able to trap a withdrawal); the
+    ///      residual rule reads only stored anchor state. The quoter and maxBuy
+    ///      remain the authoritative "is this pool open" signal.
+    function withdrawTokensFor(address owner, uint256 amount, uint256 minResidual)
         external
         onlyFactory
         returns (uint256 withdrawn, bool nowEmpty)
@@ -326,6 +388,8 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         uint256 position = node.amount;
         withdrawn = amount == 0 ? position : amount;
         if (withdrawn > position) revert InsufficientPosition();
+        uint256 remaining = position - withdrawn;
+        if (remaining != 0 && remaining < minResidual) revert ResidualBelowMinimum(remaining, minResidual);
 
         if (withdrawn == position) {
             _removeFromList(tokenNodes, tokenIndex, owner, false);
@@ -350,21 +414,27 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     ///      amounts ≤ 50 × uint128.max and real 1inch rates (≤ ~1e30) the product tops
     ///      out ~1e70 « 2^256. A pathological max-supply × max-rate pair Panic-reverts,
     ///      which is a liveness refusal, not an exploit.
-    function priceBuy(address asset, uint256 requestedAmount, address oracle, uint32 epoch)
+    /// @param floor inventory floor for `asset` (JUP-612), in that asset's units;
+    ///        the factory passes its per-asset setting. 0 = no floor (legacy: only a
+    ///        walk with nothing in it is empty).
+    function priceBuy(address asset, uint256 requestedAmount, address oracle, uint32 epoch, uint256 floor)
         external
         onlyFactory
         returns (uint256 fillableAmount, uint256 quoteCost, uint256 rate)
     {
         if (poolPaused) revert PoolIsPaused();
-        if (tokenBalance == 0) revert NoLiquidity();
         if (requestedAmount == 0) revert InvalidAmount();
 
         // buys price on the HIGHER side; _resolveRate also applies the staleness
         // surcharge whenever that price comes from the anchor rather than a live read
         (rate,) = _resolveRate(asset, oracle, epoch, true);
-
-        fillableAmount = _fillableBuy(requestedAmount);
-        if (fillableAmount == 0) revert NoLiquidity();
+        // JUP-612: the ONE emptiness rule. Evaluated after the read because it is
+        // priced: dust that is worth less than the floor is empty, not "available".
+        // One FIFO walk serves both the rule and the fill (a fill takes the first
+        // MAX_FILL_NODES nodes in order, so it is exactly min(requested, reachable)).
+        uint256 sellable = _sellableBuy();
+        if (_belowFloor(sellable, rate, floor)) revert NoLiquidity();
+        fillableAmount = requestedAmount < sellable ? requestedAmount : sellable;
 
         // round UP against the buyer
         quoteCost = (fillableAmount * rate + RATE_SCALE - 1) / RATE_SCALE;
@@ -411,25 +481,25 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     ///      Practical bound mirrors priceBuy's F4 note: quoteIn ×
     ///      RATE_SCALE must fit uint256; a pathological quoteIn Panic-reverts, which is
     ///      a liveness refusal, not an exploit.
-    function priceBuyExactQuote(address asset, uint256 quoteIn, address oracle, uint32 epoch)
+    function priceBuyExactQuote(address asset, uint256 quoteIn, address oracle, uint32 epoch, uint256 floor)
         external
         onlyFactory
         returns (uint256 fillableAmount, uint256 quoteCost, uint256 rate)
     {
         if (poolPaused) revert PoolIsPaused();
-        if (tokenBalance == 0) revert NoLiquidity();
         if (quoteIn == 0) revert InvalidAmount();
 
         // buys price on the HIGHER side; _resolveRate also applies the staleness
         // surcharge whenever that price comes from the anchor rather than a live read
         (rate,) = _resolveRate(asset, oracle, epoch, true);
+        uint256 sellable = _sellableBuy();
+        if (_belowFloor(sellable, rate, floor)) revert NoLiquidity(); // JUP-612, same rule as priceBuy
 
         // invert inside the single read: round DOWN against the buyer
         uint256 desired = (quoteIn * RATE_SCALE) / rate;
         if (desired == 0) revert AmountTooSmall();
 
-        fillableAmount = _fillableBuy(desired);
-        if (fillableAmount == 0) revert NoLiquidity();
+        fillableAmount = desired < sellable ? desired : sellable;
 
         // recompute the pull exactly as priceBuy would for this amount (round UP).
         // MUST price fillableAmount, never `desired`: on a short fill the two differ,
@@ -451,6 +521,7 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         uint256 fillAmount,
         uint256 quotePaid,
         uint256 rate,
+        uint256 floor,
         FlowstateStructs.FeeContext calldata ctx
     ) external onlyFactory {
         uint256 fee = (quotePaid * ctx.feeBps) / BPS;
@@ -497,13 +568,18 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
             }
         }
         tokenBalance -= fillAmount;
-        if (tokenBalance == 0) isHidden = true;
+        // JUP-612: "empty" after a fill is the same priced rule the quoter applies:
+        // what is left, valued at THIS fill's rate, is under the floor. That is what
+        // PoolBuy.poolEmpty and isHidden report; a later read re-evaluates it at the
+        // then-current rate, so a price move alone can reopen (or close) the pool.
+        bool nowEmpty = _belowFloor(_sellableBuy(), rate, floor);
+        if (nowEmpty) isHidden = true;
 
         _distributeFee(asset, fee, ctx);
 
         emit FlowstateEvents.PoolBuy(
             address(this), buyer, asset, fillAmount, quotePaid, rate, fee,
-            tokenBalance == 0, ctx.resellerCode
+            nowEmpty, ctx.resellerCode
         );
 
         IERC20(inventoryToken).safeTransfer(buyer, fillAmount);
@@ -793,16 +869,21 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
     /// @dev Consistency invariant: same block + same args ⇒ (fillable, cost) here
     ///      equals what buyFromPool executes, because rate resolution, the FIFO walk,
     ///      and the rounding are the same shared code paths.
-    function previewBuy(address asset, uint256 amount, address oracle, uint32 epoch)
+    ///      JUP-612: `floor` is the factory's per-asset inventory floor; a pool whose
+    ///      sellable inventory is worth less than it answers ok=false, exactly where
+    ///      priceBuy reverts NoLiquidity. Pass amount = type(uint256).max to read the
+    ///      whole sellable walk (the factory's maxBuy does this).
+    function previewBuy(address asset, uint256 amount, address oracle, uint32 epoch, uint256 floor)
         external
         view
         returns (bool ok, uint256 fillable, uint256 cost)
     {
-        if (poolPaused || tokenBalance == 0 || amount == 0) return (false, 0, 0);
+        if (poolPaused || amount == 0) return (false, 0, 0);
         (bool rateOk, uint256 rate,,) = _peekRate(asset, oracle, epoch, true);
         if (!rateOk) return (false, 0, 0);
-        fillable = _fillableBuy(amount);
-        if (fillable == 0) return (false, 0, 0);
+        uint256 sellable = _sellableBuy();
+        if (_belowFloor(sellable, rate, floor)) return (false, 0, 0);
+        fillable = amount < sellable ? amount : sellable;
         cost = (fillable * rate + RATE_SCALE - 1) / RATE_SCALE;
         if (cost == 0) return (false, 0, 0);
         ok = true;
@@ -1275,16 +1356,37 @@ contract FlowstatePool is Initializable, ReentrancyGuardUpgradeable {
         ok = true;
     }
 
-    /// @dev FIFO fillable walk shared by priceBuy and previewBuy.
-    function _fillableBuy(uint256 requested) private view returns (uint256 fillable) {
-        uint256 remaining = requested;
+    /// @dev JUP-612: THE emptiness rule, shared by priceBuy, priceBuyExactQuote,
+    ///      previewBuy and settleBuy so the quoter, the fill and the PoolBuy event can
+    ///      never disagree about whether this pool is open. A pool is empty when the
+    ///      inventory a buy can actually reach (the first MAX_FILL_NODES FIFO nodes —
+    ///      NOT tokenBalance, which a direct transfer can inflate and which counts
+    ///      nodes beyond the fill cap) is worth less than `floor` of the quote asset
+    ///      at the rate the trade would price at. floor == 0 keeps the legacy rule:
+    ///      only a walk with nothing in it is empty.
+    ///
+    ///      Why this exists (measured 2026-09-02): CASHCAT sold down to 0.0385 tokens
+    ///      (about $0.01) and, because "empty" meant tokenBalance == 0, advertised
+    ///      available == true for 4.13 days; exact-output fills through it reverted
+    ///      FillShortfall and Kyber disabled the venue for "unexecutable quoting".
+    ///      Valued with a full-width multiply so a pathological (amount × rate) pair
+    ///      cannot Panic here and turn the rule into a liveness refusal.
+    function _belowFloor(uint256 sellable, uint256 rate, uint256 floor) private pure returns (bool) {
+        if (sellable == 0) return true;
+        if (floor == 0) return false;
+        return Math.mulDiv(sellable, rate, RATE_SCALE) < floor;
+    }
+
+    /// @dev The inventory ONE buy can reach: the first MAX_FILL_NODES token nodes in
+    ///      FIFO order. Shared by priceBuy, priceBuyExactQuote, previewBuy and
+    ///      settleBuy (JUP-612). A fill of `requested` is min(requested, this), so
+    ///      one walk prices and floor-checks a buy; settleBuy walks once more after
+    ///      the ledger mutation to report the post-fill state.
+    function _sellableBuy() private view returns (uint256 sellable) {
         uint256 idx = tokenHead;
         uint256 visited;
-        while (idx != 0 && remaining != 0 && visited < MAX_FILL_NODES) {
-            uint256 nodeAmount = tokenNodes[idx].amount;
-            uint256 take = nodeAmount < remaining ? nodeAmount : remaining;
-            fillable += take;
-            remaining -= take;
+        while (idx != 0 && visited < MAX_FILL_NODES) {
+            sellable += tokenNodes[idx].amount;
             idx = tokenNodes[idx].next;
             unchecked {
                 ++visited;
