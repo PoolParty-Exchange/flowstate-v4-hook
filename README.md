@@ -442,3 +442,14 @@ Phase 2 and the ops runbook.
   that the same-second cache is doing real work on our pool. If a live pool's realised
   gas p50 sits near 190k rather than 832k, the gas concern largely dissolves and the
   slim oracle becomes an optimisation rather than a gate.
+
+## Deployments (Robinhood Chain, 4663)
+
+| Generation | Address | Notes |
+|---|---|---|
+| gen-1 (Aug 2026) | `0x03bf8D7e61Ab2c574eEB68a6f429Ab814f4468CC` | served CASHCAT + HOODRAT pairs (49 fills to 4 Sep); pairs to be retired after the gen-3 overlap |
+| gen-2 (1 Sep 2026, JUP-587) | `0x01ac4111a885c28079C16Ac7804062B15F94e8cc` | trusted-hook auto-registration; no pairs, no fills |
+| gen-3 (4 Sep 2026, JUP-621) | `0x1C74A4CA5cfD8C550E54be091aBda476Acffa8CC` | **live trusted hook.** Immutable TokenJar fee: 8 bps of the realised cost of every fill to `0x2aC03e14Cfe755426DaAEe0a4994184Ce81482F8` (Uniswap TokenJar, Robinhood Chain), carved from the 16 bps spread. Sourcify exact match. Pairs: CASHCAT/aeWETH, CASHCAT/USDG, HOODRAT/aeWETH, HOODRAT/USDG (spread 16 bps, floor 16) |
+| beacon seeder gen-2 (4 Sep 2026, hook #11) | `0xb84b5d11f5be1a08b4a8439aa31f3ebd84a2e8a0` | consent-floor deposit ABI (`seedAndDeposit` takes the depositor's signed `AnchorFloor[]`) |
+
+Market `0x8eFb662F738D0f5d9f146803FD02A36c6B67e60d`, PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951`, vendored contracts pin: see `test/real/poolparty/.vendored-from`.
