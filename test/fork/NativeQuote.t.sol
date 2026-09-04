@@ -22,7 +22,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
  * market's pull-exact transferFrom proceeds in the wrapper. Buy-only means only
  * `deposit` is ever needed — the unwrap direction cannot occur.
  */
-contract NativeQuoteForkTest is ForkTestBase {
+abstract contract NativeQuoteFixture is ForkTestBase {
     // token/aeWETH rate: 0.0004 aeWETH (18 dec) per token unit
     uint256 constant RATE_W = 4e14;
 
@@ -38,7 +38,7 @@ contract NativeQuoteForkTest is ForkTestBase {
         market.resetAnchor(pool, AEWETH);
 
         // native-quoted V4 pool on the SAME hook, wired to the SAME C1 pool
-        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), pool, 0);
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), pool, _fixtureSpreadBps());
         nativeKey = PoolKey({
             currency0: Currency.wrap(address(0)), // native always sorts first
             currency1: Currency.wrap(address(token)),
@@ -66,6 +66,16 @@ contract NativeQuoteForkTest is ForkTestBase {
         );
     }
 
+
+
+
+
+
+
+
+}
+
+contract NativeQuoteForkTest is NativeQuoteFixture {
     /// @dev Exact-input: swapper pays native; the hook wraps the whole take and the
     ///      market fills from the C1 pool's aeWETH anchor. Depositor proceeds land on
     ///      the aeWETH claim ledger — the multi-asset "mix" arriving in practice.
@@ -82,7 +92,6 @@ contract NativeQuoteForkTest is ForkTestBase {
         uint256 fee = quoteIn * MARKET_FEE_BPS / 10_000;
         assertEq(poolContract.claimableQuote(AEWETH, lister), quoteIn - fee, "lister credited in the wrapper");
     }
-
     /// @dev Exact-output: the market computes cost inside its single oracle read and
     ///      fundBuy fires with the WRAPPER as quoteAsset; the armed one-frame flag
     ///      makes the hook take NATIVE and wrap so the pull-exact succeeds.
@@ -97,7 +106,6 @@ contract NativeQuoteForkTest is ForkTestBase {
         assertEq(nativeBefore - swapper.balance, cost, "swapper paid exactly the oracle cost in native");
         assertEq(address(hook).balance, 0, "no native strands on the hook");
     }
-
     /// @dev Spread margin is custodied in the WRAPPER, never in native, so the sweep
     ///      path stays ERC-20-only.
     function test_Native_SpreadMarginAccruesInWrapper() public {
@@ -110,7 +118,6 @@ contract NativeQuoteForkTest is ForkTestBase {
         assertGt(IERC20(AEWETH).balanceOf(address(hook)), hookWethBefore, "margin accrued as aeWETH");
         assertEq(address(hook).balance, 0, "zero native custody");
     }
-
     /// @dev Rung unification: schedules key on the MARKET asset, so the wrapper's
     ///      schedule governs native pools too — one schedule to maintain per economic
     ///      asset, no drift between the two V4 representations of the same value.
@@ -136,7 +143,6 @@ contract NativeQuoteForkTest is ForkTestBase {
         assertGt(accrued, quoteIn * 70 / 10_000, "accrual reflects the rung");
         assertLt(accrued, quoteIn * 80 / 10_000, "accrual bounded near 75 bps");
     }
-
     /// @dev Rule 2 unchanged on native pools: buy direction only.
     function test_Native_SellDirectionReverts() public {
         deal(address(token), swapper, 1e18);
@@ -155,7 +161,6 @@ contract NativeQuoteForkTest is ForkTestBase {
         );
         vm.stopPrank();
     }
-
     /// @dev The multi-asset core, end to end through the hook: TWO V4 doors (USDG and
     ///      native) draw from ONE C1 pool in the same block. Per-asset anchors resolve
     ///      independently, both fill, inventory is shared, and the lister's proceeds
@@ -187,7 +192,6 @@ contract NativeQuoteForkTest is ForkTestBase {
         assertEq(IERC20(USDG).balanceOf(lister) - usdgBal, usdgIn - usdgFee, "one claim sweeps USDG");
         assertEq(IERC20(AEWETH).balanceOf(lister) - wethBal, nativeIn - wethFee, "and aeWETH");
     }
-
     /// @dev Config safety: a chain with no wrapper configured cannot register native
     ///      pairs — loud at config time, never on the hot path.
     function test_Native_RegisterRevertsWithoutWeth9() public {
@@ -195,20 +199,62 @@ contract NativeQuoteForkTest is ForkTestBase {
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), address(0))
+            abi.encode(POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0)
         );
-        FlowstateC1Hook bare =
-            new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this), address(0));
+        FlowstateC1Hook bare = new FlowstateC1Hook{salt: salt}(
+            POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0
+        );
         assertEq(address(bare), hookAddress);
         vm.expectRevert(FlowstateC1Hook.NativeQuoteUnsupported.selector);
         bare.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), pool, 0);
     }
-
     /// @dev Stray native (self-destruct aside, nothing should ever send here) is
     ///      rejected so custody accounting never has an unexplained balance.
     function test_Native_ReceiveRejectsStrangers() public {
         vm.deal(address(this), 1 ether);
         (bool ok,) = address(hook).call{value: 1}("");
         assertFalse(ok, "stray native rejected");
+    }
+}
+
+/// JUP-621 on the NATIVE quote path (Wilko, PR #12 review): the hook takes native,
+/// wraps the whole take into aeWETH for the market call, and the TokenJar fee is paid
+/// in that wrapper, in the same fill, out of the spread. Nothing native strands on the
+/// hook and the jar receives aeWETH, never ETH.
+contract NativeQuoteJarFeeForkTest is NativeQuoteFixture {
+    function _jarFeeBps() internal pure override returns (uint16) {
+        return JAR_FEE_BPS;
+    }
+
+    function _fixtureSpreadBps() internal pure override returns (uint16) {
+        return 16;
+    }
+
+    function _ceilBpsLocal(uint256 amount, uint256 bps) internal pure returns (uint256) {
+        return (amount * bps + 10_000 - 1) / 10_000;
+    }
+
+    function test_NativeQuote_JarPaidInWrapper_OutOfSpread() public {
+        uint256 quoteIn = 1e16; // 0.01 native
+        uint256 jarWethBefore = IERC20(AEWETH).balanceOf(TOKEN_JAR);
+        uint256 jarEthBefore = TOKEN_JAR.balance;
+        uint256 marginBefore = hook.accruedSpreadMargin(Currency.wrap(address(0)));
+        uint256 tokBefore = token.balanceOf(swapper);
+
+        _swapBuyNative(-int256(quoteIn), quoteIn);
+
+        uint256 tokens = token.balanceOf(swapper) - tokBefore;
+        uint256 quotePaid = (tokens * RATE_W + 1e18 - 1) / 1e18; // the market's ceil cost at the fixed mock rate
+        uint256 jarFee = IERC20(AEWETH).balanceOf(TOKEN_JAR) - jarWethBefore;
+        assertEq(TOKEN_JAR.balance - jarEthBefore, 0, "jar never receives raw native");
+        assertApproxEqAbs(jarFee, _ceilBpsLocal(quotePaid, JAR_FEE_BPS), 1, "jar paid 10 bps of the realised cost, in aeWETH");
+        uint256 marginKept = hook.accruedSpreadMargin(Currency.wrap(address(0))) - marginBefore;
+        assertApproxEqAbs(jarFee + marginKept, _ceilBpsLocal(quotePaid, 16), 1, "jar + kept margin == the 16 bps spread");
+        assertEq(address(hook).balance, 0, "no native strands on the hook");
+        assertEq(
+            IERC20(AEWETH).balanceOf(address(hook)),
+            hook.accruedSpreadMargin(Currency.wrap(address(0))) + hook.accruedDust(Currency.wrap(address(0))),
+            "hook holds only its booked margin + dust in the wrapper"
+        );
     }
 }

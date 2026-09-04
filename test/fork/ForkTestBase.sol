@@ -52,6 +52,22 @@ abstract contract ForkTestBase is RealStackDeployer {
     address constant STATE_VIEW = 0xF3334192D15450CdD385c8B70e03f9A6bD9E673b;
     address constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168; // 6 decimals
     address constant AEWETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73; // 18 decimals
+    /// JUP-621: Uniswap's TokenJar on Robinhood Chain (protocol-fees deployments table) and the
+    /// immutable fee the hook pays it on every fill, out of the spread (Hamish, 4 Sep 2026: 10 bps).
+    address constant TOKEN_JAR = 0x2aC03e14Cfe755426DaAEe0a4994184Ce81482F8;
+    uint16 constant JAR_FEE_BPS = 10; // the production value (DeployHook JAR_FEE_BPS)
+
+    /// @dev The shared fixture builds its hook with NO jar fee and a zero spread so the
+    ///      exact-amount expectations across the suite stay as they were; suites that
+    ///      exercise the fee (TokenJarFee.t.sol) override these two to the production
+    ///      values and get their own hook instance.
+    function _jarFeeBps() internal pure virtual returns (uint16) {
+        return 0;
+    }
+
+    function _fixtureSpreadBps() internal pure virtual returns (uint16) {
+        return 0;
+    }
 
     /// @notice The 1inch-shaped spot aggregator the RH Flowstate deployment is wired to
     ///         (`deploy/out.rh.json`). Live and answering: getRate(aeWETH, USDG) returns
@@ -148,14 +164,16 @@ abstract contract ForkTestBase is RealStackDeployer {
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH)
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps())
         );
-        hook = new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this), AEWETH);
+        hook = new FlowstateC1Hook{salt: salt}(
+            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps()
+        );
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
 
         // Conservative ship default: zero base spread, no rung schedule (the spread
         // suite configures spreads per test; the floor is 0 until set).
-        hook.registerPair(Currency.wrap(USDG), Currency.wrap(address(token)), pool, 0);
+        hook.registerPair(Currency.wrap(USDG), Currency.wrap(address(token)), pool, _fixtureSpreadBps());
 
         usdgIsCurrency0 = USDG < address(token);
         (Currency c0, Currency c1) = usdgIsCurrency0
