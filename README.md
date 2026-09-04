@@ -61,7 +61,7 @@ diff -r test/real/poolparty \
         ../PoolParty_Contracts/contracts   # only "Only in" lines should appear
 ```
 
-The copies are byte-identical to `PoolParty_Contracts` **`integrate/jup-602-611-612-619` @ `7829879`** (3 Sep 2026: the stacked branch behind contracts PR #43, carrying #38 + #40 + #41 + #42; this pin moves back to `origin/main` once #43 merges, and the drift gate holds it to whatever commit `.vendored-from` names). Before that it was **origin/main @ `959e867`**
+The copies are byte-identical to `PoolParty_Contracts` **origin/main @ `8c5937f`** (4 Sep 2026: the merge of contracts PR #43, JUP-602 + JUP-611 + JUP-612 + JUP-619, carrying #38 + #40 + #41 + #42; this pin moves back to `origin/main` once #43 merges, and the drift gate holds it to whatever commit `.vendored-from` names). Before that it was **origin/main @ `959e867`**
 (the merge of PR #8, the exact-quote pair, and PR #9, governance + the 12h emergency
 lane). Vendored: `FlowstateMarket`, `FlowstatePool`, `FlowBridgeCollector`,
 `FlowAccumulatorBase`, `proxy/InitializableBeaconProxy`, `libraries/{FlowstateStructs,

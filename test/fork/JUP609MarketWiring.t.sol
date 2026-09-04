@@ -13,7 +13,7 @@ contract JUP609MarketWiringTest is ForkTestBase {
         inventory.mint(lister, 100e18);
         vm.startPrank(lister);
         inventory.approve(address(market), type(uint256).max);
-        createdPool = market.createPool(address(inventory), 100e18, 0);
+        createdPool = market.createPool(address(inventory), 100e18, 0, _seedFloors(address(inventory)));
         vm.stopPrank();
     }
 
