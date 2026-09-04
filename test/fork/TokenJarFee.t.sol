@@ -8,6 +8,16 @@ import {ForkTestBase} from "./ForkTestBase.sol";
 import {FlowstateC1Hook} from "../../src/FlowstateC1Hook.sol";
 import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {Vm} from "forge-std/Vm.sol";
+import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
+import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
+
+interface IUniversalRouter {
+    function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external payable;
+}
+
+interface IPermit2 {
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+}
 
 /// JUP-621: the hook pays Uniswap's TokenJar an immutable fee on every fill, carved
 /// out of the spread so the buyer's price is unchanged. These tests pin the four
@@ -22,6 +32,47 @@ contract TokenJarFeeForkTest is ForkTestBase {
 
     function _fixtureSpreadBps() internal pure override returns (uint16) {
         return 16;
+    }
+
+    // Short fills refund the unspent remainder through settleFor, which PoolSwapTest's
+    // delta assertion does not expect; the real Universal Router path is what a short
+    // fill goes through in production, so that is what the short-fill test uses.
+    address constant UNIVERSAL_ROUTER = 0x8876789976dEcBfCbBbe364623C63652db8C0904;
+    address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    uint256 constant V4_SWAP = 0x10;
+
+    function setUp() public override {
+        super.setUp();
+        vm.startPrank(swapper);
+        IERC20(USDG).approve(PERMIT2, type(uint256).max);
+        IPermit2(PERMIT2).approve(USDG, UNIVERSAL_ROUTER, type(uint160).max, type(uint48).max);
+        vm.stopPrank();
+    }
+
+    function _routeThroughUniversalRouter(uint128 amountIn) internal {
+        bool zeroForOne = _buyZeroForOne();
+        Currency inC = zeroForOne ? poolKey.currency0 : poolKey.currency1;
+        Currency outC = zeroForOne ? poolKey.currency1 : poolKey.currency0;
+        bytes memory actions =
+            abi.encodePacked(uint8(Actions.SWAP_EXACT_IN_SINGLE), uint8(Actions.SETTLE_ALL), uint8(Actions.TAKE_ALL));
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(
+            IV4Router.ExactInputSingleParams({
+                poolKey: poolKey,
+                zeroForOne: zeroForOne,
+                amountIn: amountIn,
+                amountOutMinimum: 0,
+                minHopPriceX36: 0,
+                hookData: ""
+            })
+        );
+        params[1] = abi.encode(inC, uint256(amountIn));
+        params[2] = abi.encode(outC, uint256(0));
+        bytes memory commands = abi.encodePacked(uint8(V4_SWAP));
+        bytes[] memory inputs = new bytes[](1);
+        inputs[0] = abi.encode(actions, params);
+        vm.prank(swapper);
+        IUniversalRouter(UNIVERSAL_ROUTER).execute(commands, inputs, block.timestamp + 300);
     }
 
     function _ceilBps(uint256 amount, uint256 bps) internal pure returns (uint256) {
@@ -159,5 +210,30 @@ contract TokenJarFeeForkTest is ForkTestBase {
         );
         vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.SpreadOutOfRange.selector, 16, 17, hook.MAX_SPREAD_BPS()));
         new FlowstateC1Hook{salt: salt2}(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17));
+    }
+
+    /// Short fill (inventory runs out mid-swap, JUP-559 path): the fee is charged on
+    /// what was actually filled (quotePaid), not on the amount the buyer specified,
+    /// the unspent remainder is refunded as before, and the buyer's charge is exactly
+    /// cost + spread with the jar's share inside the spread.
+    function test_ShortFill_JarFeeOnFilledAmountOnly() public {
+        vm.prank(lister);
+        market.withdrawTokens(pool, 0); // empty it
+        _contributeInventory(1_000e18); // 1,000 tokens == 500 USDG of depth at rate 5e5
+        uint256 amountIn = 5_000e6; // ten times available depth
+
+        uint256 jarBefore = IERC20(USDG).balanceOf(TOKEN_JAR);
+        uint256 marginBefore = hook.accruedSpreadMargin(Currency.wrap(USDG));
+        uint256 buyerBefore = IERC20(USDG).balanceOf(swapper);
+
+        _routeThroughUniversalRouter(uint128(amountIn));
+
+        uint256 jarFee = IERC20(USDG).balanceOf(TOKEN_JAR) - jarBefore;
+        uint256 marginKept = hook.accruedSpreadMargin(Currency.wrap(USDG)) - marginBefore;
+        uint256 spent = buyerBefore - IERC20(USDG).balanceOf(swapper);
+        assertEq(poolContract.tokenBalance(), 0, "inventory fully consumed");
+        assertEq(jarFee, _ceilBps(500e6, JAR_FEE_BPS), "fee on the 500 USDG actually filled, not on 5,000");
+        assertEq(jarFee + marginKept, _ceilBps(500e6, 16), "jar + margin == full spread on the filled cost");
+        assertEq(spent, 500e6 + _ceilBps(500e6, 16), "buyer charged cost + spread only; remainder refunded");
     }
 }
