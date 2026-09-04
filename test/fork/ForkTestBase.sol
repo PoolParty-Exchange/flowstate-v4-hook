@@ -53,9 +53,9 @@ abstract contract ForkTestBase is RealStackDeployer {
     address constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168; // 6 decimals
     address constant AEWETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73; // 18 decimals
     /// JUP-621: Uniswap's TokenJar on Robinhood Chain (protocol-fees deployments table) and the
-    /// immutable fee the hook pays it on every fill, out of the spread (Hamish, 4 Sep 2026: 10 bps).
+    /// immutable fee the hook pays it on every fill, out of the spread (Hamish, 4 Sep 2026: 8 bps).
     address constant TOKEN_JAR = 0x2aC03e14Cfe755426DaAEe0a4994184Ce81482F8;
-    uint16 constant JAR_FEE_BPS = 10; // the production value (DeployHook JAR_FEE_BPS)
+    uint16 constant JAR_FEE_BPS = 8; // the production value (DeployHook JAR_FEE_BPS), Hamish 4 Sep 2026
 
     /// @dev The shared fixture builds its hook with NO jar fee and a zero spread so the
     ///      exact-amount expectations across the suite stay as they were; suites that

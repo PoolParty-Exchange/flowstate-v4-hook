@@ -247,7 +247,7 @@ contract NativeQuoteJarFeeForkTest is NativeQuoteFixture {
         uint256 quotePaid = (tokens * RATE_W + 1e18 - 1) / 1e18; // the market's ceil cost at the fixed mock rate
         uint256 jarFee = IERC20(AEWETH).balanceOf(TOKEN_JAR) - jarWethBefore;
         assertEq(TOKEN_JAR.balance - jarEthBefore, 0, "jar never receives raw native");
-        assertApproxEqAbs(jarFee, _ceilBpsLocal(quotePaid, JAR_FEE_BPS), 1, "jar paid 10 bps of the realised cost, in aeWETH");
+        assertApproxEqAbs(jarFee, _ceilBpsLocal(quotePaid, JAR_FEE_BPS), 1, "jar paid JAR_FEE_BPS of the realised cost, in aeWETH");
         uint256 marginKept = hook.accruedSpreadMargin(Currency.wrap(address(0))) - marginBefore;
         assertApproxEqAbs(jarFee + marginKept, _ceilBpsLocal(quotePaid, 16), 1, "jar + kept margin == the 16 bps spread");
         assertEq(address(hook).balance, 0, "no native strands on the hook");
