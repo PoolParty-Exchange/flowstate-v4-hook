@@ -41,7 +41,11 @@ contract DeployHook is Script {
 
         vm.startBroadcast();
 
-        FlowstateC1Hook hook = new FlowstateC1Hook{salt: salt}(poolManager, market, owner, weth9);
+        // JUP-621: immutable TokenJar fee (Uniswap allowlist criterion). Both values are
+        // baked into the CREATE2 init code, so they are part of the mined salt too.
+        address tokenJar = vm.envAddress("TOKEN_JAR");
+        uint16 jarFeeBps = uint16(vm.envUint("JAR_FEE_BPS"));
+        FlowstateC1Hook hook = new FlowstateC1Hook{salt: salt}(poolManager, market, owner, weth9, tokenJar, jarFeeBps);
         require(address(hook) == expected, "deployed address != mined address");
 
         // quote = aeWETH (the wrapper; native-quoted V4 pools reach the same

@@ -195,10 +195,11 @@ contract NativeQuoteForkTest is ForkTestBase {
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), address(0))
+            abi.encode(POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0)
         );
-        FlowstateC1Hook bare =
-            new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this), address(0));
+        FlowstateC1Hook bare = new FlowstateC1Hook{salt: salt}(
+            POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0
+        );
         assertEq(address(bare), hookAddress);
         vm.expectRevert(FlowstateC1Hook.NativeQuoteUnsupported.selector);
         bare.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), pool, 0);

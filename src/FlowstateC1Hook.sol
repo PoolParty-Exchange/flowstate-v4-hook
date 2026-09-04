@@ -69,6 +69,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     error ManagerReservesExceeded(Currency currency, uint256 requested, uint256 available);
     error SpreadOutOfRange(uint16 bps, uint16 floorBps, uint16 maxBps);
     error TradeTooSmallForSpread(uint256 quoteIn, uint256 spreadBps);
+    /// @dev JUP-621: cannot happen while the spread setters enforce spread >= jarFeeBps;
+    ///      kept as a hard stop so the fee can never be skipped or paid from inventory.
+    error JarFeeExceedsSpread(uint256 jarFee, uint256 spreadAccrued);
     error PartialFillUnsupportedForNativeQuote(); // refunding native needs an unwrap path this hook lacks
     error RungScheduleInvalid();
     error SweepDestinationNotSet();
@@ -92,6 +95,21 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         address(0) disables native-quote support on chains without a wrapper.
     IWETH9 public immutable weth9;
 
+    /// @notice JUP-621: Uniswap's TokenJar on this chain. Every fill pays
+    ///         `jarFeeBps` of the recomputed oracle cost to it, in the same
+    ///         transaction, out of the buyer's spread. Immutable: no setter, no owner
+    ///         path, no fill path that skips it. This is the protocol-fee-equivalent
+    ///         Uniswap Labs requires of a custom-accounting hook for routing
+    ///         allowlisting (the pool manager's own protocol fee never accrues here
+    ///         because the hook settles the whole swap).
+    address public immutable tokenJar;
+    /// @notice Basis points of the recomputed cost paid to `tokenJar` on every fill.
+    ///         Every spread this hook can charge is at least this much (see
+    ///         _checkBaseSpread, setBaseSpreadFloor, setMarketRegistrationSpread), so
+    ///         the fee is always carved from the spread and never changes the price
+    ///         the buyer pays.
+    uint16 public immutable jarFeeBps;
+
     // -------------------------------------------------------------------------
     // Constants
     // -------------------------------------------------------------------------
@@ -105,6 +123,17 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     // -------------------------------------------------------------------------
     // Admin-controlled state
     // -------------------------------------------------------------------------
+
+    /// @dev One fill's accounting, returned by the two fill helpers as a memory struct
+    ///      (JUP-621 added a sixth value and the tuple form overflowed the EVM stack).
+    struct Fill {
+        uint256 quoteIn;
+        uint256 tokensOut;
+        uint256 spreadAccrued;
+        uint256 dustAccrued;
+        uint256 costBase;
+        BeforeSwapDelta hookDelta;
+    }
 
     struct PairConfig {
         address marketPool;
@@ -220,6 +249,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         Currency indexed asset, address indexed to, uint256 spreadPortion, uint256 dustPortion, uint256 swept
     );
     event ETHSwept(address indexed to, uint256 amount);
+    /// @notice JUP-621: the TokenJar fee paid on one fill, in the quote asset the
+    ///         buyer paid (the wrapper for a native quote).
+    event ProtocolFeePaid(PoolId indexed poolId, Currency indexed asset, uint256 amount);
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -228,15 +260,26 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     /// @param _poolManager canonical PoolManager for this chain.
     /// @param _market      FlowstateMarket (must be non-zero and code-bearing).
     /// @param _owner       admin for the pair registry and reseller code.
-    constructor(address _poolManager, address _market, address _owner, address _weth9)
-        Ownable(_owner)
-    {
-        if (_poolManager == address(0) || _market == address(0)) revert ZeroAddress();
+    constructor(
+        address _poolManager,
+        address _market,
+        address _owner,
+        address _weth9,
+        address _tokenJar,
+        uint16 _jarFeeBps
+    ) Ownable(_owner) {
+        if (_poolManager == address(0) || _market == address(0) || _tokenJar == address(0)) revert ZeroAddress();
         if (_market.code.length == 0) revert ZeroAddress();
+        // The jar fee must fit under every spread the hook can charge, and the
+        // registration default (16 bps at construction) must clear it too.
+        if (_jarFeeBps > MAX_SPREAD_BPS) revert SpreadOutOfRange(_jarFeeBps, 0, MAX_SPREAD_BPS);
+        if (marketRegistrationSpreadBps < _jarFeeBps) revert SpreadOutOfRange(marketRegistrationSpreadBps, _jarFeeBps, MAX_SPREAD_BPS);
 
         poolManager = IPoolManager(_poolManager);
         market = IFlowstateMarketMinimal(_market);
         weth9 = IWETH9(_weth9); // address(0) = native quotes disabled on this chain
+        tokenJar = _tokenJar;
+        jarFeeBps = _jarFeeBps;
 
         Hooks.validateHookPermissions(
             this,
@@ -348,6 +391,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         and non-executable until the owner retunes them.
     function setBaseSpreadFloor(uint16 floorBps) external onlyOwner {
         if (floorBps > MAX_SPREAD_BPS) revert SpreadOutOfRange(floorBps, 0, MAX_SPREAD_BPS);
+        // JUP-621: the floor is only a floor on top of the jar fee; a lower floor would
+        // let setBaseSpread admit a spread that cannot carry the fee.
+        if (floorBps < jarFeeBps) revert SpreadOutOfRange(floorBps, jarFeeBps, MAX_SPREAD_BPS);
         emit BaseSpreadFloorUpdated(baseSpreadFloorBps, floorBps);
         baseSpreadFloorBps = floorBps;
     }
@@ -358,6 +404,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         lazily at registration time so this can never make createPool revert.
     function setMarketRegistrationSpread(uint16 bps) external onlyOwner {
         if (bps > MAX_SPREAD_BPS) revert SpreadOutOfRange(bps, 0, MAX_SPREAD_BPS);
+        if (bps < jarFeeBps) revert SpreadOutOfRange(bps, jarFeeBps, MAX_SPREAD_BPS); // JUP-621
         emit MarketRegistrationSpreadUpdated(marketRegistrationSpreadBps, bps);
         marketRegistrationSpreadBps = bps;
     }
@@ -519,16 +566,37 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         if (Currency.unwrap(input) != Currency.unwrap(quote)) revert SellDirectionNotSupported();
 
         bool exactInput = params.amountSpecified < 0;
-        (uint256 quoteIn, uint256 tokensOut, uint256 spreadAccrued, uint256 dustAccrued, BeforeSwapDelta hookDelta) =
-        exactInput
+        Fill memory f = exactInput
             ? _buyExactInput(cfg, input, output, params.amountSpecified, sender)
             : _buyExactOutput(cfg, input, output, params.amountSpecified);
 
-        if (spreadAccrued != 0) accruedSpreadMargin[input] += spreadAccrued;
-        if (dustAccrued != 0) accruedDust[input] += dustAccrued;
+        // JUP-621: pay Uniswap's TokenJar its fee on this fill, out of the spread. The
+        // fee base is the recomputed oracle cost the market actually charged
+        // (quotePaid / cost), the same base the spread is computed on, so
+        // jarFee <= spreadAccrued always holds (spreadBps >= jarFeeBps is enforced by
+        // every spread setter). Paid before the margin is booked, in the asset the hook
+        // is holding (the wrapper for a native quote), inside the swap itself.
+        f.spreadAccrued = _payJar(key.toId(), input, f.costBase, f.spreadAccrued);
+        if (f.spreadAccrued != 0) accruedSpreadMargin[input] += f.spreadAccrued;
+        if (f.dustAccrued != 0) accruedDust[input] += f.dustAccrued;
 
-        emit BuyExecuted(key.toId(), quote, output, quoteIn, tokensOut, exactInput, spreadAccrued, dustAccrued);
-        return (IHooks.beforeSwap.selector, hookDelta, 0);
+        emit BuyExecuted(key.toId(), quote, output, f.quoteIn, f.tokensOut, exactInput, f.spreadAccrued, f.dustAccrued);
+        return (IHooks.beforeSwap.selector, f.hookDelta, 0);
+    }
+
+    /// @dev JUP-621: pay the TokenJar its fee for this fill and return the spread the
+    ///      hook keeps. Paid in the asset the hook holds (the wrapper for a native quote).
+    function _payJar(PoolId poolId, Currency input, uint256 costBase, uint256 spreadAccrued)
+        internal
+        returns (uint256 spreadLeft)
+    {
+        uint256 jarFee = _ceilBps(costBase, jarFeeBps);
+        if (jarFee == 0) return spreadAccrued;
+        if (jarFee > spreadAccrued) revert JarFeeExceedsSpread(jarFee, spreadAccrued);
+        Currency held = input.isAddressZero() ? Currency.wrap(address(weth9)) : input;
+        IERC20(Currency.unwrap(held)).safeTransfer(tokenJar, jarFee);
+        emit ProtocolFeePaid(poolId, held, jarFee);
+        return spreadAccrued - jarFee;
     }
 
     /// @dev exactInput spread carve: the swapper's specified quoteIn is taken into
@@ -551,25 +619,26 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         address sender
     )
         internal
-        returns (uint256 quoteIn, uint256 tokensOut, uint256 spreadAccrued, uint256 dustAccrued, BeforeSwapDelta hookDelta)
+        returns (Fill memory f)
     {
-        quoteIn = uint256(-amountSpecified);
-        uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), quoteIn);
-        uint256 netQuote = spreadBps == 0 ? quoteIn : quoteIn * BPS_DENOMINATOR / (BPS_DENOMINATOR + spreadBps);
+        f.quoteIn = uint256(-amountSpecified);
+        uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), f.quoteIn);
+        uint256 netQuote = spreadBps == 0 ? f.quoteIn : f.quoteIn * BPS_DENOMINATOR / (BPS_DENOMINATOR + spreadBps);
         // Sub-dust ticket: the carve leaves the market nothing to price. Raise the
         // explicit typed error rather than letting FlowstatePool's InvalidAmount
         // surface for a hook-caused condition (same posture as ManagerReservesExceeded,
         // §2.1).
-        if (netQuote == 0) revert TradeTooSmallForSpread(quoteIn, spreadBps);
-        _takeChecked(input, quoteIn);
+        if (netQuote == 0) revert TradeTooSmallForSpread(f.quoteIn, spreadBps);
+        _takeChecked(input, f.quoteIn);
         // native quote: wrap the WHOLE take (cost + spread + dust) so accrued margin
         // is held uniformly in the wrapper and the sweep path stays ERC-20-only
-        if (input.isAddressZero()) weth9.deposit{value: quoteIn}();
+        if (input.isAddressZero()) weth9.deposit{value: f.quoteIn}();
         uint256 quotePaid;
-        (tokensOut, quotePaid) =
+        (f.tokensOut, quotePaid) =
             market.buyFromPoolExactQuote(cfg.marketPool, cfg.marketAsset, netQuote, resellerCode, address(this));
-        _settle(output, tokensOut);
-        spreadAccrued = _ceilBps(quotePaid, spreadBps);
+        _settle(output, f.tokensOut);
+        f.spreadAccrued = _ceilBps(quotePaid, spreadBps);
+        f.costBase = quotePaid; // JUP-621: the jar fee is computed on the same base as the spread
 
         // JUP-559 partial fill. The pool may now fill SHORT of netQuote when inventory
         // runs out, so `leftover` is either the ordinary carve residue (a wei or two) or
@@ -592,20 +661,20 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         // the exact cost of those, so the unspent remainder is strictly less than the cost
         // of one token-wei. Anything at or above that is inventory running out.
         //
-        //   full fill:  tokensOut = floor(netQuote / p),  quotePaid = ceil(tokensOut * p)
-        //               => netQuote - quotePaid < p <= ceil(quotePaid / tokensOut)
+        //   full fill:  f.tokensOut = floor(netQuote / p),  quotePaid = ceil(f.tokensOut * p)
+        //               => netQuote - quotePaid < p <= ceil(quotePaid / f.tokensOut)
         //
         // The per-token-wei cost is recovered from the returned pair rather than re-read,
         // so this tracks the rate the market ACTUALLY used, including the anchor and the
         // staleness surcharge, neither of which this hook can see directly.
         //
-        // Do NOT widen this by spreadAccrued. An earlier revision compared `leftover`
-        // against `quoteIn - netQuote + inversionBound`, which cancels to
-        // `netQuote - quotePaid > spreadAccrued + inversionBound` and therefore treated a
+        // Do NOT widen this by f.spreadAccrued. An earlier revision compared `leftover`
+        // against `f.quoteIn - netQuote + inversionBound`, which cancels to
+        // `netQuote - quotePaid > f.spreadAccrued + inversionBound` and therefore treated a
         // genuine shortfall of up to the whole spread as ordinary dust, silently keeping
         // it. Regression pinned in test/fork/UniversalRouterPartialFill.t.sol.
-        uint256 leftover = quoteIn - quotePaid - spreadAccrued;
-        uint256 inversionBound = tokensOut == 0 ? 0 : (quotePaid + tokensOut - 1) / tokensOut;
+        uint256 leftover = f.quoteIn - quotePaid - f.spreadAccrued;
+        uint256 inversionBound = f.tokensOut == 0 ? 0 : (quotePaid + f.tokensOut - 1) / f.tokensOut;
         if (netQuote - quotePaid > inversionBound) {
             // Native refunds would need an unwrap path this hook does not have
             // (weth9.deposit is one-way), so native-quote pairs stay all-or-nothing.
@@ -614,9 +683,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
             IERC20(Currency.unwrap(input)).safeTransfer(address(poolManager), leftover);
             poolManager.settleFor(sender);
         } else {
-            dustAccrued = leftover;
+            f.dustAccrued = leftover;
         }
-        hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), -tokensOut.toInt128());
+        f.hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), -f.tokensOut.toInt128());
     }
 
     /// @dev Single market call, single oracle read: buyFromPoolExactOut computes the
@@ -633,30 +702,31 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///      notional of an exact-output trade).
     function _buyExactOutput(PairConfig memory cfg, Currency input, Currency output, int256 amountSpecified)
         internal
-        returns (uint256 quoteIn, uint256 tokensOut, uint256 spreadAccrued, uint256 dustAccrued, BeforeSwapDelta hookDelta)
+        returns (Fill memory f)
     {
-        tokensOut = uint256(amountSpecified);
+        f.tokensOut = uint256(amountSpecified);
         bool nativeIn = input.isAddressZero();
         // fundBuy receives the MARKET asset (the wrapper, for a native pair); this
         // one-frame flag tells it to take native from the manager and wrap instead
         if (nativeIn) _takeNativeInCallback = true;
         (, uint256 cost) =
-            market.buyFromPoolExactOut(cfg.marketPool, cfg.marketAsset, tokensOut, resellerCode, address(this));
+            market.buyFromPoolExactOut(cfg.marketPool, cfg.marketAsset, f.tokensOut, resellerCode, address(this));
         if (nativeIn) _takeNativeInCallback = false;
         uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), cost);
-        spreadAccrued = _ceilBps(cost, spreadBps);
-        dustAccrued = 0; // exact-output has no carve: cost is exact, spread is exact
-        quoteIn = cost + spreadAccrued;
+        f.spreadAccrued = _ceilBps(cost, spreadBps);
+        f.dustAccrued = 0; // exact-output has no carve: cost is exact, spread is exact
+        f.costBase = cost; // JUP-621
+        f.quoteIn = cost + f.spreadAccrued;
         int256 delta = poolManager.currencyDelta(address(this), input);
         uint256 takenInCallback = delta < 0 ? uint256(-delta) : 0; // cost if fundBuy ran, else 0
-        if (quoteIn > takenInCallback) {
-            _takeChecked(input, quoteIn - takenInCallback);
+        if (f.quoteIn > takenInCallback) {
+            _takeChecked(input, f.quoteIn - takenInCallback);
             // spread margin (and, when the callback was skipped, the cost too until
             // it was pulled above) is wrapped so margin custody is wrapper-uniform
-            if (nativeIn) weth9.deposit{value: quoteIn - takenInCallback}();
+            if (nativeIn) weth9.deposit{value: f.quoteIn - takenInCallback}();
         }
-        _settle(output, tokensOut);
-        hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), quoteIn.toInt128());
+        _settle(output, f.tokensOut);
+        f.hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), f.quoteIn.toInt128());
     }
 
     // -------------------------------------------------------------------------
@@ -768,8 +838,11 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     /// @dev baseSpread must clear the current per-chain oracle-drift floor and sit
     ///      under the hard cap. Shared by config-time checks and the readiness gate.
     function _checkBaseSpread(uint16 bps) internal view {
-        if (bps < baseSpreadFloorBps || bps > MAX_SPREAD_BPS) {
-            revert SpreadOutOfRange(bps, baseSpreadFloorBps, MAX_SPREAD_BPS);
+        // JUP-621: the effective lower bound is max(floor, jarFeeBps): every spread must
+        // be able to carry the TokenJar fee without touching the buyer's price.
+        uint16 lower = baseSpreadFloorBps > jarFeeBps ? baseSpreadFloorBps : jarFeeBps;
+        if (bps < lower || bps > MAX_SPREAD_BPS) {
+            revert SpreadOutOfRange(bps, lower, MAX_SPREAD_BPS);
         }
     }
 
