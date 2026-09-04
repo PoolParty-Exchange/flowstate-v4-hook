@@ -13,11 +13,30 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+/// @dev ABI twin of FlowstateStructs.AnchorFloor (JUP-611): the lowest anchor rate,
+///      per seeded quote asset, the depositor consents to. Declared locally because
+///      the seeder pins 0.8.26 and the vendored contracts pin 0.8.29; the tuple
+///      layout (address, uint192) is what the market decodes.
+struct AnchorFloor {
+    address asset;
+    uint192 minRate;
+}
+
 /// @dev The one market entry point the seeder consumes: deposit on behalf of a named
 ///      contribution owner (FlowstateMarket "gift semantics", R10). Tokens are pulled
 ///      from msg.sender (this contract); the position is credited to contributionOwner.
+///      JUP-611 (contracts PR #40): the deposit carries the floors the depositor
+///      consents to, one per asset the pool has an anchor for.
 interface IFlowstateMarketDeposit {
-    function contributeTokens(address pool, uint256 amount, address contributionOwner) external;
+    function contributeTokens(address pool, uint256 amount, address contributionOwner, AnchorFloor[] calldata floors)
+        external;
+}
+
+/// @dev The pool surface the seeder reads to build the consent floors: which quote
+///      assets are anchored, and each asset's durable anchor.
+interface IFlowstatePoolAnchors {
+    function seededAssets() external view returns (address[] memory);
+    function anchorOf(address asset) external view returns (uint192 rate, uint64 blockNumber, uint32 epoch);
 }
 
 /// @dev The one hook surface the seeder reads: whether a pool's beacon is already lit.
@@ -88,10 +107,21 @@ contract FlowstateBeaconSeeder is IUnlockCallback, ReentrancyGuard {
     /// @param inventoryToken the pool's inventory token (mismatches revert inside the
     ///                       market's pull; nothing can be lost to a wrong value).
     /// @param amount         inventory-token amount to deposit.
-    function seedAndDeposit(PoolKey calldata key, address marketPool, address inventoryToken, uint256 amount)
-        external
-        nonReentrant
-    {
+    /// @param floors         the depositor's JUP-611 consent floors, one per seeded
+    ///                       quote asset, chosen and signed by the depositor BEFORE
+    ///                       submission and passed to the market UNCHANGED. The
+    ///                       periphery never substitutes a value it read during
+    ///                       execution (Wilko, PR #11 review): if the durable anchor
+    ///                       has moved below a signed floor by the time this executes,
+    ///                       the market reverts with AnchorBelowFloor and no inventory
+    ///                       is funded at the moved price.
+    function seedAndDeposit(
+        PoolKey calldata key,
+        address marketPool,
+        address inventoryToken,
+        uint256 amount,
+        AnchorFloor[] calldata floors
+    ) external nonReentrant {
         if (!IBeaconHook(address(key.hooks)).beaconSeeded(key.toId())) {
             try this.seedFor(key, inventoryToken, msg.sender) {}
             catch (bytes memory reason) {
@@ -100,7 +130,23 @@ contract FlowstateBeaconSeeder is IUnlockCallback, ReentrancyGuard {
         }
         IERC20(inventoryToken).safeTransferFrom(msg.sender, address(this), amount);
         IERC20(inventoryToken).forceApprove(address(market), amount);
-        market.contributeTokens(marketPool, amount, msg.sender);
+        market.contributeTokens(marketPool, amount, msg.sender, floors);
+    }
+
+    /// @notice Read-only QUOTE helper for front-ends: the pool's current durable
+    ///         anchors, one per seeded asset, in the exact shape `seedAndDeposit`
+    ///         expects. A UI shows these as "today's price", the depositor signs them
+    ///         (or lower floors of their own), and the signed values travel to the
+    ///         market unchanged. This function is deliberately NOT called inside
+    ///         `seedAndDeposit`: a floor read at execution time consents to whatever the
+    ///         anchor is at that moment, which is exactly the exposure JUP-611 removes.
+    function consentFloors(address marketPool) external view returns (AnchorFloor[] memory floors) {
+        address[] memory assets = IFlowstatePoolAnchors(marketPool).seededAssets();
+        floors = new AnchorFloor[](assets.length);
+        for (uint256 i = 0; i < assets.length; i++) {
+            (uint192 rate,,) = IFlowstatePoolAnchors(marketPool).anchorOf(assets[i]);
+            floors[i] = AnchorFloor({asset: assets[i], minRate: rate});
+        }
     }
 
     /// @notice try/catch shim for seedAndDeposit. Callable externally only in the ways

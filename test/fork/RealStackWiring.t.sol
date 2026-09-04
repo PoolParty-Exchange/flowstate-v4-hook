@@ -530,7 +530,7 @@ contract RealStackDeclineForkTest is RealStackTestBase {
         token.mint(address(this), 51e18);
         token.approve(address(market), type(uint256).max);
         for (uint256 i = 0; i < 51; i++) {
-            market.contributeTokens(pool, 1e18, address(uint160(0xC0DE0000 + i)));
+            market.contributeTokens(pool, 1e18, address(uint160(0xC0DE0000 + i)), _consentFloors(pool));
         }
         assertEq(poolContract.tokenBalance(), 51e18, "51 nodes of inventory on the books");
 

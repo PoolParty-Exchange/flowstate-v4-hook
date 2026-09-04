@@ -144,7 +144,7 @@ contract RegisterFromMarketTest is ForkTestBase {
         newToken.mint(lister, 100e18);
         vm.startPrank(lister);
         newToken.approve(address(market), type(uint256).max);
-        address newPool = market.createPool(address(newToken), 100e18, 0);
+        address newPool = market.createPool(address(newToken), 100e18, 0, _seedFloors(address(newToken)));
         vm.stopPrank();
 
         bytes32 key = _key(USDG, address(newToken));

@@ -130,6 +130,13 @@ library FlowstateEvents {
     // ── fees & config ────────────────────────────────────────────────────
     event FeeBpsSet(address indexed token, uint16 feeBps);
     event QuoteAssetSet(address indexed asset, bool approved);
+    /// @notice JUP-612: per-quote-asset inventory floor, in that asset's units.
+    event InventoryFloorSet(address indexed asset, uint256 floor);
+    /// @notice JUP-612 compaction: a sub-minimum FIFO node moved to its owner's claim ledger.
+    event DustEvicted(address indexed pool, address indexed owner, uint256 amount);
+    event DustCompacted(address indexed pool, address indexed caller, uint256 nodes, uint256 amount);
+    /// @notice JUP-619: per-quote-asset minimum deposit, in that asset's units.
+    event MinContributionSet(address indexed asset, uint256 minimum);
     event AnchorBandUpdated(address indexed pool, uint16 bandBps);
     event PriceSourceUpdated(address indexed pool, uint8 source);
     event BuyBackConfigured(
