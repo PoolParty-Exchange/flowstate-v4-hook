@@ -9,7 +9,7 @@ import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.so
 import {IV4Quoter} from "@uniswap/v4-periphery/src/interfaces/IV4Quoter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ForkTestBase} from "./ForkTestBase.sol";
-import {FlowstateBeaconSeeder} from "../../src/FlowstateBeaconSeeder.sol";
+import {FlowstateBeaconSeeder, AnchorFloor} from "../../src/FlowstateBeaconSeeder.sol";
 import {MockInventoryToken} from "../mocks/MockInventoryToken.sol";
 
 /// @notice The GMGN-visibility beacon (JUP-516): the hook admits exactly ONE
@@ -95,8 +95,9 @@ contract BeaconSeederForkTest is ForkTestBase {
         uint256 amount = 500e18;
         uint256 balBefore = token.balanceOf(depositor);
 
+        AnchorFloor[] memory signed = seeder.consentFloors(pool); // what the UI shows and the depositor signs
         vm.prank(depositor);
-        seeder.seedAndDeposit(poolKey, pool, address(token), amount);
+        seeder.seedAndDeposit(poolKey, pool, address(token), amount, signed);
 
         (uint256 tokenPosition,,) = poolContract.positions(depositor);
         assertEq(tokenPosition, amount, "deposit credited to depositor, not periphery");
@@ -124,8 +125,9 @@ contract BeaconSeederForkTest is ForkTestBase {
         });
         uint256 amount = 250e18;
 
+        AnchorFloor[] memory signed = seeder.consentFloors(pool);
         vm.prank(depositor);
-        seeder.seedAndDeposit(badKey, pool, address(token), amount);
+        seeder.seedAndDeposit(badKey, pool, address(token), amount, signed);
 
         (uint256 tokenPosition,,) = poolContract.positions(depositor);
         assertEq(tokenPosition, amount, "deposit landed despite beacon failure");
@@ -133,10 +135,11 @@ contract BeaconSeederForkTest is ForkTestBase {
     }
 
     function test_SeedAndDeposit_SecondDepositSkipsSeeding() public {
+        AnchorFloor[] memory signed = seeder.consentFloors(pool);
         vm.startPrank(depositor);
-        seeder.seedAndDeposit(poolKey, pool, address(token), 100e18);
+        seeder.seedAndDeposit(poolKey, pool, address(token), 100e18, signed);
         uint256 balAfterFirst = token.balanceOf(depositor);
-        seeder.seedAndDeposit(poolKey, pool, address(token), 100e18);
+        seeder.seedAndDeposit(poolKey, pool, address(token), 100e18, signed);
         vm.stopPrank();
 
         (uint256 tokenPosition,,) = poolContract.positions(depositor);
@@ -193,5 +196,37 @@ contract BeaconSeederForkTest is ForkTestBase {
                 hookData: ""
             })
         );
+    }
+
+    // -- 4. JUP-611 consent travels unchanged (Wilko, PR #11 review) ------------
+
+    /// The periphery must not substitute an execution-time anchor for the depositor's
+    /// signed floor. Sign at anchor X, poison/move the anchor below X before the
+    /// transaction lands, and the deposit must revert with the market's AnchorBelowFloor.
+    function test_SeedAndDeposit_RevertsWhenAnchorFallsBelowSignedFloor() public {
+        AnchorFloor[] memory signed = seeder.consentFloors(pool); // signed at today's anchor
+        assertGt(signed[0].minRate, 0, "fixture has a live anchor");
+        // the anchor moves DOWN after signing (oracle moved + re-anchored, as an attacker
+        // or a genuine market move would produce)
+        _setOracleRate(_rate() * 9 / 10);
+        (uint192 movedAnchor,,) = poolContract.anchorOf(USDG);
+        assertLt(movedAnchor, signed[0].minRate, "anchor is now below the signed floor");
+
+        vm.prank(depositor);
+        vm.expectPartialRevert(bytes4(keccak256("AnchorBelowFloor(address,uint256,uint256)")));
+        seeder.seedAndDeposit(poolKey, pool, address(token), 100e18, signed);
+
+        (uint256 tokenPosition,,) = poolContract.positions(depositor);
+        assertEq(tokenPosition, 0, "nothing funded at the moved price");
+    }
+
+    /// A floor the depositor sets ABOVE today's anchor is refused outright: the
+    /// periphery passes it through and the market rejects it.
+    function test_SeedAndDeposit_RevertsWhenSignedFloorAboveAnchor() public {
+        AnchorFloor[] memory signed = seeder.consentFloors(pool);
+        signed[0].minRate = signed[0].minRate + 1;
+        vm.prank(depositor);
+        vm.expectPartialRevert(bytes4(keccak256("AnchorBelowFloor(address,uint256,uint256)")));
+        seeder.seedAndDeposit(poolKey, pool, address(token), 100e18, signed);
     }
 }
