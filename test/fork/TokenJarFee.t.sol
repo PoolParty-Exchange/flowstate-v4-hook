@@ -25,7 +25,7 @@ interface IPermit2 {
 /// transaction, from the spread (never from inventory or the buyer), and impossible
 /// to configure away.
 contract TokenJarFeeForkTest is ForkTestBase {
-    /// Production values: 10 bps to the jar out of a 16 bps spread.
+    /// Production values: 8 bps to the jar out of a 16 bps spread.
     function _jarFeeBps() internal pure override returns (uint16) {
         return JAR_FEE_BPS;
     }
@@ -111,7 +111,7 @@ contract TokenJarFeeForkTest is ForkTestBase {
         uint256 fullSpread = jarFee + marginKept;
         assertLe(jarFee, fullSpread, "fee never exceeds the spread");
         assertLe(jarFee, _ceilBps(netQuote, JAR_FEE_BPS), "fee <= fee on the asked notional");
-        assertGe(jarFee, _ceilBps(netQuote - netQuote / 1000, JAR_FEE_BPS), "fee ~ 10 bps of cost");
+        assertGe(jarFee, _ceilBps(netQuote - netQuote / 1000, JAR_FEE_BPS), "fee ~ JAR_FEE_BPS of cost");
         // buyer charged the specified input exactly, nothing more
         assertEq(buyerBefore - IERC20(USDG).balanceOf(swapper), quoteIn, "buyer paid quoteIn");
         assertEq(uint256(int256(-d.amount0() > 0 ? -d.amount0() : -d.amount1())), quoteIn, "delta == quoteIn");
