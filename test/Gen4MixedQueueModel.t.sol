@@ -74,6 +74,38 @@ contract Gen4MixedQueueConformanceTest is Test {
         assertEq(total, 106);
     }
 
+    // sizeForGas: a pool leg never plans more nodes than its gas budget walks (JUP-698 gate 1 finding)
+    function test_SizeForGasStopsAtTheBudget() public pure {
+        IGen4Pool.QueueNode[] memory nodes = _nodes(4);
+        nodes[0] = _node(1, 10, 0);
+        nodes[1] = _node(2, 20, 0);
+        nodes[2] = _node(3, 30, 0);
+        nodes[3] = _node(4, 40, 0);
+        assertEq(Gen4Queue.sizeForGas(nodes, type(uint64).max, 0, 100, 10), 0);
+        assertEq(Gen4Queue.sizeForGas(nodes, type(uint64).max, 99, 100, 10), 0);
+        assertEq(Gen4Queue.sizeForGas(nodes, type(uint64).max, 100, 100, 10), 10);
+        assertEq(Gen4Queue.sizeForGas(nodes, type(uint64).max, 299, 100, 10), 30);
+        assertEq(Gen4Queue.sizeForGas(nodes, type(uint64).max, 400, 100, 10), 100);
+    }
+
+    function test_SizeForGasNeverCrossesTheListingBoundary() public pure {
+        IGen4Pool.QueueNode[] memory nodes = _nodes(3);
+        nodes[0] = _node(7, 10, 0);
+        nodes[1] = _node(8, 20, 5);
+        nodes[2] = _node(9, 30, 0);
+        assertEq(Gen4Queue.sizeForGas(nodes, 8, type(uint256).max, 100, 10), 25);
+        assertEq(Gen4Queue.sizeForGas(nodes, 6, type(uint256).max, 100, 10), 0);
+    }
+
+    function test_SizeForGasChargesPinnedNodesOnlyTheSkip() public pure {
+        IGen4Pool.QueueNode[] memory nodes = _nodes(3);
+        nodes[0] = _node(1, 10, 10);
+        nodes[1] = _node(2, 10, 10);
+        nodes[2] = _node(3, 30, 0);
+        assertEq(Gen4Queue.sizeForGas(nodes, type(uint64).max, 120, 100, 10), 30);
+        assertEq(Gen4Queue.sizeForGas(nodes, type(uint64).max, 119, 100, 10), 0);
+    }
+
     function test_ActualAmountsDriveAggregateAccounting() public pure {
         Gen4Accounting.Totals memory totals;
         Gen4Accounting.recordPool(totals, 4, 39);

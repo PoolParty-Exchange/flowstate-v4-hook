@@ -97,8 +97,10 @@ contract Gen4MockSettlement {
         market = market_;
     }
 
+    bool public revertSettle;
     function setAlwaysStale(bool value) external { alwaysStale = value; }
     function setClosed(bool value) external { closed = value; }
+    function setRevertSettle(bool value) external { revertSettle = value; }
     function price(address, address) external view returns (uint8 why, uint256 price_) {
         return closed ? (uint8(1), uint256(0)) : (uint8(0), rate);
     }
@@ -115,6 +117,7 @@ contract Gen4MockSettlement {
         uint256
     ) external returns (uint8 outcome, uint64 id, uint256 filled, uint256 quotePaid) {
         recorder.record(100 + listingId);
+        require(!revertSettle, "settlement reverted");
         if (closed) return (CLOSED, listingId, 0, 0);
         if (alwaysStale) return (STALE, listingId, 0, 0);
         (uint8 state, uint64 current,, uint256 available,,) = registry.peek(address(token));
@@ -147,8 +150,12 @@ contract Gen4MockMarket {
         recorder = recorder_;
     }
 
+    // 1: the bounded buy reverts; 2: it burns every unit of gas it is given (an out-of-gas leg)
+    uint8 public failMode;
+    address public supplierRegistry; // zero: sell-side attribution off, as the pinned stack deploys
     function approveAsset(address asset) external { approvedQuoteAssets[asset] = true; }
     function setExecutionRate(uint256 value) external { executionRate = value; }
+    function setFailMode(uint8 value) external { failMode = value; }
     function poolRecords(address candidate) external view returns (address inventoryToken, bool exists) {
         return candidate == address(pool) ? (address(token), true) : (address(0), false);
     }
@@ -171,6 +178,8 @@ contract Gen4MockMarket {
         uint256
     ) public returns (uint256 tokensFilled, uint256 quotePaid) {
         recorder.record(200);
+        if (failMode == 1) revert("pool leg reverted");
+        if (failMode == 2) while (true) {} // exhausts the forwarded gas
         tokensFilled = pool.fill(amount, buyer);
         quotePaid = (tokensFilled * executionRate + 1e18 - 1) / 1e18;
         require(quotePaid <= maxCost, "over budget");
@@ -412,6 +421,69 @@ contract Gen4HookIntegrationTest is Test {
         uint256 beforeGas = gasleft();
         hook.runExactInput(address(pool), address(quote), address(quote), address(token), 5e18, address(this));
         emit log_named_uint("gen4_16_stale_attempts_gas", beforeGas - gasleft());
+    }
+
+    // Fail-soft legs (JUP-698 gate 1 finding, 26 Sep 2026): a leg that reverts or runs out of gas is
+    // rolled back inside the callee; exact input stops and refunds instead of reverting the swap.
+    function _assertPoolLegFailureRefunds(uint8 mode) internal {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        market.setFailMode(mode);
+        uint256 managerBefore = quote.balanceOf(address(manager));
+        (uint256 tokens, uint256 cost, uint256 refund,) = hook.runExactInput(
+            address(pool), address(quote), address(quote), address(token), 10e18, address(this)
+        );
+        assertEq(tokens, 0, "nothing filled");
+        assertEq(cost, 0, "nothing charged");
+        assertEq(refund, 10e18, "the whole input refunded");
+        assertEq(quote.balanceOf(address(manager)), managerBefore, "input back in the manager");
+        assertEq(quote.balanceOf(address(hook)), 0, "hook keeps nothing");
+        assertEq(pool.amount(), 1e18, "the node untouched");
+    }
+
+    function test_RevertingPoolLegRefundsInsteadOfRevertingTheSwap() public {
+        _assertPoolLegFailureRefunds(1);
+    }
+
+    function test_OutOfGasPoolLegIsCaughtAndRefunds() public {
+        _assertPoolLegFailureRefunds(2);
+    }
+
+    function test_RevertingListingLegRefundsAfterEarlierFills() public {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        token.mint(address(settlement), 2e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 2, 2e18, 1, 1)); // live listing behind node 1
+        settlement.setRevertSettle(true);
+        (uint256 tokens, uint256 cost, uint256 refund,) = hook.runExactInput(
+            address(pool), address(quote), address(quote), address(token), 10e18, address(this)
+        );
+        assertEq(tokens, 1e18, "the pool leg before the listing still delivered");
+        assertEq(cost, 1e18);
+        assertEq(refund, 9e18, "the rest refunded");
+        assertEq(quote.balanceOf(address(hook)), 0);
+    }
+
+    function test_FailedPoolLegOnExactOutputRevertsAsShortfallAndStrandsNothing() public {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        market.setFailMode(2);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4FillShortfall.selector, 0, 1e18));
+        hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+    }
+
+    function test_BelowMinimumAttemptGasExactInputRefundsWithoutAnAttempt() public {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        uint256 limit = hook.GEN4_FINALIZATION_GAS_RESERVE() + hook.GEN4_MIN_ATTEMPT_GAS() - 1;
+        (bool ok, bytes memory ret) = address(hook).call{gas: limit}(
+            abi.encodeCall(FlowstateC1HookHarness.runExactInput, (address(pool), address(quote), address(quote), address(token), 10e18, address(this)))
+        );
+        assertTrue(ok, "no revert");
+        (uint256 tokens,, uint256 refund,) = abi.decode(ret, (uint256, uint256, uint256, uint256));
+        assertEq(tokens, 0);
+        assertEq(refund, 10e18);
+        assertEq(recorder.length(), 0, "no leg attempted");
     }
 }
 

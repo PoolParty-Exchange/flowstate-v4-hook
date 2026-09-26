@@ -30,6 +30,29 @@ library Gen4Queue {
     /// @notice Inspect only the pool's bounded traversal and return the first
     ///         executable node plus inventory that may be consumed before the
     ///         listing boundary. Passing max uint64 means no listing boundary.
+    /// @notice The inventory a pool leg may take within `gasBudget`: executable nodes at or below
+    ///         `poolTail`, in queue order, each costing `nodeGas` (a fully pinned node, which the
+    ///         market's walk only steps over, `skipGas`), stopping before the budget would be passed.
+    function sizeForGas(
+        IGen4Pool.QueueNode[] memory nodes,
+        uint64 poolTail,
+        uint256 gasBudget,
+        uint256 nodeGas,
+        uint256 skipGas
+    ) internal pure returns (uint256 amount) {
+        uint256 used;
+        uint256 length = nodes.length;
+        for (uint256 i; i < length; ++i) {
+            IGen4Pool.QueueNode memory node = nodes[i];
+            if (node.index > poolTail) break;
+            uint256 available = uint256(node.amount) - uint256(node.pinned);
+            uint256 cost = available == 0 ? skipGas : nodeGas;
+            if (used + cost > gasBudget) break;
+            used += cost;
+            amount += available;
+        }
+    }
+
     function inspect(IGen4Pool.QueueNode[] memory nodes, uint64 poolTail)
         internal
         pure

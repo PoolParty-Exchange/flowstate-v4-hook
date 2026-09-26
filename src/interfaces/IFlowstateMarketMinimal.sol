@@ -22,6 +22,10 @@ interface IFlowstateMarketMinimal {
     /// @notice Whether an asset is currently approved as executable quote input.
     function approvedQuoteAssets(address asset) external view returns (bool);
 
+    /// @notice JUP-695 supplier registry; zero while sell-side attribution is off. Gen-4 reads it
+    ///         once per swap to plan pool-leg gas.
+    function supplierRegistry() external view returns (address);
+
     /// @notice JUP-696 passive-lane rate used by both pool and listing settlement.
     function previewRate(address pool, address asset) external view returns (bool ok, uint256 rate);
 

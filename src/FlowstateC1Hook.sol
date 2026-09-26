@@ -135,11 +135,32 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
 
     uint256 public constant GEN4_MAX_ATTEMPTS = 16;
     uint256 public constant GEN4_MAX_POOL_NODES = 50;
+    /// @notice Kept back for finalisation after the walk (accounting, jar fee, settle, refund).
     uint256 public constant GEN4_FINALIZATION_GAS_RESERVE = 400_000;
-    uint256 public constant GEN4_ATTEMPT_GAS_BUDGET = 6_000_000;
-    uint256 internal constant GEN4_READ_GAS_LIMIT = 750_000;
-    uint256 internal constant GEN4_QUEUE_READ_GAS_LIMIT = 750_000;
-    uint256 internal constant GEN4_EXECUTION_GAS_LIMIT = 1_500_000;
+    /// @notice Below reserve + this before an attempt, the walk stops: exact input refunds the
+    ///         unspent input, exact output reverts. A courtesy stop sized from measurement, not a
+    ///         guarantee: on the pinned stack the reads before an attempt cost 0.50M cold with one
+    ///         deposit and 1.81M cold from 50 deposits up (test/stack/read-gas-probe.test.cjs), a
+    ///         smallest pool leg about 0.32M. An under-gassed swap may still revert in a read.
+    uint256 public constant GEN4_MIN_ATTEMPT_GAS = 1_000_000;
+    /// @notice Pool leg sizing. The market's bounded buy measured ~0.27M plus ~41k per node walked
+    ///         (test/stack/gas-probe.test.cjs). With the market's supplier registry set (JUP-695),
+    ///         paying a sell-side partner adds up to ~134k per node, so the hook reads the registry
+    ///         once per swap and plans with the matching per-node figure. A fully pinned node is
+    ///         only stepped over. Underplanning is safe: a leg that runs out of gas is caught.
+    uint256 public constant GEN4_POOL_LEG_BASE_GAS = 400_000;
+    uint256 public constant GEN4_POOL_NODE_GAS = 60_000;
+    uint256 public constant GEN4_POOL_NODE_GAS_ATTRIBUTED = 180_000;
+    uint256 public constant GEN4_POOL_SKIP_GAS = 15_000;
+    /// @notice A listing sale measured 0.9M to 1.2M with partner cuts (JUP-697 fork acceptance).
+    uint256 public constant GEN4_LISTING_LEG_MIN_GAS = 1_400_000;
+    /// @notice Upper bound on the gas forwarded to one leg.
+    uint256 public constant GEN4_MAX_LEG_GAS = 10_000_000;
+    /// @dev What this frame keeps for itself after a leg returns, beyond the finalisation reserve.
+    uint256 internal constant GEN4_LEG_RETURN_GAS = 60_000;
+    uint256 internal constant GEN4_READ_GAS_LIMIT = 1_000_000;
+    uint256 internal constant GEN4_REGISTRY_READ_GAS = 50_000;
+    uint256 internal constant GEN4_QUEUE_READ_GAS_LIMIT = 1_000_000;
 
     uint8 internal constant LISTING_EMPTY = 0;
     uint8 internal constant LISTING_AVAILABLE = 1;
@@ -182,6 +203,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         uint256 totalAvailable;
         uint256 executable;
         uint256 rate;
+        uint64 boundary;
+        IGen4Pool.QueueNode[] nodes;
     }
 
     struct PairConfig {
@@ -842,9 +865,10 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         bool refundUnused;
         bool done;
         address token = Currency.unwrap(output);
+        uint256 nodeGas = _poolNodeGas();
 
         while (!done && attempts < GEN4_MAX_ATTEMPTS) {
-            if (gasleft() < GEN4_FINALIZATION_GAS_RESERVE + GEN4_ATTEMPT_GAS_BUDGET) {
+            if (gasleft() < GEN4_FINALIZATION_GAS_RESERVE + GEN4_MIN_ATTEMPT_GAS) {
                 refundUnused = true;
                 break;
             }
@@ -861,10 +885,19 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
 
             ++attempts;
             uint256 remainingBudget = budget - (totals.poolQuote + totals.listingQuote);
+            uint256 legGas = _legGas();
             if (source == Gen4Queue.Source.Pool) {
+                // never more nodes than the gas this leg can be given will walk
+                uint256 sized = _poolLegSize(pool, legGas, nodeGas);
+                if (sized == 0) {
+                    refundUnused = true;
+                    break;
+                }
+                if (sized < poolCap) poolCap = sized;
                 uint256 amount = _affordable(poolCap, remainingBudget, pool.rate);
                 if (amount == 0) break;
-                (uint256 poolTokens, uint256 poolQuote) = market.buyFromPoolBounded{gas: GEN4_EXECUTION_GAS_LIMIT}(
+                // a failed leg rolls back inside the market: stop and refund, never revert the swap
+                try market.buyFromPoolBounded{gas: legGas}(
                     cfg.marketPool,
                     cfg.marketAsset,
                     amount,
@@ -873,22 +906,29 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                     remainingBudget,
                     0,
                     0
-                );
-                if (poolTokens == 0) {
+                ) returns (uint256 poolTokens, uint256 poolQuote) {
+                    if (poolTokens == 0) {
+                        refundUnused = true;
+                        break;
+                    }
+                    Gen4Accounting.recordPool(totals, poolTokens, poolQuote);
+                } catch {
                     refundUnused = true;
                     break;
                 }
-                Gen4Accounting.recordPool(totals, poolTokens, poolQuote);
                 continue;
             }
 
+            if (legGas < GEN4_LISTING_LEG_MIN_GAS) {
+                refundUnused = true;
+                break;
+            }
             uint256 maxAmount = listing.state == LISTING_DEAD || pool.rate == 0
                 ? 1
                 : _affordable(listing.available, remainingBudget, pool.rate);
             if (maxAmount == 0) break;
             uint256 maxQuote = listing.state == LISTING_DEAD || pool.rate == 0 ? 0 : _quoteFor(maxAmount, pool.rate);
-            (uint8 outcome, uint64 actualId, uint256 listingTokens, uint256 listingQuote) =
-                listingSettlement.settleHead{gas: GEN4_EXECUTION_GAS_LIMIT}(
+            try listingSettlement.settleHead{gas: legGas}(
                 token,
                 listing.id,
                 listing.version,
@@ -898,20 +938,25 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                 address(this),
                 resellerCode,
                 0
-            );
-            if (outcome == LISTING_SOLD) {
-                if (actualId != listing.id || listingTokens == 0 || listingQuote > maxQuote) {
+            ) returns (uint8 outcome, uint64 actualId, uint256 listingTokens, uint256 listingQuote) {
+                if (outcome == LISTING_SOLD) {
+                    if (actualId != listing.id || listingTokens == 0 || listingQuote > maxQuote) {
+                        revert UnexpectedListingOutcome(outcome);
+                    }
+                    Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, true, listingTokens, listingQuote);
+                } else if (outcome == LISTING_SKIPPED || outcome == LISTING_STALE) {
+                    Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+                } else if (outcome == LISTING_CLOSED) {
+                    Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+                    refundUnused = true;
+                    done = true;
+                } else {
                     revert UnexpectedListingOutcome(outcome);
                 }
-                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, true, listingTokens, listingQuote);
-            } else if (outcome == LISTING_SKIPPED || outcome == LISTING_STALE) {
-                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
-            } else if (outcome == LISTING_CLOSED) {
-                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+            } catch {
+                // a listing sale that reverts is rolled back by the settlement: stop and refund
                 refundUnused = true;
-                done = true;
-            } else {
-                revert UnexpectedListingOutcome(outcome);
+                break;
             }
         }
 
@@ -946,9 +991,10 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         Gen4Accounting.Totals memory totals;
         uint256 attempts;
         address token = Currency.unwrap(output);
+        uint256 nodeGas = _poolNodeGas();
 
         while (Gen4Accounting.remainingOutput(totals, target) != 0 && attempts < GEN4_MAX_ATTEMPTS) {
-            uint256 requiredGas = GEN4_FINALIZATION_GAS_RESERVE + GEN4_ATTEMPT_GAS_BUDGET;
+            uint256 requiredGas = GEN4_FINALIZATION_GAS_RESERVE + GEN4_MIN_ATTEMPT_GAS;
             if (gasleft() < requiredGas) revert Gen4InsufficientGas(gasleft(), requiredGas);
             ListingCandidate memory listing = _inspectListing(token);
             PoolCandidate memory pool = _inspectPool(cfg, listing, token);
@@ -960,11 +1006,15 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
 
             ++attempts;
             uint256 remaining = Gen4Accounting.remainingOutput(totals, target);
+            uint256 legGas = _legGas();
             if (source == Gen4Queue.Source.Pool) {
+                uint256 sized = _poolLegSize(pool, legGas, nodeGas);
+                if (sized == 0) break;
+                if (sized < poolCap) poolCap = sized;
                 uint256 amount = poolCap < remaining ? poolCap : remaining;
                 uint256 poolPrefund = _quoteFor(amount, pool.rate);
                 _prefundInput(input, poolPrefund);
-                (uint256 poolTokens, uint256 poolQuote) = market.buyFromPoolBounded{gas: GEN4_EXECUTION_GAS_LIMIT}(
+                try market.buyFromPoolBounded{gas: legGas}(
                     cfg.marketPool,
                     cfg.marketAsset,
                     amount,
@@ -973,20 +1023,25 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                     poolPrefund,
                     0,
                     0
-                );
-                if (poolQuote > poolPrefund || poolTokens == 0) revert Gen4FillShortfall(poolTokens, amount);
-                if (poolPrefund > poolQuote) _returnPrefund(input, poolPrefund - poolQuote);
-                Gen4Accounting.recordPool(totals, poolTokens, poolQuote);
+                ) returns (uint256 poolTokens, uint256 poolQuote) {
+                    if (poolQuote > poolPrefund || poolTokens == 0) revert Gen4FillShortfall(poolTokens, amount);
+                    if (poolPrefund > poolQuote) _returnPrefund(input, poolPrefund - poolQuote);
+                    Gen4Accounting.recordPool(totals, poolTokens, poolQuote);
+                } catch {
+                    // rolled back inside the market; the shortfall check below reverts the swap
+                    _returnPrefund(input, poolPrefund);
+                    break;
+                }
                 continue;
             }
 
+            if (legGas < GEN4_LISTING_LEG_MIN_GAS) break;
             uint256 maxAmount = listing.state == LISTING_DEAD
                 ? 1
                 : (listing.available < remaining ? listing.available : remaining);
             uint256 listingPrefund = listing.state == LISTING_DEAD ? 0 : _quoteFor(maxAmount, pool.rate);
             if (listingPrefund != 0) _prefundInput(input, listingPrefund);
-            (uint8 outcome, uint64 actualId, uint256 listingTokens, uint256 listingQuote) =
-                listingSettlement.settleHead{gas: GEN4_EXECUTION_GAS_LIMIT}(
+            try listingSettlement.settleHead{gas: legGas}(
                 token,
                 listing.id,
                 listing.version,
@@ -996,21 +1051,25 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                 address(this),
                 resellerCode,
                 0
-            );
-            if (outcome == LISTING_SOLD) {
-                if (actualId != listing.id || listingTokens == 0 || listingQuote > listingPrefund) {
+            ) returns (uint8 outcome, uint64 actualId, uint256 listingTokens, uint256 listingQuote) {
+                if (outcome == LISTING_SOLD) {
+                    if (actualId != listing.id || listingTokens == 0 || listingQuote > listingPrefund) {
+                        revert UnexpectedListingOutcome(outcome);
+                    }
+                    if (listingPrefund > listingQuote) _returnPrefund(input, listingPrefund - listingQuote);
+                    Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, true, listingTokens, listingQuote);
+                } else if (
+                    outcome == LISTING_SKIPPED || outcome == LISTING_STALE || outcome == LISTING_CLOSED
+                ) {
+                    if (listingPrefund != 0) _returnPrefund(input, listingPrefund);
+                    Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+                    if (outcome == LISTING_CLOSED) break;
+                } else {
                     revert UnexpectedListingOutcome(outcome);
                 }
-                if (listingPrefund > listingQuote) _returnPrefund(input, listingPrefund - listingQuote);
-                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, true, listingTokens, listingQuote);
-            } else if (
-                outcome == LISTING_SKIPPED || outcome == LISTING_STALE || outcome == LISTING_CLOSED
-            ) {
+            } catch {
                 if (listingPrefund != 0) _returnPrefund(input, listingPrefund);
-                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
-                if (outcome == LISTING_CLOSED) break;
-            } else {
-                revert UnexpectedListingOutcome(outcome);
+                break;
             }
         }
 
@@ -1073,6 +1132,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         }
         uint64 boundary = listing.state == LISTING_EMPTY ? type(uint64).max : listing.poolTail;
         (c.firstIndex, c.boundedAvailable, c.totalAvailable) = Gen4Queue.inspect(nodes, boundary);
+        c.boundary = boundary;
+        c.nodes = nodes;
 
         uint256 marketMax;
         try market.maxBuy{gas: GEN4_READ_GAS_LIMIT}(cfg.marketPool, cfg.marketAsset) returns (
@@ -1090,6 +1151,33 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
             else c.executable = 0;
         } catch {
             revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
+        }
+    }
+
+    /// @dev Gas to forward to one leg: everything but the finalisation reserve and what this frame
+    ///      needs once the call returns, capped. EIP-150 keeps a further 1/64 back.
+    function _legGas() internal view returns (uint256 g) {
+        uint256 keep = GEN4_FINALIZATION_GAS_RESERVE + GEN4_LEG_RETURN_GAS;
+        uint256 left = gasleft();
+        if (left <= keep) return 0;
+        g = left - keep;
+        if (g > GEN4_MAX_LEG_GAS) g = GEN4_MAX_LEG_GAS;
+    }
+
+    /// @dev Tokens a pool leg may take within `legGas`: the executable inventory of the inspected
+    ///      nodes at or below the boundary, in queue order, up to what the walk can afford.
+    function _poolLegSize(PoolCandidate memory pool, uint256 legGas, uint256 nodeGas) internal pure returns (uint256) {
+        if (legGas <= GEN4_POOL_LEG_BASE_GAS) return 0;
+        return Gen4Queue.sizeForGas(pool.nodes, pool.boundary, legGas - GEN4_POOL_LEG_BASE_GAS, nodeGas, GEN4_POOL_SKIP_GAS);
+    }
+
+    /// @dev Per-node planning gas for this swap: the attributed figure whenever the market has a
+    ///      supplier registry set, or its answer cannot be read.
+    function _poolNodeGas() internal view returns (uint256) {
+        try market.supplierRegistry{gas: GEN4_REGISTRY_READ_GAS}() returns (address registry) {
+            return registry == address(0) ? GEN4_POOL_NODE_GAS : GEN4_POOL_NODE_GAS_ATTRIBUTED;
+        } catch {
+            return GEN4_POOL_NODE_GAS_ATTRIBUTED;
         }
     }
 

@@ -280,6 +280,26 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       assert.ok(retired >= 1);
     });
 
+    it("a 50-deposit buy under tight gas limits fills what the gas allows and refunds the rest, never reverting", async () => {
+      const s = await stack();
+      for (let i = 0; i < 49; i++) await s.deposit(TOK(50));
+      const full = TOK(100) + 49n * TOK(50);
+      const rows = [];
+      for (const gasLimit of [2_500_000, 3_500_000, 4_500_000, 7_000_000]) {
+        const snap = await network.provider.send("evm_snapshot", []);
+        try {
+          const rc = await s.buy({ amountSpecified: -(20_000n * 10n ** 6n) }, { refundable: true, gasLimit });
+          const got = fills(rc, s).reduce((t, x) => t + x.amount, 0n);
+          rows.push({ gasLimit, got, gasUsed: rc.gasUsed, reverted: false });
+        } catch (e) { rows.push({ gasLimit, reverted: true }); }
+        finally { await network.provider.send("evm_revert", [snap]); }
+      }
+      console.log("      " + rows.map((r) => `${r.gasLimit}: ${r.reverted ? "REVERTED" : `${r.got / 10n ** 18n} of ${full / 10n ** 18n} tokens, gas ${r.gasUsed}`}`).join("; "));
+      for (const r of rows) assert.equal(r.reverted, false, `reverted at ${r.gasLimit}`);
+      assert.ok(rows.some((r) => r.got > 0n && r.got < full), "some limit fills part and refunds the rest");
+      assert.equal(rows[rows.length - 1].got, full, "enough gas fills everything");
+    });
+
     it("the lowest gas limit at which a pool-only swap fills (routers must send at least this)", async () => {
       const s = await stack();
       const at = async (gasLimit) => {
