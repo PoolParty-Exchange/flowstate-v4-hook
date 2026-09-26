@@ -169,9 +169,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     uint256 internal constant GEN4_LEG_RETURN_GAS = 60_000;
     /// @dev Caps on the queue and listing reads, whose cost is bounded by the 50-node window and
     ///      the registry's own walk bounds (measured cold: peek 90k, tokenQueueEnds 16k, queue 477k).
-    ///      maxBuy and price are NOT capped: they run the venue evaluation, whose cost grows with the
-    ///      venue's initialized ticks (review F2: ~19k per tick, 1.57M at 72 ticks), so they get the
-    ///      gas that is left, as the legs do.
+    ///      maxBuy and price are not held to this cap: they run the venue evaluation, whose cost grows
+    ///      with the venue's initialized ticks (review F2: ~19k per tick, 1.57M at 72 ticks), so they
+    ///      get the gas that is left (at most GEN4_MAX_LEG_GAS), as the legs do.
     uint256 internal constant GEN4_READ_GAS_LIMIT = 1_000_000;
     uint256 internal constant GEN4_REGISTRY_READ_GAS = 50_000;
     uint8 internal constant STOP_GAS = 1;
@@ -1182,7 +1182,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
             c.readFailed = true;
             return c;
         }
-        // the market's bounded buy re-runs this evaluation: plan the leg's base on what it cost here
+        // the market's bounded buy re-runs this evaluation (warm): use what it cost here as an estimate
+        // of the leg's base, never below the measured floor; a leg that still runs short is caught
         uint256 spent = before - gasleft();
         c.legBase = spent > GEN4_POOL_LEG_BASE_GAS ? spent : GEN4_POOL_LEG_BASE_GAS;
         c.executable = c.totalAvailable < marketMax ? c.totalAvailable : marketMax;
@@ -1217,8 +1218,10 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
 
     /// @dev Per-node planning gas for this swap, from two settings read once: whether the market pays
     ///      sell-side partners (supplier registry set) and whether proceeds can recycle into this
-    ///      pool's buy-back (buy-back on with the traded asset). A setting that cannot be read counts
-    ///      as on.
+    ///      pool's buy-back (buy-back on with the traded asset). A getter that reverts or runs out of
+    ///      gas counts as on. Malformed return data from a getter reverts in this frame (try/catch does
+    ///      not cover decoding): the market and pool are FlowState's own contracts, fixed at pair
+    ///      registration and upgraded only through the timelock (Robin pass 58).
     function _poolNodeGas(PairConfig memory cfg) internal view returns (uint256) {
         bool attributed = true;
         try market.supplierRegistry{gas: GEN4_REGISTRY_READ_GAS}() returns (address registry) {
