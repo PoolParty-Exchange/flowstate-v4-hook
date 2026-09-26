@@ -243,12 +243,17 @@ async function main() {
   const [, , , , cardNext] = await rv.slot0();
   for (let n = Number(cardNext) + 100; n <= 3600; n += 100) await (await rv.increaseObservationCardinalityNext(Math.min(n, 3600), { gasLimit: 5_000_000 })).wait();
   if (Number((await rv.slot0())[4]) < 3600) await (await rv.increaseObservationCardinalityNext(3600, { gasLimit: 5_000_000 })).wait();
-  await (await m.connect(admin).setRegistrarParams(500_000_000n, 400_000_000n, 723, V3_FACTORY)).wait();
+  // Depth floors for this section only: $100 to open, $80 to stay (fork fixture). The live ROBINCAT/WETH
+  // venue is thin (0.101 WETH of depth at block 72,839,953, 0.325 at 72,856,778), and this section tests the hook with WETH as
+  // currency0, not venue qualification. The measured depth is printed below.
+  await (await m.connect(admin).setRegistrarParams(100_000_000n, 80_000_000n, 723, V3_FACTORY)).wait();
   await (await m.connect(admin).registerVenue(rPoolAddr, ROBINCAT_WETH_V3, { gasLimit: 20_000_000 })).wait();
+  const rVenue = await m.evaluateVenue(rPoolAddr);
+  console.log(`   venue depth ${ethers.formatUnits(rVenue.depthQuote, 18)} WETH; depthOk ${rVenue.depthOk} (fork floors $100 open / $80 stay)`);
   await (await m.connect(tl48).openPassiveLane(rPoolAddr)).wait();
   const [rWhy, rRate] = await settlement.price(ROBINCAT, WETH);
   if (rWhy !== 0n) {
-    console.log(`   ! NOT COVERED on this fork: ROBINCAT not sellable (why ${rWhy})`);
+    fail(`ROBINCAT not sellable on this fork (why ${rWhy}): the WETH-as-currency0 case was not exercised`);
   } else {
     await (await hook.registerPair(WETH, ROBINCAT, rPoolAddr, 16)).wait();
     const rKey = keyOf(WETH, ROBINCAT);
