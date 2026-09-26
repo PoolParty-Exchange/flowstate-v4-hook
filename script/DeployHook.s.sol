@@ -45,7 +45,11 @@ contract DeployHook is Script {
         // baked into the CREATE2 init code, so they are part of the mined salt too.
         address tokenJar = vm.envAddress("TOKEN_JAR");
         uint16 jarFeeBps = uint16(vm.envUint("JAR_FEE_BPS"));
-        FlowstateC1Hook hook = new FlowstateC1Hook{salt: salt}(poolManager, market, owner, weth9, tokenJar, jarFeeBps);
+        address listingRegistry = vm.envAddress("LISTING_REGISTRY");
+        address listingSettlement = vm.envAddress("LISTING_SETTLEMENT");
+        FlowstateC1Hook hook = new FlowstateC1Hook{salt: salt}(
+            poolManager, market, owner, weth9, tokenJar, jarFeeBps, listingRegistry, listingSettlement
+        );
         require(address(hook) == expected, "deployed address != mined address");
 
         // quote = aeWETH (the wrapper; native-quoted V4 pools reach the same

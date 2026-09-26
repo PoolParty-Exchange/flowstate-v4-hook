@@ -35,7 +35,10 @@ contract MineHookAddress is Script {
         address weth9 = vm.envAddress("AEWETH");
         address tokenJar = vm.envAddress("TOKEN_JAR"); // JUP-621
         uint16 jarFeeBps = uint16(vm.envUint("JAR_FEE_BPS"));
-        bytes memory constructorArgs = abi.encode(poolManager, market, owner, weth9, tokenJar, jarFeeBps);
+        address listingRegistry = vm.envAddress("LISTING_REGISTRY");
+        address listingSettlement = vm.envAddress("LISTING_SETTLEMENT");
+        bytes memory constructorArgs =
+            abi.encode(poolManager, market, owner, weth9, tokenJar, jarFeeBps, listingRegistry, listingSettlement);
 
         (address hookAddress, bytes32 salt) =
             HookMiner.find(CREATE2_DEPLOYER, flags, type(FlowstateC1Hook).creationCode, constructorArgs);

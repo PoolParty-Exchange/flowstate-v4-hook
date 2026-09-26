@@ -164,10 +164,10 @@ abstract contract ForkTestBase is RealStackDeployer {
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps())
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), address(0), address(0))
         );
         hook = new FlowstateC1Hook{salt: salt}(
-            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps()
+            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), address(0), address(0)
         );
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
 
