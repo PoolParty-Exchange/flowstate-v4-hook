@@ -87,6 +87,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     error Gen4FillShortfall(uint256 filled, uint256 requested);
     error Gen4AttemptCapExceeded(uint256 attempts);
     error Gen4InsufficientGas(uint256 remaining, uint256 required);
+    /// @notice Exact input stopped (gas, a failed read, a failed leg) before anything filled.
+    error Gen4NothingFilled(uint8 reason);
 
     // -------------------------------------------------------------------------
     // Immutable wiring
@@ -143,14 +145,21 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         deposit and 1.81M cold from 50 deposits up (test/stack/read-gas-probe.test.cjs), a
     ///         smallest pool leg about 0.32M. An under-gassed swap may still revert in a read.
     uint256 public constant GEN4_MIN_ATTEMPT_GAS = 1_000_000;
-    /// @notice Pool leg sizing. The market's bounded buy measured ~0.27M plus ~41k per node walked
-    ///         (test/stack/gas-probe.test.cjs). With the market's supplier registry set (JUP-695),
-    ///         paying a sell-side partner adds up to ~134k per node, so the hook reads the registry
-    ///         once per swap and plans with the matching per-node figure. A fully pinned node is
-    ///         only stepped over. Underplanning is safe: a leg that runs out of gas is caught.
-    uint256 public constant GEN4_POOL_LEG_BASE_GAS = 400_000;
-    uint256 public constant GEN4_POOL_NODE_GAS = 60_000;
-    uint256 public constant GEN4_POOL_NODE_GAS_ATTRIBUTED = 180_000;
+    /// @notice Pool leg planning, from EXECUTION gas (eth_estimateGas, before end-of-transaction
+    ///         refunds) of the market's bounded buy on the pinned stack
+    ///         (test/stack/exec-gas-probe.test.cjs): 326k base + 55.7k per node plain; 414k base +
+    ///         109k per node when proceeds recycle into the buy-back (buy-back on in the traded
+    ///         asset, owner opted in). Paying a sell-side partner (market supplier registry set,
+    ///         JUP-695) adds up to ~134k per node. The hook reads both settings once per swap and
+    ///         plans with the matching figure (+~15%), assuming the worst when a read fails. The
+    ///         base is the larger of this floor and what the market's own maxBuy cost in this
+    ///         swap, since the buy re-runs that venue evaluation. A fully pinned node is only
+    ///         stepped over. A leg that still runs out of gas is caught (see _buyGen4ExactInput).
+    uint256 public constant GEN4_POOL_LEG_BASE_GAS = 450_000;
+    uint256 public constant GEN4_POOL_NODE_GAS = 65_000;
+    uint256 public constant GEN4_POOL_NODE_GAS_RECYCLED = 125_000;
+    uint256 public constant GEN4_POOL_NODE_GAS_ATTRIBUTED = 220_000;
+    uint256 public constant GEN4_POOL_NODE_GAS_ATTRIBUTED_RECYCLED = 280_000;
     uint256 public constant GEN4_POOL_SKIP_GAS = 15_000;
     /// @notice A listing sale measured 0.9M to 1.2M with partner cuts (JUP-697 fork acceptance).
     uint256 public constant GEN4_LISTING_LEG_MIN_GAS = 1_400_000;
@@ -158,8 +167,17 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     uint256 public constant GEN4_MAX_LEG_GAS = 10_000_000;
     /// @dev What this frame keeps for itself after a leg returns, beyond the finalisation reserve.
     uint256 internal constant GEN4_LEG_RETURN_GAS = 60_000;
+    /// @dev Caps on the queue and listing reads, whose cost is bounded by the 50-node window and
+    ///      the registry's own walk bounds (measured cold: peek 90k, tokenQueueEnds 16k, queue 477k).
+    ///      maxBuy and price are NOT capped: they run the venue evaluation, whose cost grows with the
+    ///      venue's initialized ticks (review F2: ~19k per tick, 1.57M at 72 ticks), so they get the
+    ///      gas that is left, as the legs do.
     uint256 internal constant GEN4_READ_GAS_LIMIT = 1_000_000;
     uint256 internal constant GEN4_REGISTRY_READ_GAS = 50_000;
+    uint8 internal constant STOP_GAS = 1;
+    uint8 internal constant STOP_READ = 2;
+    uint8 internal constant STOP_POOL_LEG = 3;
+    uint8 internal constant STOP_LISTING_LEG = 4;
     uint256 internal constant GEN4_QUEUE_READ_GAS_LIMIT = 1_000_000;
 
     uint8 internal constant LISTING_EMPTY = 0;
@@ -205,6 +223,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         uint256 rate;
         uint64 boundary;
         IGen4Pool.QueueNode[] nodes;
+        uint256 legBase;
+        bool readFailed;
     }
 
     struct PairConfig {
@@ -362,6 +382,10 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                 revert ListingWiringMismatch(_listingRegistry, _listingSettlement);
             }
             if (IGen4ListingSettlement(_listingSettlement).registry() != _listingRegistry) {
+                revert ListingWiringMismatch(_listingRegistry, _listingSettlement);
+            }
+            // both directions: the settlement this hook approves must be the one the registry is bound to
+            if (IGen4ListingRegistry(_listingRegistry).settlement() != _listingSettlement) {
                 revert ListingWiringMismatch(_listingRegistry, _listingSettlement);
             }
             address registryMarket = IGen4ListingRegistry(_listingRegistry).market();
@@ -865,15 +889,21 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         bool refundUnused;
         bool done;
         address token = Currency.unwrap(output);
-        uint256 nodeGas = _poolNodeGas();
+        uint256 nodeGas = _poolNodeGas(cfg);
 
         while (!done && attempts < GEN4_MAX_ATTEMPTS) {
             if (gasleft() < GEN4_FINALIZATION_GAS_RESERVE + GEN4_MIN_ATTEMPT_GAS) {
+                _softStop(totals, STOP_GAS);
                 refundUnused = true;
                 break;
             }
             ListingCandidate memory listing = _inspectListing(token);
             PoolCandidate memory pool = _inspectPool(cfg, listing, token);
+            if (pool.readFailed) {
+                _softStop(totals, STOP_READ);
+                refundUnused = true;
+                break;
+            }
             bool hasListing = listing.state != LISTING_EMPTY;
             uint256 poolCap = hasListing ? pool.boundedAvailable : pool.totalAvailable;
             if (poolCap > pool.executable) poolCap = pool.executable;
@@ -890,14 +920,17 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                 // never more nodes than the gas this leg can be given will walk
                 uint256 sized = _poolLegSize(pool, legGas, nodeGas);
                 if (sized == 0) {
+                    _softStop(totals, STOP_GAS);
                     refundUnused = true;
                     break;
                 }
                 if (sized < poolCap) poolCap = sized;
                 uint256 amount = _affordable(poolCap, remainingBudget, pool.rate);
                 if (amount == 0) break;
-                // a failed leg rolls back inside the market: stop and refund, never revert the swap
-                try market.buyFromPoolBounded{gas: legGas}(
+                // A leg that reverts or runs out of gas is rolled back inside the market. After a
+                // partial fill the walk stops and refunds the rest; with nothing filled the swap
+                // reverts (_softStop). Gas is re-read at the call (Robin pass 57).
+                try market.buyFromPoolBounded{gas: _legGas()}(
                     cfg.marketPool,
                     cfg.marketAsset,
                     amount,
@@ -913,6 +946,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                     }
                     Gen4Accounting.recordPool(totals, poolTokens, poolQuote);
                 } catch {
+                    _softStop(totals, STOP_POOL_LEG);
                     refundUnused = true;
                     break;
                 }
@@ -920,6 +954,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
             }
 
             if (legGas < GEN4_LISTING_LEG_MIN_GAS) {
+                _softStop(totals, STOP_GAS);
                 refundUnused = true;
                 break;
             }
@@ -928,7 +963,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                 : _affordable(listing.available, remainingBudget, pool.rate);
             if (maxAmount == 0) break;
             uint256 maxQuote = listing.state == LISTING_DEAD || pool.rate == 0 ? 0 : _quoteFor(maxAmount, pool.rate);
-            try listingSettlement.settleHead{gas: legGas}(
+            try listingSettlement.settleHead{gas: _legGas()}(
                 token,
                 listing.id,
                 listing.version,
@@ -954,7 +989,8 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                     revert UnexpectedListingOutcome(outcome);
                 }
             } catch {
-                // a listing sale that reverts is rolled back by the settlement: stop and refund
+                // a listing sale that reverts is rolled back by the settlement: as a failed pool leg
+                _softStop(totals, STOP_LISTING_LEG);
                 refundUnused = true;
                 break;
             }
@@ -991,13 +1027,14 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         Gen4Accounting.Totals memory totals;
         uint256 attempts;
         address token = Currency.unwrap(output);
-        uint256 nodeGas = _poolNodeGas();
+        uint256 nodeGas = _poolNodeGas(cfg);
 
         while (Gen4Accounting.remainingOutput(totals, target) != 0 && attempts < GEN4_MAX_ATTEMPTS) {
             uint256 requiredGas = GEN4_FINALIZATION_GAS_RESERVE + GEN4_MIN_ATTEMPT_GAS;
             if (gasleft() < requiredGas) revert Gen4InsufficientGas(gasleft(), requiredGas);
             ListingCandidate memory listing = _inspectListing(token);
             PoolCandidate memory pool = _inspectPool(cfg, listing, token);
+            if (pool.readFailed) revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
             bool hasListing = listing.state != LISTING_EMPTY;
             uint256 poolCap = hasListing ? pool.boundedAvailable : pool.totalAvailable;
             if (poolCap > pool.executable) poolCap = pool.executable;
@@ -1014,7 +1051,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                 uint256 amount = poolCap < remaining ? poolCap : remaining;
                 uint256 poolPrefund = _quoteFor(amount, pool.rate);
                 _prefundInput(input, poolPrefund);
-                try market.buyFromPoolBounded{gas: legGas}(
+                try market.buyFromPoolBounded{gas: _legGas()}(
                     cfg.marketPool,
                     cfg.marketAsset,
                     amount,
@@ -1041,7 +1078,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
                 : (listing.available < remaining ? listing.available : remaining);
             uint256 listingPrefund = listing.state == LISTING_DEAD ? 0 : _quoteFor(maxAmount, pool.rate);
             if (listingPrefund != 0) _prefundInput(input, listingPrefund);
-            try listingSettlement.settleHead{gas: legGas}(
+            try listingSettlement.settleHead{gas: _legGas()}(
                 token,
                 listing.id,
                 listing.version,
@@ -1135,27 +1172,34 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         c.boundary = boundary;
         c.nodes = nodes;
 
+        // maxBuy and price run the venue evaluation (review F2): they get the gas that is left, and a
+        // failure is reported to the caller (exact input stops or reverts, exact output reverts)
         uint256 marketMax;
-        try market.maxBuy{gas: GEN4_READ_GAS_LIMIT}(cfg.marketPool, cfg.marketAsset) returns (
-            uint256 maxTokens, uint256
-        ) {
+        uint256 before = gasleft();
+        try market.maxBuy{gas: _legGas()}(cfg.marketPool, cfg.marketAsset) returns (uint256 maxTokens, uint256) {
             marketMax = maxTokens;
         } catch {
-            revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
+            c.readFailed = true;
+            return c;
         }
+        // the market's bounded buy re-runs this evaluation: plan the leg's base on what it cost here
+        uint256 spent = before - gasleft();
+        c.legBase = spent > GEN4_POOL_LEG_BASE_GAS ? spent : GEN4_POOL_LEG_BASE_GAS;
         c.executable = c.totalAvailable < marketMax ? c.totalAvailable : marketMax;
-        try listingSettlement.price{gas: GEN4_READ_GAS_LIMIT}(token, cfg.marketAsset) returns (
-            uint8 why, uint256 rate
-        ) {
+        try listingSettlement.price{gas: _legGas()}(token, cfg.marketAsset) returns (uint8 why, uint256 rate) {
             if (why == 0) c.rate = rate;
             else c.executable = 0;
         } catch {
-            revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
+            c.readFailed = true;
+            return c;
         }
     }
 
-    /// @dev Gas to forward to one leg: everything but the finalisation reserve and what this frame
-    ///      needs once the call returns, capped. EIP-150 keeps a further 1/64 back.
+    /// @dev Gas to forward to one leg or venue read: everything but the finalisation reserve and what
+    ///      this frame needs once the call returns, capped. Read it at the call site: the callee gets at
+    ///      most this (EIP-150 only binds when it exceeds 63/64 of what is left), so after a callee
+    ///      that runs out of gas this frame keeps the reserve plus the return allowance, less what it
+    ///      spent between this read and the call.
     function _legGas() internal view returns (uint256 g) {
         uint256 keep = GEN4_FINALIZATION_GAS_RESERVE + GEN4_LEG_RETURN_GAS;
         uint256 left = gasleft();
@@ -1167,18 +1211,39 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     /// @dev Tokens a pool leg may take within `legGas`: the executable inventory of the inspected
     ///      nodes at or below the boundary, in queue order, up to what the walk can afford.
     function _poolLegSize(PoolCandidate memory pool, uint256 legGas, uint256 nodeGas) internal pure returns (uint256) {
-        if (legGas <= GEN4_POOL_LEG_BASE_GAS) return 0;
-        return Gen4Queue.sizeForGas(pool.nodes, pool.boundary, legGas - GEN4_POOL_LEG_BASE_GAS, nodeGas, GEN4_POOL_SKIP_GAS);
+        if (legGas <= pool.legBase) return 0;
+        return Gen4Queue.sizeForGas(pool.nodes, pool.boundary, legGas - pool.legBase, nodeGas, GEN4_POOL_SKIP_GAS);
     }
 
-    /// @dev Per-node planning gas for this swap: the attributed figure whenever the market has a
-    ///      supplier registry set, or its answer cannot be read.
-    function _poolNodeGas() internal view returns (uint256) {
+    /// @dev Per-node planning gas for this swap, from two settings read once: whether the market pays
+    ///      sell-side partners (supplier registry set) and whether proceeds can recycle into this
+    ///      pool's buy-back (buy-back on with the traded asset). A setting that cannot be read counts
+    ///      as on.
+    function _poolNodeGas(PairConfig memory cfg) internal view returns (uint256) {
+        bool attributed = true;
         try market.supplierRegistry{gas: GEN4_REGISTRY_READ_GAS}() returns (address registry) {
-            return registry == address(0) ? GEN4_POOL_NODE_GAS : GEN4_POOL_NODE_GAS_ATTRIBUTED;
-        } catch {
-            return GEN4_POOL_NODE_GAS_ATTRIBUTED;
-        }
+            attributed = registry != address(0);
+        } catch {}
+        bool recycled = true;
+        try IGen4Pool(cfg.marketPool).buyBackEnabled{gas: GEN4_REGISTRY_READ_GAS}() returns (bool enabled) {
+            if (!enabled) {
+                recycled = false;
+            } else {
+                try IGen4Pool(cfg.marketPool).buybackAsset{gas: GEN4_REGISTRY_READ_GAS}() returns (address asset) {
+                    recycled = asset == cfg.marketAsset;
+                } catch {}
+            }
+        } catch {}
+        if (attributed) return recycled ? GEN4_POOL_NODE_GAS_ATTRIBUTED_RECYCLED : GEN4_POOL_NODE_GAS_ATTRIBUTED;
+        return recycled ? GEN4_POOL_NODE_GAS_RECYCLED : GEN4_POOL_NODE_GAS;
+    }
+
+    /// @dev Exact input: a stop caused by gas, a failed read or a failed leg keeps what already filled
+    ///      and refunds the rest, but with NOTHING filled it reverts, so an under-gassed swap fails
+    ///      loudly and gas estimators search upward instead of settling on a limit that buys nothing
+    ///      (review F3).
+    function _softStop(Gen4Accounting.Totals memory totals, uint8 reason) internal pure {
+        if (totals.poolTokens + totals.listingTokens == 0) revert Gen4NothingFilled(reason);
     }
 
     function _affordable(uint256 available, uint256 budget, uint256 rate) internal pure returns (uint256 amount) {

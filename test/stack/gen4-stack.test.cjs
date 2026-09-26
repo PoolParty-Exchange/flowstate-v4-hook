@@ -32,16 +32,56 @@ function artifact(file, name) {
   return { abi: a.abi, bytecode: a.bytecode.object };
 }
 
+/** Review F2: a flat venue like registerFlatVenue's, but at tick spacing 10 (the registrar's
+ *  minimum) with `positions` one-wei positions (2 initialized ticks each) inside the walk window,
+ *  which every venue evaluation (maxBuy, price, the pool's own buy) walks tick by tick. */
+async function dustyVenue(fx, pool, positions) {
+  const Q192 = 1n << 192n, RATE = H.RATE ?? 2_000_000n;
+  const isqrt = (n) => { if (n < 2n) return n; let x = 1n << BigInt(Math.ceil(n.toString(2).length / 2)); for (;;) { const y = (x + n / x) >> 1n; if (y >= x) break; x = y; } while (x * x > n) x--; while ((x + 1n) * (x + 1n) <= n) x++; return x; };
+  const tokenAddr = await pool.inventoryToken();
+  const srcIsToken0 = BigInt(tokenAddr) < BigInt(fx.usdc.target);
+  const [t0, t1] = srcIsToken0 ? [tokenAddr, fx.usdc.target] : [fx.usdc.target, tokenAddr];
+  const venue = await (await ethers.getContractFactory("MockV3VenueRing")).deploy(t0, t1, 10);
+  await venue.increaseObservationCardinalityNext(3600);
+  let sq;
+  if (srcIsToken0) sq = isqrt((RATE * Q192) / 10n ** 18n);
+  else { sq = isqrt((Q192 * 10n ** 18n) / RATE); if (sq * sq < (Q192 * 10n ** 18n) / RATE) sq += 1n; }
+  const price = Number(RATE) / 1e18;
+  const slotTick = Math.floor(Math.log(srcIsToken0 ? price : 1 / price) / Math.log(1.0001));
+  const ringTick = srcIsToken0 ? slotTick : slotTick + 1;
+  await venue.setSqrtPrice(sq, ringTick);
+  const L = 10n ** 19n;
+  await venue.setLiquidity(L);
+  const now = (await ethers.provider.getBlock("latest")).timestamp;
+  await venue.pushObservation(now - 2100, ringTick, L);
+  await venue.pushObservation(now - 1000, ringTick, L);
+  await venue.pushObservation(now - 1, ringTick, L);
+  const sp = 10, t = ringTick, base = Math.floor(t / sp) * sp, ticks = [];
+  for (let i = 1; ticks.length < 2 * positions; i++) ticks.push(srcIsToken0 ? base + i * sp : base - (i - 1) * sp - (t % sp === 0 ? sp : 0));
+  for (let k = 0; k < positions; k++) {
+    const a = ticks[2 * k], b = ticks[2 * k + 1];
+    await venue.setTickLiquidity(Math.min(a, b), 1);
+    await venue.setTickLiquidity(Math.max(a, b), -1);
+  }
+  await fx.market.connect(fx.signers.admin).setRegistrarParams(25_000n * 10n ** 6n, 20_000n * 10n ** 6n, 723, ethers.ZeroAddress);
+  if ((await fx.market.quoteReference(fx.usdc.target)) === ethers.ZeroAddress) await fx.market.connect(fx.signers.admin).setQuoteReference(fx.usdc.target, fx.usdc.target);
+  await fx.market.connect(fx.signers.admin).registerVenue(pool.target, venue.target);
+  return venue;
+}
+
 describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${PINNED.slice(0, 7)})`, function () {
   this.timeout(600_000);
 
   /** The real stack: market, pool with its seed node, a flat venue, the lane open, listings. */
-  async function stack() {
+  async function stack(opts = {}) {
     const fx = await S.deploySignedFixture();
     const { admin, timelock48, buyerEOA } = fx.signers;
     await network.provider.send("hardhat_setCode", [PERMIT2, fs.readFileSync(path.resolve(process.cwd(), "test/fixtures/permit2-rh-runtime.hex"), "utf8").trim()]);
     const permit2 = new ethers.Contract(PERMIT2, ["function approve(address token, address spender, uint160 amount, uint48 expiration)"], ethers.provider);
-    const pool = await H.createDefaultPool(fx, TOK(100)); // node 1: alice's seed; flat USDC venue at RATE; lane opened by the timelock
+    const pool = opts.dustTicks
+      ? await H.createDefaultPool(fx, TOK(100), 0, [fx.usdc], { venue: false })
+      : await H.createDefaultPool(fx, TOK(100)); // node 1: alice's seed; flat USDC venue at RATE; lane opened by the timelock
+    if (opts.dustTicks) await dustyVenue(fx, pool, opts.dustTicks);
     await fx.market.connect(admin).setMinContribution(fx.usdc.target, 100_000_000n); // $100 = 50 tokens at RATE
     const { settlement, registry } = await deployListings(ethers, fx.market.target, PERMIT2, false);
     const far = BigInt((await ethers.provider.getBlock("latest")).timestamp + 30 * 86400);
@@ -285,7 +325,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       for (let i = 0; i < 49; i++) await s.deposit(TOK(50));
       const full = TOK(100) + 49n * TOK(50);
       const rows = [];
-      for (const gasLimit of [2_500_000, 3_500_000, 4_500_000, 7_000_000]) {
+      for (const gasLimit of [2_000_000, 3_000_000, 4_000_000, 5_000_000, 8_000_000]) {
         const snap = await network.provider.send("evm_snapshot", []);
         try {
           const rc = await s.buy({ amountSpecified: -(20_000n * 10n ** 6n) }, { refundable: true, gasLimit });
@@ -295,9 +335,26 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
         finally { await network.provider.send("evm_revert", [snap]); }
       }
       console.log("      " + rows.map((r) => `${r.gasLimit}: ${r.reverted ? "REVERTED" : `${r.got / 10n ** 18n} of ${full / 10n ** 18n} tokens, gas ${r.gasUsed}`}`).join("; "));
-      for (const r of rows) assert.equal(r.reverted, false, `reverted at ${r.gasLimit}`);
-      assert.ok(rows.some((r) => r.got > 0n && r.got < full), "some limit fills part and refunds the rest");
+      // review F3: a limit either fills something (and refunds the rest) or reverts; never succeeds empty
+      for (const r of rows) assert.ok(r.reverted || r.got > 0n, `succeeded with no output at ${r.gasLimit}`);
+      assert.ok(rows.some((r) => !r.reverted && r.got > 0n && r.got < full), "some limit fills part and refunds the rest");
       assert.equal(rows[rows.length - 1].got, full, "enough gas fills everything");
+    });
+
+    it("review F2: 72 dust ticks in a spacing-10 venue raise the reads above 1M but cannot stop swaps", async () => {
+      const s = await stack({ dustTicks: 36 });
+      const from = s.fx.signers.buyerEOA.address;
+      const g = async (c, name, args) => (await ethers.provider.estimateGas({ from, to: c.target, data: c.interface.encodeFunctionData(name, args) })) - 21000n;
+      const maxBuyGas = await g(s.fx.market, "maxBuy", [s.pool.target, s.fx.usdc.target]);
+      const priceGas = await g(s.settlement, "price", [s.fx.token.target, s.fx.usdc.target]);
+      const ev = await s.fx.market.evaluateVenue(s.pool.target);
+      assert.ok(maxBuyGas > 1_000_000n, `maxBuy costs ${maxBuyGas}: above the old fixed 1M read cap`);
+      const a = await s.seller(TOK(60));
+      await (await s.list(a, TOK(60))).wait();
+      const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+      const order = fills(rc, s).map((x) => x.src + (x.id ? x.id : ""));
+      console.log(`      dusty venue: maxBuy ${maxBuyGas}, price ${priceGas} (tier ${ev.tier}, depthOk ${ev.depthOk}); swap order ${order.join(" > ")}; gas ${rc.gasUsed}`);
+      assert.deepEqual(order, ["pool", "listing1"]);
     });
 
     it("the lowest gas limit at which a pool-only swap fills (routers must send at least this)", async () => {

@@ -5,6 +5,7 @@ pragma solidity ^0.8.26;
 ///         PoolParty_Contracts PR #54 head de4464f.
 interface IGen4ListingRegistry {
     function market() external view returns (address);
+    function settlement() external view returns (address);
 
     function peek(address token)
         external
@@ -47,4 +48,6 @@ interface IGen4Pool {
 
     function queue(uint256 maxNodes) external view returns (QueueNode[] memory);
     function tokenQueueEnds() external view returns (uint64 head, uint64 tail);
+    function buyBackEnabled() external view returns (bool);
+    function buybackAsset() external view returns (address);
 }
