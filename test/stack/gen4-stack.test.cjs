@@ -292,6 +292,20 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     assert.ok(q.some(([index, amount]) => index === 2n && amount === TOK(50)), `node 2 untouched: ${q}`);
   });
 
+  it("F1 (accepted, Hamish 26 Sep): a top-up made after a listing keeps the depositor's place, so it sells before the listing", async () => {
+    const s = await stack();
+    const d = await s.deposit(TOK(50));                 // node 2
+    const a = await s.seller(TOK(60));
+    await (await s.list(a, TOK(60))).wait();             // poolTail = 2
+    await s.fx.market.connect(s.fx.signers.alice).contributeTokens(s.pool.target, TOK(100), d, await H.consentFloors(s.pool.target), GAS);
+    const node2 = (await s.pool.queue(10)).find((n) => n.index === 2n);
+    assert.equal(node2.amount, TOK(150), "the top-up merged into node 2, which keeps its number");
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const f = fills(rc, s);
+    assert.deepEqual(f.map((x) => x.src + (x.id ? x.id : "")), ["pool", "listing1"]);
+    assert.equal(f[0].amount, TOK(250), "the seed and all of node 2, top-up included, before the listing");
+  });
+
   describe("gate 2: gas on the pinned stack", () => {
     it("a 50-deposit queue ahead of a listing: one swap takes all 50 nodes then the listing", async () => {
       const s = await stack();
