@@ -18,6 +18,10 @@ import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeE
 import {IFlowstateMarketMinimal} from "./interfaces/IFlowstateMarketMinimal.sol";
 import {IFlowstateBuyFunder} from "./interfaces/IFlowstateBuyFunder.sol";
 import {IWETH9} from "./interfaces/IWETH9.sol";
+import {IGen4ListingRegistry, IGen4ListingSettlement, IGen4Pool} from "./interfaces/IGen4Inventory.sol";
+import {Gen4Queue} from "./libraries/Gen4Queue.sol";
+import {Gen4Accounting} from "./libraries/Gen4Accounting.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title FlowstateC1Hook
 /// @notice Uniswap V4 custom-curve hook adapting routed BUY flow onto Flowstate C1 pool
@@ -76,6 +80,13 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     error RungScheduleInvalid();
     error SweepDestinationNotSet();
     error EthSweepFailed();
+    error ListingWiringMismatch(address registry, address settlement);
+    error ListingMarketMismatch(address expected, address registryMarket, address settlementMarket);
+    error CandidateInspectionFailed(uint8 source);
+    error UnexpectedListingOutcome(uint8 outcome);
+    error Gen4FillShortfall(uint256 filled, uint256 requested);
+    error Gen4AttemptCapExceeded(uint256 attempts);
+    error Gen4InsufficientGas(uint256 remaining, uint256 required);
 
     // -------------------------------------------------------------------------
     // Immutable wiring
@@ -110,11 +121,33 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///         the buyer pays.
     uint16 public immutable jarFeeBps;
 
+    /// @notice JUP-697 one-candidate listing endpoints. Both are zero for a
+    ///         Gen-3-only deployment; otherwise both are code-bearing and the
+    ///         settlement's immutable registry must match.
+    IGen4ListingRegistry public immutable listingRegistry;
+    IGen4ListingSettlement public immutable listingSettlement;
+
     // -------------------------------------------------------------------------
     // Constants
     // -------------------------------------------------------------------------
 
     uint256 public constant BPS_DENOMINATOR = 10_000;
+
+    uint256 public constant GEN4_MAX_ATTEMPTS = 16;
+    uint256 public constant GEN4_MAX_POOL_NODES = 50;
+    uint256 public constant GEN4_FINALIZATION_GAS_RESERVE = 400_000;
+    uint256 public constant GEN4_ATTEMPT_GAS_BUDGET = 6_000_000;
+    uint256 internal constant GEN4_READ_GAS_LIMIT = 750_000;
+    uint256 internal constant GEN4_QUEUE_READ_GAS_LIMIT = 750_000;
+    uint256 internal constant GEN4_EXECUTION_GAS_LIMIT = 1_500_000;
+
+    uint8 internal constant LISTING_EMPTY = 0;
+    uint8 internal constant LISTING_AVAILABLE = 1;
+    uint8 internal constant LISTING_DEAD = 2;
+    uint8 internal constant LISTING_SOLD = 0;
+    uint8 internal constant LISTING_SKIPPED = 2;
+    uint8 internal constant LISTING_STALE = 3;
+    uint8 internal constant LISTING_CLOSED = 4;
 
     /// @notice Hard cap on baseSpreadBps and on any single rung's extraBps (10%).
     ///         Structural ceiling on the total spread is therefore 2 * MAX_SPREAD_BPS.
@@ -133,6 +166,22 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         uint256 dustAccrued;
         uint256 costBase;
         BeforeSwapDelta hookDelta;
+    }
+
+    struct ListingCandidate {
+        uint8 state;
+        uint64 id;
+        uint256 available;
+        uint32 version;
+        uint64 poolTail;
+    }
+
+    struct PoolCandidate {
+        uint64 firstIndex;
+        uint256 boundedAvailable;
+        uint256 totalAvailable;
+        uint256 executable;
+        uint256 rate;
     }
 
     struct PairConfig {
@@ -266,7 +315,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         address _owner,
         address _weth9,
         address _tokenJar,
-        uint16 _jarFeeBps
+        uint16 _jarFeeBps,
+        address _listingRegistry,
+        address _listingSettlement
     ) Ownable(_owner) {
         if (_poolManager == address(0) || _market == address(0) || _tokenJar == address(0)) revert ZeroAddress();
         if (_market.code.length == 0) revert ZeroAddress();
@@ -280,6 +331,24 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         weth9 = IWETH9(_weth9); // address(0) = native quotes disabled on this chain
         tokenJar = _tokenJar;
         jarFeeBps = _jarFeeBps;
+        if ((_listingRegistry == address(0)) != (_listingSettlement == address(0))) {
+            revert ListingWiringMismatch(_listingRegistry, _listingSettlement);
+        }
+        if (_listingRegistry != address(0)) {
+            if (_listingRegistry.code.length == 0 || _listingSettlement.code.length == 0) {
+                revert ListingWiringMismatch(_listingRegistry, _listingSettlement);
+            }
+            if (IGen4ListingSettlement(_listingSettlement).registry() != _listingRegistry) {
+                revert ListingWiringMismatch(_listingRegistry, _listingSettlement);
+            }
+            address registryMarket = IGen4ListingRegistry(_listingRegistry).market();
+            address settlementMarket = IGen4ListingSettlement(_listingSettlement).market();
+            if (registryMarket != _market || settlementMarket != _market) {
+                revert ListingMarketMismatch(_market, registryMarket, settlementMarket);
+            }
+        }
+        listingRegistry = IGen4ListingRegistry(_listingRegistry);
+        listingSettlement = IGen4ListingSettlement(_listingSettlement);
 
         Hooks.validateHookPermissions(
             this,
@@ -366,6 +435,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
             marketAsset: marketAsset
         });
         IERC20(marketAsset).forceApprove(address(market), type(uint256).max);
+        if (address(listingSettlement) != address(0)) {
+            IERC20(marketAsset).forceApprove(address(listingSettlement), type(uint256).max);
+        }
         emit PairRegistered(c0, c1, marketPool, quoteIsCurrency0);
         emit BaseSpreadUpdated(c0, c1, baseSpreadBps);
     }
@@ -457,13 +529,14 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     function sweepMargin(Currency asset) external onlyOwner returns (uint256 swept) {
         address to = sweepDestination;
         if (to == address(0)) revert SweepDestinationNotSet();
-        uint256 spreadPortion = accruedSpreadMargin[asset];
-        uint256 dustPortion = accruedDust[asset];
-        accruedSpreadMargin[asset] = 0;
-        accruedDust[asset] = 0;
-        swept = IERC20(Currency.unwrap(asset)).balanceOf(address(this));
-        if (swept != 0) IERC20(Currency.unwrap(asset)).safeTransfer(to, swept);
-        emit MarginSwept(asset, to, spreadPortion, dustPortion, swept);
+        Currency held = asset.isAddressZero() ? Currency.wrap(address(weth9)) : asset;
+        uint256 spreadPortion = accruedSpreadMargin[held];
+        uint256 dustPortion = accruedDust[held];
+        accruedSpreadMargin[held] = 0;
+        accruedDust[held] = 0;
+        swept = IERC20(Currency.unwrap(held)).balanceOf(address(this));
+        if (swept != 0) IERC20(Currency.unwrap(held)).safeTransfer(to, swept);
+        emit MarginSwept(held, to, spreadPortion, dustPortion, swept);
     }
 
     /// @notice Recover ETH (none accrues in v1: the hook is all-ERC20 and has no
@@ -566,9 +639,16 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         if (Currency.unwrap(input) != Currency.unwrap(quote)) revert SellDirectionNotSupported();
 
         bool exactInput = params.amountSpecified < 0;
-        Fill memory f = exactInput
-            ? _buyExactInput(cfg, input, output, params.amountSpecified, sender)
-            : _buyExactOutput(cfg, input, output, params.amountSpecified);
+        Fill memory f;
+        if (address(listingSettlement) == address(0)) {
+            f = exactInput
+                ? _buyExactInput(cfg, input, output, params.amountSpecified, sender)
+                : _buyExactOutput(cfg, input, output, params.amountSpecified);
+        } else {
+            f = exactInput
+                ? _buyGen4ExactInput(cfg, input, output, params.amountSpecified, sender)
+                : _buyGen4ExactOutput(cfg, input, output, params.amountSpecified);
+        }
 
         // JUP-621: pay Uniswap's TokenJar its fee on this fill, out of the spread. The
         // fee base is the recomputed oracle cost the market actually charged
@@ -577,8 +657,9 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
         // every spread setter). Paid before the margin is booked, in the asset the hook
         // is holding (the wrapper for a native quote), inside the swap itself.
         f.spreadAccrued = _payJar(key.toId(), input, f.costBase, f.spreadAccrued);
-        if (f.spreadAccrued != 0) accruedSpreadMargin[input] += f.spreadAccrued;
-        if (f.dustAccrued != 0) accruedDust[input] += f.dustAccrued;
+        Currency heldInput = input.isAddressZero() ? Currency.wrap(address(weth9)) : input;
+        if (f.spreadAccrued != 0) accruedSpreadMargin[heldInput] += f.spreadAccrued;
+        if (f.dustAccrued != 0) accruedDust[heldInput] += f.dustAccrued;
 
         emit BuyExecuted(key.toId(), quote, output, f.quoteIn, f.tokensOut, exactInput, f.spreadAccrued, f.dustAccrued);
         return (IHooks.beforeSwap.selector, f.hookDelta, 0);
@@ -730,6 +811,330 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     }
 
     // -------------------------------------------------------------------------
+    // Gen-4 mixed pool/listing lane (JUP-698)
+    // -------------------------------------------------------------------------
+
+    /// @dev Exact input takes the committed amount once, then spends only the
+    ///      spread-adjusted budget across globally ordered legs. Every successful
+    ///      source records its returned amounts; an unsuccessful listing records
+    ///      no cost. Exhaustion/cap/gas reserve returns all unspent input, while a
+    ///      sub-token remainder after otherwise executable inventory remains Gen-3
+    ///      inversion dust.
+    function _buyGen4ExactInput(
+        PairConfig memory cfg,
+        Currency input,
+        Currency output,
+        int256 amountSpecified,
+        address sender
+    ) internal returns (Fill memory f) {
+        f.quoteIn = uint256(-amountSpecified);
+        uint256 spreadBps = _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), f.quoteIn);
+        uint256 budget = spreadBps == 0
+            ? f.quoteIn
+            : f.quoteIn * BPS_DENOMINATOR / (BPS_DENOMINATOR + spreadBps);
+        if (budget == 0) revert TradeTooSmallForSpread(f.quoteIn, spreadBps);
+
+        _takeChecked(input, f.quoteIn);
+        if (input.isAddressZero()) weth9.deposit{value: f.quoteIn}();
+
+        Gen4Accounting.Totals memory totals;
+        uint256 attempts;
+        bool refundUnused;
+        bool done;
+        address token = Currency.unwrap(output);
+
+        while (!done && attempts < GEN4_MAX_ATTEMPTS) {
+            if (gasleft() < GEN4_FINALIZATION_GAS_RESERVE + GEN4_ATTEMPT_GAS_BUDGET) {
+                refundUnused = true;
+                break;
+            }
+            ListingCandidate memory listing = _inspectListing(token);
+            PoolCandidate memory pool = _inspectPool(cfg, listing, token);
+            bool hasListing = listing.state != LISTING_EMPTY;
+            uint256 poolCap = hasListing ? pool.boundedAvailable : pool.totalAvailable;
+            if (poolCap > pool.executable) poolCap = pool.executable;
+            Gen4Queue.Source source = Gen4Queue.select(poolCap != 0, pool.firstIndex, hasListing, listing.poolTail);
+            if (source == Gen4Queue.Source.None) {
+                refundUnused = true;
+                break;
+            }
+
+            ++attempts;
+            uint256 remainingBudget = budget - (totals.poolQuote + totals.listingQuote);
+            if (source == Gen4Queue.Source.Pool) {
+                uint256 amount = _affordable(poolCap, remainingBudget, pool.rate);
+                if (amount == 0) break;
+                (uint256 poolTokens, uint256 poolQuote) = market.buyFromPoolBounded{gas: GEN4_EXECUTION_GAS_LIMIT}(
+                    cfg.marketPool,
+                    cfg.marketAsset,
+                    amount,
+                    resellerCode,
+                    address(this),
+                    remainingBudget,
+                    0,
+                    0
+                );
+                if (poolTokens == 0) {
+                    refundUnused = true;
+                    break;
+                }
+                Gen4Accounting.recordPool(totals, poolTokens, poolQuote);
+                continue;
+            }
+
+            uint256 maxAmount = listing.state == LISTING_DEAD || pool.rate == 0
+                ? 1
+                : _affordable(listing.available, remainingBudget, pool.rate);
+            if (maxAmount == 0) break;
+            uint256 maxQuote = listing.state == LISTING_DEAD || pool.rate == 0 ? 0 : _quoteFor(maxAmount, pool.rate);
+            (uint8 outcome, uint64 actualId, uint256 listingTokens, uint256 listingQuote) =
+                listingSettlement.settleHead{gas: GEN4_EXECUTION_GAS_LIMIT}(
+                token,
+                listing.id,
+                listing.version,
+                maxAmount,
+                cfg.marketAsset,
+                maxQuote,
+                address(this),
+                resellerCode,
+                0
+            );
+            if (outcome == LISTING_SOLD) {
+                if (actualId != listing.id || listingTokens == 0 || listingQuote > maxQuote) {
+                    revert UnexpectedListingOutcome(outcome);
+                }
+                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, true, listingTokens, listingQuote);
+            } else if (outcome == LISTING_SKIPPED || outcome == LISTING_STALE) {
+                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+            } else if (outcome == LISTING_CLOSED) {
+                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+                refundUnused = true;
+                done = true;
+            } else {
+                revert UnexpectedListingOutcome(outcome);
+            }
+        }
+
+        if (!done && attempts == GEN4_MAX_ATTEMPTS) refundUnused = true;
+        uint256 cost = totals.poolQuote + totals.listingQuote;
+        uint256 spread = _ceilBps(cost, spreadBps);
+        uint256 refund = refundUnused ? f.quoteIn - cost - spread : 0;
+        Gen4Accounting.Final memory result =
+            Gen4Accounting.exactInput(totals, f.quoteIn, spreadBps, jarFeeBps, refund);
+        if (result.refund != 0) _refundInput(input, sender, result.refund);
+        if (result.tokensOut != 0) _settle(output, result.tokensOut);
+
+        f.tokensOut = result.tokensOut;
+        f.spreadAccrued = result.spread;
+        f.dustAccrued = result.dust;
+        f.costBase = result.cost;
+        f.hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), -f.tokensOut.toInt128());
+    }
+
+    /// @dev Exact output caps every leg by the remaining target. Pool and listing
+    ///      calls are pre-funded at the same previewed rate used by JUP-697; any
+    ///      typed unsuccessful listing outcome refunds that pre-funding before both
+    ///      sources are inspected again. Failure to reach the target reverts the
+    ///      whole unlock, so no partial exact-output debt can survive.
+    function _buyGen4ExactOutput(
+        PairConfig memory cfg,
+        Currency input,
+        Currency output,
+        int256 amountSpecified
+    ) internal returns (Fill memory f) {
+        uint256 target = uint256(amountSpecified);
+        Gen4Accounting.Totals memory totals;
+        uint256 attempts;
+        address token = Currency.unwrap(output);
+
+        while (Gen4Accounting.remainingOutput(totals, target) != 0 && attempts < GEN4_MAX_ATTEMPTS) {
+            uint256 requiredGas = GEN4_FINALIZATION_GAS_RESERVE + GEN4_ATTEMPT_GAS_BUDGET;
+            if (gasleft() < requiredGas) revert Gen4InsufficientGas(gasleft(), requiredGas);
+            ListingCandidate memory listing = _inspectListing(token);
+            PoolCandidate memory pool = _inspectPool(cfg, listing, token);
+            bool hasListing = listing.state != LISTING_EMPTY;
+            uint256 poolCap = hasListing ? pool.boundedAvailable : pool.totalAvailable;
+            if (poolCap > pool.executable) poolCap = pool.executable;
+            Gen4Queue.Source source = Gen4Queue.select(poolCap != 0, pool.firstIndex, hasListing, listing.poolTail);
+            if (source == Gen4Queue.Source.None) break;
+
+            ++attempts;
+            uint256 remaining = Gen4Accounting.remainingOutput(totals, target);
+            if (source == Gen4Queue.Source.Pool) {
+                uint256 amount = poolCap < remaining ? poolCap : remaining;
+                uint256 poolPrefund = _quoteFor(amount, pool.rate);
+                _prefundInput(input, poolPrefund);
+                (uint256 poolTokens, uint256 poolQuote) = market.buyFromPoolBounded{gas: GEN4_EXECUTION_GAS_LIMIT}(
+                    cfg.marketPool,
+                    cfg.marketAsset,
+                    amount,
+                    resellerCode,
+                    address(this),
+                    poolPrefund,
+                    0,
+                    0
+                );
+                if (poolQuote > poolPrefund || poolTokens == 0) revert Gen4FillShortfall(poolTokens, amount);
+                if (poolPrefund > poolQuote) _returnPrefund(input, poolPrefund - poolQuote);
+                Gen4Accounting.recordPool(totals, poolTokens, poolQuote);
+                continue;
+            }
+
+            uint256 maxAmount = listing.state == LISTING_DEAD
+                ? 1
+                : (listing.available < remaining ? listing.available : remaining);
+            uint256 listingPrefund = listing.state == LISTING_DEAD ? 0 : _quoteFor(maxAmount, pool.rate);
+            if (listingPrefund != 0) _prefundInput(input, listingPrefund);
+            (uint8 outcome, uint64 actualId, uint256 listingTokens, uint256 listingQuote) =
+                listingSettlement.settleHead{gas: GEN4_EXECUTION_GAS_LIMIT}(
+                token,
+                listing.id,
+                listing.version,
+                maxAmount,
+                cfg.marketAsset,
+                listingPrefund,
+                address(this),
+                resellerCode,
+                0
+            );
+            if (outcome == LISTING_SOLD) {
+                if (actualId != listing.id || listingTokens == 0 || listingQuote > listingPrefund) {
+                    revert UnexpectedListingOutcome(outcome);
+                }
+                if (listingPrefund > listingQuote) _returnPrefund(input, listingPrefund - listingQuote);
+                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, true, listingTokens, listingQuote);
+            } else if (
+                outcome == LISTING_SKIPPED || outcome == LISTING_STALE || outcome == LISTING_CLOSED
+            ) {
+                if (listingPrefund != 0) _returnPrefund(input, listingPrefund);
+                Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+                if (outcome == LISTING_CLOSED) break;
+            } else {
+                revert UnexpectedListingOutcome(outcome);
+            }
+        }
+
+        uint256 filled = totals.poolTokens + totals.listingTokens;
+        if (filled != target) {
+            if (attempts == GEN4_MAX_ATTEMPTS) revert Gen4AttemptCapExceeded(attempts);
+            revert Gen4FillShortfall(filled, target);
+        }
+        Gen4Accounting.Final memory result =
+            Gen4Accounting.exactOutput(totals, _spreadBps(cfg.baseSpreadBps, Currency.wrap(cfg.marketAsset), totals.poolQuote + totals.listingQuote), jarFeeBps);
+        if (result.spread != 0) _prefundInput(input, result.spread);
+        _settle(output, result.tokensOut);
+
+        f.quoteIn = result.charged;
+        f.tokensOut = result.tokensOut;
+        f.spreadAccrued = result.spread;
+        f.costBase = result.cost;
+        f.hookDelta = toBeforeSwapDelta((-amountSpecified).toInt128(), f.quoteIn.toInt128());
+    }
+
+    function _inspectListing(address token) internal view returns (ListingCandidate memory c) {
+        try listingRegistry.peek{gas: GEN4_READ_GAS_LIMIT}(token) returns (
+            uint8 state,
+            uint64 id,
+            uint64,
+            uint256 available,
+            uint32 version,
+            uint64 poolTail
+        ) {
+            if (state > LISTING_DEAD || (state == LISTING_EMPTY) != (id == 0)) {
+                revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Listing));
+            }
+            c = ListingCandidate(state, id, available, version, poolTail);
+        } catch {
+            revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Listing));
+        }
+    }
+
+    function _inspectPool(PairConfig memory cfg, ListingCandidate memory listing, address token)
+        internal
+        view
+        returns (PoolCandidate memory c)
+    {
+        uint64 head;
+        try IGen4Pool(cfg.marketPool).tokenQueueEnds{gas: GEN4_READ_GAS_LIMIT}() returns (uint64 h, uint64) {
+            head = h;
+        } catch {
+            revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
+        }
+        IGen4Pool.QueueNode[] memory nodes;
+        try IGen4Pool(cfg.marketPool).queue{gas: GEN4_QUEUE_READ_GAS_LIMIT}(GEN4_MAX_POOL_NODES) returns (
+            IGen4Pool.QueueNode[] memory readNodes
+        ) {
+            nodes = readNodes;
+        } catch {
+            revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
+        }
+        if ((head == 0) != (nodes.length == 0) || (nodes.length != 0 && nodes[0].index != head)) {
+            revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
+        }
+        uint64 boundary = listing.state == LISTING_EMPTY ? type(uint64).max : listing.poolTail;
+        (c.firstIndex, c.boundedAvailable, c.totalAvailable) = Gen4Queue.inspect(nodes, boundary);
+
+        uint256 marketMax;
+        try market.maxBuy{gas: GEN4_READ_GAS_LIMIT}(cfg.marketPool, cfg.marketAsset) returns (
+            uint256 maxTokens, uint256
+        ) {
+            marketMax = maxTokens;
+        } catch {
+            revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
+        }
+        c.executable = c.totalAvailable < marketMax ? c.totalAvailable : marketMax;
+        try listingSettlement.price{gas: GEN4_READ_GAS_LIMIT}(token, cfg.marketAsset) returns (
+            uint8 why, uint256 rate
+        ) {
+            if (why == 0) c.rate = rate;
+            else c.executable = 0;
+        } catch {
+            revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
+        }
+    }
+
+    function _affordable(uint256 available, uint256 budget, uint256 rate) internal pure returns (uint256 amount) {
+        if (rate == 0) return 0;
+        amount = Math.mulDiv(budget, 1e18, rate);
+        if (amount > available) amount = available;
+    }
+
+    function _quoteFor(uint256 amount, uint256 rate) internal pure returns (uint256) {
+        return Math.mulDiv(amount, rate, 1e18, Math.Rounding.Ceil);
+    }
+
+    function _prefundInput(Currency input, uint256 amount) internal {
+        _takeChecked(input, amount);
+        if (input.isAddressZero()) weth9.deposit{value: amount}();
+    }
+
+    function _refundInput(Currency input, address recipient, uint256 amount) internal {
+        if (input.isAddressZero()) {
+            weth9.withdraw(amount);
+            poolManager.settleFor{value: amount}(recipient);
+        } else {
+            poolManager.sync(input);
+            IERC20(Currency.unwrap(input)).safeTransfer(address(poolManager), amount);
+            poolManager.settleFor(recipient);
+        }
+    }
+
+    /// @dev Return an exact-output leg's unused pre-funding to this hook's own
+    ///      PoolManager delta. The swapper is charged only by the final returned
+    ///      hook delta, so crediting the caller here would leave the hook itself in
+    ///      debt and make the unlock fail.
+    function _returnPrefund(Currency input, uint256 amount) internal {
+        if (input.isAddressZero()) {
+            weth9.withdraw(amount);
+            poolManager.settle{value: amount}();
+        } else {
+            poolManager.sync(input);
+            IERC20(Currency.unwrap(input)).safeTransfer(address(poolManager), amount);
+            poolManager.settle();
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Funding callback (IFlowstateBuyFunder)
     // -------------------------------------------------------------------------
 
@@ -758,7 +1163,7 @@ contract FlowstateC1Hook is IHooks, IFlowstateBuyFunder, Ownable2Step {
     ///      and nobody else — weth9.deposit never sends native back. Reject strays
     ///      so accounting never has to explain an unexplained balance.
     receive() external payable {
-        if (msg.sender != address(poolManager)) revert UnexpectedNativeSender(msg.sender);
+        if (msg.sender != address(poolManager) && msg.sender != address(weth9)) revert UnexpectedNativeSender(msg.sender);
     }
 
     function afterSwap(address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)

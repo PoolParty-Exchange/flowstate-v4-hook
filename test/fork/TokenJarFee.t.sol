@@ -198,18 +198,22 @@ contract TokenJarFeeForkTest is ForkTestBase {
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, address(0), JAR_FEE_BPS)
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, address(0), JAR_FEE_BPS, address(0), address(0))
         );
         vm.expectRevert(FlowstateC1Hook.ZeroAddress.selector);
-        new FlowstateC1Hook{salt: salt}(POOL_MANAGER, address(market), address(this), AEWETH, address(0), JAR_FEE_BPS);
+        new FlowstateC1Hook{salt: salt}(
+            POOL_MANAGER, address(market), address(this), AEWETH, address(0), JAR_FEE_BPS, address(0), address(0)
+        );
         (, bytes32 salt2) = HookMiner.find(
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17))
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17), address(0), address(0))
         );
         vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.SpreadOutOfRange.selector, 16, 17, hook.MAX_SPREAD_BPS()));
-        new FlowstateC1Hook{salt: salt2}(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17));
+        new FlowstateC1Hook{salt: salt2}(
+            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17), address(0), address(0)
+        );
     }
 
     /// Short fill (inventory runs out mid-swap, JUP-559 path): the fee is charged on

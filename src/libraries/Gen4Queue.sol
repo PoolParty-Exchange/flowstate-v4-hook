@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.8.26;
 
-/// @notice Internal-only planning primitives for the gen-4 mixed inventory lane.
-/// @dev This is deliberately not an interface to the listings contracts. Adapters must
-///      translate the final JUP-697/JUP-696 surfaces into a resolved, globally comparable
-///      key before this library will choose between pool and listing inventory.
+import {IGen4Pool} from "../interfaces/IGen4Inventory.sol";
+
+/// @notice Production FIFO primitives for the Gen-4 mixed pool/listing lane.
+/// @dev JUP-697 supplies a definitive cross-source boundary: a pool node was
+///      queued before a listing exactly when node.index <= listing.poolTail.
 library Gen4Queue {
     enum Source {
         None,
@@ -12,51 +13,36 @@ library Gen4Queue {
         Listing
     }
 
-    struct OrderKey {
-        // The shared chain counter. A zero sentinel is unresolved unless the adapter has
-        // additional metadata that safely normalizes it into a real total-order key.
-        uint64 createdBlock;
-        // Cross-source ordering within one counter value. Its meaning is intentionally
-        // left to the final protocol contract; a source-local id is not sufficient.
-        uint64 tieBreaker;
-        bool resolved;
-    }
-
-    struct Candidate {
-        Source source;
-        uint256 available;
-        OrderKey order;
-        // False when the source cannot distinguish a truly empty queue from bounded
-        // traversal/cleaning exhaustion. Unknown is never treated as absent.
-        bool definitive;
-    }
-
-    /// @notice Select the older available source, or report that ordering is blocked.
-    /// @dev An unresolved candidate is usable when it has no competitor: its own source
-    ///      already preserves local FIFO. It is never compared across sources.
-    function select(Candidate memory pool, Candidate memory listing)
+    /// @notice Select the globally oldest executable source.
+    /// @dev A dead listing still exists and must be selected/retired when no
+    ///      executable pool node predates it. `poolIndex` is the first node with
+    ///      unpinned inventory, not merely the linked-list head.
+    function select(bool hasPool, uint64 poolIndex, bool hasListing, uint64 listingPoolTail)
         internal
         pure
-        returns (Source source, bool blocked)
+        returns (Source)
     {
-        if (!pool.definitive || !listing.definitive) return (Source.None, true);
-        bool hasPool = pool.available != 0;
-        bool hasListing = listing.available != 0;
-        if (!hasPool) return hasListing ? (Source.Listing, false) : (Source.None, false);
-        if (!hasListing) return (Source.Pool, false);
+        if (!hasListing) return hasPool ? Source.Pool : Source.None;
+        if (!hasPool) return Source.Listing;
+        return poolIndex <= listingPoolTail ? Source.Pool : Source.Listing;
+    }
 
-        // Zero is the overloaded unstamped sentinel. It is never a valid cross-source
-        // order value, even if a future adapter accidentally marks the key resolved.
-        // A genuinely normalized global key must be represented with a non-zero major.
-        if (pool.order.createdBlock == 0 || listing.order.createdBlock == 0) return (Source.None, true);
-        if (!pool.order.resolved || !listing.order.resolved) return (Source.None, true);
-        if (pool.order.createdBlock < listing.order.createdBlock) return (Source.Pool, false);
-        if (listing.order.createdBlock < pool.order.createdBlock) return (Source.Listing, false);
-        if (pool.order.tieBreaker < listing.order.tieBreaker) return (Source.Pool, false);
-        if (listing.order.tieBreaker < pool.order.tieBreaker) return (Source.Listing, false);
-
-        // Equal keys are not silently resolved with a source preference. The final
-        // protocol must supply either unique metadata or an explicit tie rule.
-        return (Source.None, true);
+    /// @notice Inspect only the pool's bounded traversal and return the first
+    ///         executable node plus inventory that may be consumed before the
+    ///         listing boundary. Passing max uint64 means no listing boundary.
+    function inspect(IGen4Pool.QueueNode[] memory nodes, uint64 poolTail)
+        internal
+        pure
+        returns (uint64 firstIndex, uint256 boundedAvailable, uint256 totalAvailable)
+    {
+        uint256 length = nodes.length;
+        for (uint256 i; i < length; ++i) {
+            IGen4Pool.QueueNode memory node = nodes[i];
+            uint256 available = uint256(node.amount) - uint256(node.pinned);
+            if (available == 0) continue;
+            if (firstIndex == 0) firstIndex = node.index;
+            totalAvailable += available;
+            if (node.index <= poolTail) boundedAvailable += available;
+        }
     }
 }

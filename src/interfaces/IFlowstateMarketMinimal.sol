@@ -22,6 +22,14 @@ interface IFlowstateMarketMinimal {
     /// @notice Whether an asset is currently approved as executable quote input.
     function approvedQuoteAssets(address asset) external view returns (bool);
 
+    /// @notice JUP-696 passive-lane rate used by both pool and listing settlement.
+    function previewRate(address pool, address asset) external view returns (bool ok, uint256 rate);
+
+    /// @notice JUP-612 executable passive inventory within the pool's bounded
+    ///         MAX_FILL_NODES traversal. Returns zeroes rather than reverting when
+    ///         the pool cannot currently execute.
+    function maxBuy(address pool, address asset) external view returns (uint256 maxTokens, uint256 maxQuote);
+
     /// @notice Legacy exact-output buy (partial-fill semantics; kept for reference —
     ///         the hook's swap paths use the pair below).
     /// @return tokensFilled tokens delivered (may be < amount on inventory caps).
@@ -29,6 +37,17 @@ interface IFlowstateMarketMinimal {
     function buyFromPool(address pool, address asset, uint256 amount, string calldata resellerCode, address buyer)
         external
         returns (uint256 tokensFilled, uint256 quotePaid);
+
+    function buyFromPoolBounded(
+        address pool,
+        address asset,
+        uint256 amount,
+        string calldata resellerCode,
+        address buyer,
+        uint256 maxCost,
+        uint256 minTokensFilled,
+        uint256 deadline
+    ) external returns (uint256 tokensFilled, uint256 quotePaid);
 
     /// @notice Exact-input buy in quote terms: the market inverts quoteIn to a token
     ///         amount inside its single oracle read, pulls exactly the oracle cost of

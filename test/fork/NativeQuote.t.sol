@@ -199,10 +199,10 @@ contract NativeQuoteForkTest is NativeQuoteFixture {
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0)
+            abi.encode(POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0, address(0), address(0))
         );
         FlowstateC1Hook bare = new FlowstateC1Hook{salt: salt}(
-            POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0
+            POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0, address(0), address(0)
         );
         assertEq(address(bare), hookAddress);
         vm.expectRevert(FlowstateC1Hook.NativeQuoteUnsupported.selector);
@@ -238,7 +238,7 @@ contract NativeQuoteJarFeeForkTest is NativeQuoteFixture {
         uint256 quoteIn = 1e16; // 0.01 native
         uint256 jarWethBefore = IERC20(AEWETH).balanceOf(TOKEN_JAR);
         uint256 jarEthBefore = TOKEN_JAR.balance;
-        uint256 marginBefore = hook.accruedSpreadMargin(Currency.wrap(address(0)));
+        uint256 marginBefore = hook.accruedSpreadMargin(Currency.wrap(AEWETH));
         uint256 tokBefore = token.balanceOf(swapper);
 
         _swapBuyNative(-int256(quoteIn), quoteIn);
@@ -248,12 +248,12 @@ contract NativeQuoteJarFeeForkTest is NativeQuoteFixture {
         uint256 jarFee = IERC20(AEWETH).balanceOf(TOKEN_JAR) - jarWethBefore;
         assertEq(TOKEN_JAR.balance - jarEthBefore, 0, "jar never receives raw native");
         assertApproxEqAbs(jarFee, _ceilBpsLocal(quotePaid, JAR_FEE_BPS), 1, "jar paid JAR_FEE_BPS of the realised cost, in aeWETH");
-        uint256 marginKept = hook.accruedSpreadMargin(Currency.wrap(address(0))) - marginBefore;
+        uint256 marginKept = hook.accruedSpreadMargin(Currency.wrap(AEWETH)) - marginBefore;
         assertApproxEqAbs(jarFee + marginKept, _ceilBpsLocal(quotePaid, 16), 1, "jar + kept margin == the 16 bps spread");
         assertEq(address(hook).balance, 0, "no native strands on the hook");
         assertEq(
             IERC20(AEWETH).balanceOf(address(hook)),
-            hook.accruedSpreadMargin(Currency.wrap(address(0))) + hook.accruedDust(Currency.wrap(address(0))),
+            hook.accruedSpreadMargin(Currency.wrap(AEWETH)) + hook.accruedDust(Currency.wrap(AEWETH)),
             "hook holds only its booked margin + dust in the wrapper"
         );
     }
