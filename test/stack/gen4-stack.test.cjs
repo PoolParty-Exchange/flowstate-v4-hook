@@ -306,6 +306,17 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     assert.equal(f[0].amount, TOK(250), "the seed and all of node 2, top-up included, before the listing");
   });
 
+  it("a closed swap route (lane closed by the timelock) sells nothing and refunds the whole input", async () => {
+    const s = await stack();
+    const a = await s.seller(TOK(60));
+    await (await s.list(a, TOK(60))).wait();
+    await (await s.fx.market.connect(s.fx.signers.timelock48).closePassiveLane(s.pool.target)).wait();
+    const rc = await s.buy({ amountSpecified: -(20n * 10n ** 6n) }, { refundable: true });
+    assert.equal(fills(rc, s).length, 0);
+    assert.equal(rc.money.paid, 0n, "nothing charged");
+    assert.equal((await s.registry.listing(1)).remaining, TOK(60), "the listing untouched");
+  });
+
   describe("gate 2: gas on the pinned stack", () => {
     it("a 50-deposit queue ahead of a listing: one swap takes all 50 nodes then the listing", async () => {
       const s = await stack();

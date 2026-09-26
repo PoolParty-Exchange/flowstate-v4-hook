@@ -529,6 +529,30 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(recorder.length(), 0, "no leg attempted");
     }
 
+    // The price is read once per swap: a closed swap route sells nothing from either source
+    function test_ClosedRouteExactInputRefundsEverythingWithoutAnAttempt() public {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 2, 2e18, 1, 1));
+        settlement.setClosed(true);
+        (uint256 tokens, uint256 cost, uint256 refund,) = hook.runExactInput(
+            address(pool), address(quote), address(quote), address(token), 10e18, address(this)
+        );
+        assertEq(tokens, 0);
+        assertEq(cost, 0);
+        assertEq(refund, 10e18);
+        assertEq(recorder.length(), 0, "no leg attempted");
+        assertEq(quote.balanceOf(address(hook)), 0);
+    }
+
+    function test_ClosedRouteExactOutputRevertsAsShortfall() public {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        settlement.setClosed(true);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4FillShortfall.selector, 0, 1e18));
+        hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+    }
+
     // Per-node gas planning (review F5): four cases from the market's registry and the pool's buy-back
     function test_PoolNodeGasFollowsAttributionAndRecycling() public {
         assertEq(hook.poolNodeGas(address(pool), address(quote)), hook.GEN4_POOL_NODE_GAS());
