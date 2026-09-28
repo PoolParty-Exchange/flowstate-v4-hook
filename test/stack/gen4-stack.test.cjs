@@ -142,13 +142,32 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       await fx.market.connect(fx.signers.alice).contributeTokens(pool.target, amount, w, await H.consentFloors(pool.target), { ...GAS, ...opts });
       return w;
     };
-    // PoolSwapTest for fills with no refund; the live-delta router (SETTLE_ALL semantics) wherever the
-    // hook may refund unspent input (more asked for than is for sale)
+    // WSR F5 (27 Sep 2026): exact input fills the whole slice or reverts. `buyAll` sizes the slice the way
+    // a splitting aggregator does: an oversized probe reverts ExactInputShortfall(filled, ...), an
+    // exact-output quote of `filled` tokens gives the exact price, and that price is sent as exact input.
+    const WRAPPED = new ethers.Interface(["error WrappedError(address target, bytes4 selector, bytes reason, bytes details)"]);
+    const shortfallOf = (e) => {
+      const data = e.data ?? e.error?.data ?? e.info?.error?.data;
+      const w = WRAPPED.parseError(data);
+      const inner = hook.interface.parseError(w.args.reason);
+      assert.equal(inner.name, "ExactInputShortfall", `expected ExactInputShortfall, got ${inner.name}`);
+      return { filled: inner.args[0], wanted: inner.args[1], reason: Number(inner.args[2]) };
+    };
+    const priceAll = async (gas) => {
+      const p = { zeroForOne, sqrtPriceLimitX96: zeroForOne ? MIN_SQRT : MAX_SQRT };
+      let filled;
+      try { await live.connect(buyerEOA).swap.staticCall(key, { ...p, amountSpecified: -(10n ** 12n) }, gas); assert.fail("an oversized probe must revert"); }
+      catch (e) { if (e.code === "ERR_ASSERTION") throw e; filled = shortfallOf(e).filled; }
+      const [d0, d1] = await live.connect(buyerEOA).swap.staticCall(key, { ...p, amountSpecified: filled }, gas);
+      return { filled, charged: -(zeroForOne ? d0 : d1) };
+    };
     const buy = async (params, opts = {}) => {
+      const gas = opts.gasLimit ? { gasLimit: opts.gasLimit } : GAS;
+      let sized;
+      if (opts.buyAll) { sized = await priceAll(GAS); params = { ...params, amountSpecified: -sized.charged }; }
       const p = { zeroForOne, sqrtPriceLimitX96: zeroForOne ? MIN_SQRT : MAX_SQRT, ...params };
       const usdc0 = await fx.usdc.balanceOf(buyerEOA.address);
-      const gas = opts.gasLimit ? { gasLimit: opts.gasLimit } : GAS;
-      const tx = opts.refundable
+      const tx = opts.buyAll || opts.live
         ? await live.connect(buyerEOA).swap(key, p, gas)
         : await router.connect(buyerEOA).swap(key, p, { takeClaims: false, settleUsingBurn: false }, "0x", gas);
       const rc = await tx.wait();
@@ -165,11 +184,12 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
         } catch {}
       }
       assert.equal(paid, sources + spread + jarFee + dust, `paid ${paid} != sources ${sources} + spread ${spread} + jar ${jarFee} + dust ${dust}`);
-      if (opts.refundable && params.amountSpecified < 0n) assert.ok(paid < -params.amountSpecified, "unspent input refunded");
+      if (params.amountSpecified < 0n) assert.equal(paid, -params.amountSpecified, "exact input charges the whole slice, nothing handed back");
+      if (sized) rc.sized = sized;
       rc.money = { paid, sources, spread, jarFee, dust };
       return rc;
     };
-    return { fx, pool, registry, settlement, manager, router, hook, key, jar, seller, list, deposit, buy, zeroForOne };
+    return { fx, pool, registry, settlement, manager, router, live, hook, key, jar, seller, list, deposit, buy, priceAll, shortfallOf, zeroForOne };
   }
 
   /** The fills of one swap, in execution order: pool fills (PoolBuy) and listing sales (ListingFilled). */
@@ -212,7 +232,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     await (await s.list(b, TOK(60))).wait(); // L2: poolTail = 2
     assert.equal((await s.registry.listing(1)).poolTail, 1n);
     assert.equal((await s.registry.listing(2)).poolTail, 2n);
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true }); // more than everything listed and deposited
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true }); // more than everything listed and deposited
     const f = fills(rc, s);
     const order = f.map((x) => x.src + (x.id ? x.id : ""));
     console.log(`      order: ${order.join(" > ")}; gas ${rc.gasUsed}`);
@@ -229,7 +249,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     await (await s.list(b, TOK(60))).wait();
     // L1 dies: its seller moves the tokens away
     await (await s.fx.token.connect(a).transfer(s.fx.signers.alice.address, TOK(60))).wait();
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
     const f = fills(rc, s), order = f.map((x) => x.src + (x.id ? x.id : ""));
     console.log(`      order: ${order.join(" > ")}; gas ${rc.gasUsed}`);
     assert.ok(!order.includes("listing1"), "the dead listing sold nothing");
@@ -250,7 +270,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       await network.provider.send("evm_mine", []);
     } finally { await network.provider.send("evm_setAutomine", [true]); }
     assert.equal((await s.registry.listing(1)).poolTail, 2n); // the first deposit (node 2) came before the listing
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
     const order = fills(rc, s).map((x) => x.src + (x.id ? x.id : ""));
     console.log(`      order: ${order.join(" > ")}`);
     // seed and node 2 (one pool leg, both at or below the snapshot), then the listing, then node 3
@@ -266,7 +286,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     const q = await S.makeQuote(s.fx, s.pool, { tokenAmount: TOK(100), nonce: 9 });
     await S.placeHold(s.fx, q);
     assert.equal((await s.pool.queue(10))[0].pinned, TOK(100));
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
     const order = fills(rc, s).map((x) => x.src + (x.id ? x.id : ""));
     console.log(`      order: ${order.join(" > ")}`);
     assert.deepEqual(order.slice(0, 2), ["listing1", "pool"]);
@@ -300,21 +320,59 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     await s.fx.market.connect(s.fx.signers.alice).contributeTokens(s.pool.target, TOK(100), d, await H.consentFloors(s.pool.target), GAS);
     const node2 = (await s.pool.queue(10)).find((n) => n.index === 2n);
     assert.equal(node2.amount, TOK(150), "the top-up merged into node 2, which keeps its number");
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
     const f = fills(rc, s);
     assert.deepEqual(f.map((x) => x.src + (x.id ? x.id : "")), ["pool", "listing1"]);
     assert.equal(f[0].amount, TOK(250), "the seed and all of node 2, top-up included, before the listing");
   });
 
-  it("a closed swap route (lane closed by the timelock) sells nothing and refunds the whole input", async () => {
+  it("a closed swap route (lane closed by the timelock) reverts with its reason and charges nothing", async () => {
     const s = await stack();
     const a = await s.seller(TOK(60));
     await (await s.list(a, TOK(60))).wait();
     await (await s.fx.market.connect(s.fx.signers.timelock48).closePassiveLane(s.pool.target)).wait();
-    const rc = await s.buy({ amountSpecified: -(20n * 10n ** 6n) }, { refundable: true });
-    assert.equal(fills(rc, s).length, 0);
-    assert.equal(rc.money.paid, 0n, "nothing charged");
+    const buyer = s.fx.signers.buyerEOA, usdc0 = await s.fx.usdc.balanceOf(buyer.address);
+    const p = { zeroForOne: s.zeroForOne, sqrtPriceLimitX96: s.zeroForOne ? MIN_SQRT : MAX_SQRT, amountSpecified: -(20n * 10n ** 6n) };
+    let reason;
+    try { await s.live.connect(buyer).swap.staticCall(s.key, p, GAS); assert.fail("a closed route must revert"); }
+    catch (e) { if (e.code === "ERR_ASSERTION") throw e; reason = s.shortfallOf(e).reason; }
+    assert.equal(reason, 6, "STOP_CLOSED");
+    assert.equal(await s.fx.usdc.balanceOf(buyer.address), usdc0, "nothing charged");
     assert.equal((await s.registry.listing(1)).remaining, TOK(60), "the listing untouched");
+  });
+
+  // Gas matrix (WSR F5 build, 27-28 Sep 2026): gas used, eth_estimateGas and the LOWEST gas limit that
+  // fills, per case. Run with GAS_MATRIX=1. Each case sizes its slice to the whole stock, as a splitting
+  // aggregator would; under all-or-nothing a limit either fills completely or reverts.
+  (process.env.GAS_MATRIX ? describe : describe.skip)("gas matrix", () => {
+    const measure = async (s, label) => {
+      const { charged } = await s.priceAll(GAS);
+      const p = { zeroForOne: s.zeroForOne, sqrtPriceLimitX96: s.zeroForOne ? MIN_SQRT : MAX_SQRT, amountSpecified: -charged };
+      const buyer = s.fx.signers.buyerEOA;
+      const est = await s.live.connect(buyer).swap.estimateGas(s.key, p);
+      const at = async (gasLimit) => {
+        const snap = await network.provider.send("evm_snapshot", []);
+        try { const rc = await (await s.live.connect(buyer).swap(s.key, p, { gasLimit })).wait(); return { ok: true, used: rc.gasUsed }; }
+        catch { return { ok: false }; }
+        finally { await network.provider.send("evm_revert", [snap]); }
+      };
+      const full = await at(30_000_000);
+      assert.ok(full.ok, `${label}: fills at 30M`);
+      let lo = 300_000, hi = 30_000_000;
+      while (hi - lo > 25_000) { const mid = Math.floor((lo + hi) / 2); if ((await at(mid)).ok) hi = mid; else lo = mid; }
+      const used = Number(full.used);
+      console.log(`      ${label}: used ${used}, estimate ${est} (${(Number(est) / used).toFixed(2)}x), lowest limit that fills ${hi} (${(hi / used).toFixed(2)}x used)`);
+    };
+    it("matrix", async () => {
+      { const s = await stack(); await measure(s, "pool only, 1 node (seed)"); }
+      { const s = await stack(); for (let i = 0; i < 19; i++) await s.deposit(TOK(50)); await measure(s, "pool only, 20 nodes"); }
+      { const s = await stack(); for (let i = 0; i < 49; i++) await s.deposit(TOK(50)); await measure(s, "pool only, 50 nodes"); }
+      { const s = await stack(); const a = await s.seller(TOK(60)); await (await s.list(a, TOK(60))).wait(); await measure(s, "seed + 1 listing"); }
+      { const s = await stack(); const a = await s.seller(TOK(60)), b = await s.seller(TOK(60)); await (await s.list(a, TOK(60))).wait(); await (await s.list(b, TOK(60))).wait(); await measure(s, "seed + 2 listings"); }
+      { const s = await stack(); const a = await s.seller(TOK(60)), b = await s.seller(TOK(60)); await (await s.list(a, TOK(60))).wait(); await (await s.list(b, TOK(60))).wait();
+        await (await s.fx.token.connect(a).transfer(s.fx.signers.alice.address, TOK(60))).wait(); await measure(s, "seed + 1 dead + 1 live listing"); }
+      { const s = await stack({ dustTicks: 36 }); const a = await s.seller(TOK(60)); await (await s.list(a, TOK(60))).wait(); await measure(s, "dusty venue (72 ticks), seed + 1 listing"); }
+    });
   });
 
   describe("gate 2: gas on the pinned stack", () => {
@@ -324,45 +382,56 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       const a = await s.seller(TOK(60));
       await (await s.list(a, TOK(60))).wait(); // poolTail = 50
       assert.equal((await s.pool.queue(100)).length, 50);
-      const rc = await s.buy({ amountSpecified: -(20_000n * 10n ** 6n) }, { refundable: true });
+      const rc = await s.buy({ amountSpecified: -(20_000n * 10n ** 6n) }, { buyAll: true });
       const f = fills(rc, s), order = f.map((x) => x.src + (x.id ? x.id : ""));
       console.log(`      50 nodes + 1 listing: order ${order.join(" > ")}; pool tokens ${f.filter((x) => x.src === "pool").reduce((t, x) => t + x.amount, 0n)}; gas ${rc.gasUsed}`);
       assert.equal(order[order.length - 1], "listing1", "the listing only after the whole queue ahead of it");
     });
 
-    it("16 dead listings ahead of the pool: the attempt cap stops the walk and refunds, never reverts", async () => {
+    it("16 dead listings ahead of stock: a buy that needs it reverts; an independent prune clears the queue and the buy fills", async () => {
       const s = await stack();
-      // retire the seed's sellability first: move every deposit behind 16 listings by listing before any deposit
-      // (the seed is node 1 at or below every snapshot, so it sells first; the cap is measured on the listings after it)
       const sellers = [];
       for (let i = 0; i < 16; i++) { const w = await s.seller(TOK(60)); await (await s.list(w, TOK(60))).wait(); sellers.push(w); }
       await s.deposit(TOK(50)); // node 2, behind all 16 listings
       for (const w of sellers) await (await s.fx.token.connect(w).transfer(s.fx.signers.alice.address, TOK(60))).wait(); // all 16 die
-      const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
-      const f = fills(rc, s), order = f.map((x) => x.src + (x.id ? x.id : ""));
-      const retired = rc.logs.filter((l) => l.address.toLowerCase() === s.registry.target.toLowerCase()).map((l) => { try { return s.registry.interface.parseLog(l); } catch { return null; } }).filter((e) => e && e.name === "Retired").length;
-      console.log(`      16 dead listings: order ${order.join(" > ") || "(none)"}; retired ${retired}; gas ${rc.gasUsed}; paid ${rc.money.paid}`);
-      assert.ok(retired >= 1);
+      const buyer = s.fx.signers.buyerEOA;
+      const p = { zeroForOne: s.zeroForOne, sqrtPriceLimitX96: s.zeroForOne ? MIN_SQRT : MAX_SQRT };
+      // the seed (node 1) is at or below every snapshot and sells first; node 2 sits behind the 16 dead listings
+      const seedOnly = await s.priceAll(GAS);
+      let wall;
+      try { await s.live.connect(buyer).swap.staticCall(s.key, { ...p, amountSpecified: -(seedOnly.charged * 2n) }, GAS); assert.fail("must revert"); }
+      catch (e) { if (e.code === "ERR_ASSERTION") throw e; wall = s.shortfallOf(e); }
+      console.log(`      16 dead listings: a buy past them reverts reason ${wall.reason} with ${wall.filled} filled (the seed)`);
+      assert.equal(wall.reason, 7, "the attempt cap");
+      // independent cleanup, in its own transactions, by anyone
+      const keeper = s.fx.signers.alice;
+      for (let id = 1n; id <= 16n; id++) await (await s.registry.connect(keeper).prune(id, GAS)).wait();
+      for (let id = 1n; id <= 16n; id++) assert.equal((await s.registry.listing(id)).status, 3n, `L${id} retired by prune`);
+      const all = await s.priceAll(GAS);
+      assert.equal(all.filled, TOK(100) + TOK(50), "the seed and node 2 are now reachable");
+      const rc = await s.buy({}, { buyAll: true });
+      const f = fills(rc, s);
+      assert.equal(f.reduce((t, x) => t + x.amount, 0n), TOK(150), "the buy past the cleared queue fills completely");
+      console.log(`      after prune: filled ${f.reduce((t, x) => t + x.amount, 0n)}; gas ${rc.gasUsed}`);
     });
 
-    it("a 50-deposit buy under tight gas limits fills what the gas allows and refunds the rest, never reverting", async () => {
+    it("a 50-deposit buy under tight gas limits either fills completely or reverts, never fills part", async () => {
       const s = await stack();
       for (let i = 0; i < 49; i++) await s.deposit(TOK(50));
       const full = TOK(100) + 49n * TOK(50);
+      const { charged } = await s.priceAll(GAS);
       const rows = [];
       for (const gasLimit of [2_000_000, 3_000_000, 4_000_000, 5_000_000, 8_000_000]) {
         const snap = await network.provider.send("evm_snapshot", []);
         try {
-          const rc = await s.buy({ amountSpecified: -(20_000n * 10n ** 6n) }, { refundable: true, gasLimit });
+          const rc = await s.buy({ amountSpecified: -charged }, { live: true, gasLimit });
           const got = fills(rc, s).reduce((t, x) => t + x.amount, 0n);
           rows.push({ gasLimit, got, gasUsed: rc.gasUsed, reverted: false });
         } catch (e) { rows.push({ gasLimit, reverted: true }); }
         finally { await network.provider.send("evm_revert", [snap]); }
       }
       console.log("      " + rows.map((r) => `${r.gasLimit}: ${r.reverted ? "REVERTED" : `${r.got / 10n ** 18n} of ${full / 10n ** 18n} tokens, gas ${r.gasUsed}`}`).join("; "));
-      // review F3: a limit either fills something (and refunds the rest) or reverts; never succeeds empty
-      for (const r of rows) assert.ok(r.reverted || r.got > 0n, `succeeded with no output at ${r.gasLimit}`);
-      assert.ok(rows.some((r) => !r.reverted && r.got > 0n && r.got < full), "some limit fills part and refunds the rest");
+      for (const r of rows) assert.ok(r.reverted || r.got === full, `filled part (${r.got}) at ${r.gasLimit}`);
       assert.equal(rows[rows.length - 1].got, full, "enough gas fills everything");
     });
 
@@ -376,7 +445,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       assert.ok(maxBuyGas > 1_000_000n, `maxBuy costs ${maxBuyGas}: above the old fixed 1M read cap`);
       const a = await s.seller(TOK(60));
       await (await s.list(a, TOK(60))).wait();
-      const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+      const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
       const order = fills(rc, s).map((x) => x.src + (x.id ? x.id : ""));
       console.log(`      dusty venue: maxBuy ${maxBuyGas}, price ${priceGas} (tier ${ev.tier}, depthOk ${ev.depthOk}); swap order ${order.join(" > ")}; gas ${rc.gasUsed}`);
       assert.deepEqual(order, ["pool", "listing1"]);
@@ -397,6 +466,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       while (hi - lo > 50_000) { const mid = Math.floor((lo + hi) / 2); if ((await at(mid)).filled) hi = mid; else lo = mid; }
       const r = await at(hi), below = await at(lo);
       console.log(`      pool-only $20 swap: fills from gas limit ~${hi} (gas used ${r.gasUsed}); at ${lo}: ${below.reverted ? "reverts" : "succeeds with NO fill"}`);
+      assert.ok(below.reverted, "below the limit it reverts, never succeeds empty");
     });
   });
 });

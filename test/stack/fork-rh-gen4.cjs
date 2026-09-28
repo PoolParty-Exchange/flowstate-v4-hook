@@ -37,7 +37,12 @@ const UR_ABI = ["function execute(bytes commands, bytes[] inputs, uint256 deadli
 const G = { gasLimit: 8_000_000 };
 const SWAP_GAS = { gasLimit: 30_000_000 };
 const V4_SWAP = "0x10";
-const [SWAP_EXACT_IN_SINGLE, SWAP_EXACT_OUT_SINGLE, SETTLE_ALL, TAKE_ALL] = [0x06, 0x08, 0x0c, 0x0f];
+const [SWAP_EXACT_IN_SINGLE, SWAP_EXACT_OUT_SINGLE, SETTLE, SETTLE_ALL, TAKE_ALL] = [0x06, 0x08, 0x0b, 0x0c, 0x0f];
+const [V3_SWAP_EXACT_IN, SWEEP, WRAP_ETH, EXECUTE_SUB_PLAN, ALLOW_REVERT] = [0x00, 0x04, 0x0b, 0x21, 0x80];
+const ADDRESS_THIS = "0x0000000000000000000000000000000000000002";
+const MIN_SQRT = 4295128740n, MAX_SQRT = 1461446703485210103287273052203988822378723970341n;
+const HOODRAT = "0x8e62F281f282686fCa6dCB39288069a93fC23F1c", TENDIES = "0x45242320DBB855EeA8Fd36804C6487E10E97FCF9";
+const GEN3_HOOK = "0x1C74A4CA5cfD8C550E54be091aBda476Acffa8CC";
 
 const send = (m, p) => network.provider.send(m, p);
 const fail = (m) => { console.error(`\nABORT: ${m}`); process.exit(1); };
@@ -101,7 +106,10 @@ async function main() {
   const cashKey = keyOf(WETH, CASHCAT), nativeKey = { currency0: ethers.ZeroAddress, currency1: CASHCAT, fee: 0, tickSpacing: 60, hooks: hookAddr };
   await (await manager.initialize(cashKey, 1n << 96n, G)).wait();
   await (await manager.initialize(nativeKey, 1n << 96n, G)).wait();
-  ok(`hook ${hookAddr} (flags 0x28cc) via CREATE2; pairs CASHCAT/aeWETH and CASHCAT/ETH registered and initialised on the live PoolManager`);
+  // two-door shares (28 Sep 2026): while both ETH pairs are registered each sells only its share of the stock.
+  // Sections 1-9 size one pair to the WHOLE stock, so the native-ETH pair is registered only for [4] and [10].
+  await (await hook.unregisterPair(ethers.ZeroAddress, CASHCAT)).wait();
+  ok(`hook ${hookAddr} (flags 0x28cc) via CREATE2; pairs CASHCAT/aeWETH and CASHCAT/ETH registered and initialised on the live PoolManager (CASHCAT/ETH unregistered outside [4] and [10])`);
 
   // ── Universal Router encoding (the live router's V4Router; struct shape detected by simulation) ─
   let withMinHop = true;
@@ -128,6 +136,28 @@ async function main() {
   await (await weth.connect(buyer).approve(PERMIT2, ethers.MaxUint256)).wait();
   const far = BigInt((await now()) + 30 * 86400);
   await (await permit2.connect(buyer).approve(WETH, UNIVERSAL_ROUTER, MAX160, far)).wait();
+  // WSR F5 (27 Sep 2026): exact input fills the whole slice or reverts. A slice is sized the way a
+  // splitting aggregator sizes it: an oversized probe reverts ExactInputShortfall(filled, ...), then an
+  // exact-output quote of `filled` tokens gives the exact price (the test-only live-delta router returns it).
+  const LR = artifact("Gen4LiveDeltaRouter.sol", "Gen4LiveDeltaRouter");
+  const live = await new ethers.ContractFactory(LR.abi, LR.bytecode, admin).deploy(POOL_MANAGER);
+  await (await weth.connect(buyer).approve(live.target, ethers.MaxUint256)).wait();
+  const WRAPPED = new ethers.Interface(["error WrappedError(address target, bytes4 selector, bytes reason, bytes details)"]);
+  const shortfallOf = (e) => {
+    let data = e.data ?? e.error?.data ?? e.info?.error?.data;
+    if (data && typeof data === "object") data = data.data; // over the fork's JSON-RPC the revert data is nested once more
+    const w = WRAPPED.parseError(data), inner = hook.interface.parseError(w.args.reason);
+    return { name: inner.name, filled: inner.args[0], wanted: inner.args[1], reason: Number(inner.args[2]) };
+  };
+  const sizeAll = async (who, key, inC) => {
+    const zfo = BigInt(inC) === BigInt(key.currency0), p = { zeroForOne: zfo, sqrtPriceLimitX96: zfo ? MIN_SQRT : MAX_SQRT };
+    let filled;
+    try { await live.connect(who).swap.staticCall(key, { ...p, amountSpecified: -(10n ** 20n) }, SWAP_GAS); fail("an oversized probe filled"); }
+    catch (e) { if (e.code === undefined && String(e).includes("ABORT")) throw e; const sf = shortfallOf(e); if (sf.name !== "ExactInputShortfall") fail(`probe reverted ${sf.name}`); filled = sf.filled; }
+    const [d0, d1] = await live.connect(who).swap.staticCall(key, { ...p, amountSpecified: filled }, SWAP_GAS);
+    return { filled, charged: -(zfo ? d0 : d1) };
+  };
+
   // detect the router's ExactInputSingleParams shape with a harmless simulation
   try { await (await urCall(buyer, cashKey, WETH, CASHCAT, "in", 1_000_000_000n, 0n)).sim(); }
   catch (e) { withMinHop = false; try { await (await urCall(buyer, cashKey, WETH, CASHCAT, "in", 1_000_000_000n, 0n)).sim(); withMinHop = false; } catch { withMinHop = true; } }
@@ -164,7 +194,8 @@ async function main() {
   const bound2 = await boundedInventory(pool, (await registry.listing(L2)).poolTail);
   const jar0 = await weth.balanceOf(TOKEN_JAR), b0 = await weth.balanceOf(buyer.address), c0 = await cash.balanceOf(buyer.address);
   const urW0 = await weth.balanceOf(UNIVERSAL_ROUTER), urC0 = await cash.balanceOf(UNIVERSAL_ROUTER), hk0 = await weth.balanceOf(hookAddr);
-  const budget = ((lot * 10n) * rate) / 10n ** 18n * 2n; // twice the value of everything queued and listed here
+  const sized1 = await sizeAll(buyer, cashKey, WETH); // the whole stock, sized as an aggregator would
+  const budget = sized1.charged;
   const call1 = await urCall(buyer, cashKey, WETH, CASHCAT, "in", budget, 1n);
   const rc1 = await (await call1.run()).wait();
   const f1 = fills(rc1, pool), h1 = hookEvents(rc1);
@@ -179,12 +210,13 @@ async function main() {
   const sources1 = f1.reduce((t, x) => t + x.quote, 0n);
   if (got1 !== f1.reduce((t, x) => t + x.amount, 0n)) fail("buyer's CASHCAT differs from the fills");
   if (paid1 !== sources1 + h1.spread + h1.jar + h1.dust) fail(`conservation: paid ${paid1} vs ${sources1} + ${h1.spread} + ${h1.jar} + ${h1.dust}`);
-  if (paid1 >= budget) fail("no refund on an over-sized budget");
+  if (paid1 !== budget) fail(`exact input must charge the whole slice: paid ${paid1} of ${budget}`);
+  if (got1 !== sized1.filled) fail(`the slice was not filled completely: ${got1} of ${sized1.filled}`);
   if ((await weth.balanceOf(TOKEN_JAR)) - jar0 !== h1.jar || h1.jar === 0n) fail("TokenJar fee not received as reported");
   if ((await weth.balanceOf(UNIVERSAL_ROUTER)) !== urW0 || (await cash.balanceOf(UNIVERSAL_ROUTER)) !== urC0) fail("the router kept a balance");
   if ((await weth.balanceOf(hookAddr)) - hk0 !== h1.spread + h1.dust || (await cash.balanceOf(hookAddr)) !== 0n) fail("the hook holds more than its spread and dust");
   gasTable.push(["UR exact input, live nodes + L1 + deposit + L2", rc1.gasUsed]);
-  ok(`sold ${ethers.formatUnits(got1, 18)} CASHCAT for ${ethers.formatUnits(paid1, 18)} WETH of a ${ethers.formatUnits(budget, 18)} budget (rest refunded); pool never sold past a listing's snapshot; jar ${h1.jar}, spread ${h1.spread}, dust ${h1.dust}; router and hook keep nothing else`);
+  ok(`sold ${ethers.formatUnits(got1, 18)} CASHCAT for ${ethers.formatUnits(paid1, 18)} WETH (the slice sized to the whole stock, filled completely); pool never sold past a listing's snapshot; jar ${h1.jar}, spread ${h1.spread}, dust ${h1.dust}; router and hook keep nothing else`);
 
   // ── [2] minimum output: the router refuses and nothing changes ─────────────────────────────────
   console.log("\n[2] minimum output");
@@ -213,6 +245,7 @@ async function main() {
 
   // ── [4] native ETH in (the hook wraps into aeWETH) ─────────────────────────────────────────────
   console.log("\n[4] native ETH exact input");
+  await (await hook.registerPair(ethers.ZeroAddress, CASHCAT, cashPoolAddr, 16)).wait(); // both ETH pairs: native 80% (the default)
   const s4 = await seller(CASHCAT, cashSrc, lot); await list(s4, lot);
   const ethIn = ((lot / 2n) * rate) / 10n ** 18n; // well inside what is queued: a full fill
   const cN = await cash.balanceOf(buyer.address), hkW = await weth.balanceOf(hookAddr);
@@ -223,6 +256,7 @@ async function main() {
   if (gotN === 0n || gotN !== f4.reduce((t, x) => t + x.amount, 0n)) fail("native swap delivered nothing or not the fills");
   if (ethIn !== f4.reduce((t, x) => t + x.quote, 0n) + h4.spread + h4.jar + h4.dust) fail("native conservation");
   if ((await ethers.provider.getBalance(hookAddr)) !== 0n) fail("the hook holds native ETH");
+  await (await hook.unregisterPair(ethers.ZeroAddress, CASHCAT)).wait();
   if ((await weth.balanceOf(hookAddr)) - hkW !== h4.spread + h4.dust) fail("native: hook's aeWETH moved by more than spread and dust");
   gasTable.push(["UR native ETH exact input", rc4.gasUsed]);
   ok(`${ethers.formatUnits(ethIn, 18)} ETH bought ${ethers.formatUnits(gotN, 18)} CASHCAT; margin held in aeWETH, no native left on the hook`);
@@ -282,6 +316,253 @@ async function main() {
   await (await hook.sweepMargin(WETH)).wait();
   if ((await weth.balanceOf(sweepTo)) !== margin || (await weth.balanceOf(hookAddr)) !== 0n) fail("sweep");
   ok(`owner swept ${ethers.formatUnits(margin, 18)} aeWETH of margin; the hook holds nothing`);
+
+  // ── [7] Wilko's router plans: the router holds the input (WRAP_ETH, and USDG -> WETH on V3 first) ─────
+  console.log("\n[7] router-held input through the live Universal Router: exact, oversized, allow-revert with and without SWEEP");
+  const zfoW = BigInt(WETH) === BigInt(cashKey.currency0);
+  const ethOf = (a) => ethers.provider.getBalance(a);
+  const urState = async () => ({ eth: await ethOf(UNIVERSAL_ROUTER), weth: await weth.balanceOf(UNIVERSAL_ROUTER), usdg: await usdg.balanceOf(UNIVERSAL_ROUTER), cash: await cash.balanceOf(UNIVERSAL_ROUTER) });
+  const sameUr = (a, b) => a.eth === b.eth && a.weth === b.weth && a.usdg === b.usdg && a.cash === b.cash;
+  const usdg = new ethers.Contract(USDG, ERC20, ethers.provider);
+  const strangerSweep = async () => {
+    const st = await throwaway(), w0 = await weth.balanceOf(st.address), e0 = await ethOf(st.address);
+    const ins = [coder.encode(["address", "address", "uint256"], [WETH, st.address, 0n]), coder.encode(["address", "address", "uint256"], [ethers.ZeroAddress, st.address, 0n])];
+    const rc = await (await ur.connect(st).execute(ethers.solidityPacked(["uint8", "uint8"], [SWEEP, SWEEP]), ins, (await now()) + 600, { gasLimit: 400_000 })).wait();
+    return { weth: (await weth.balanceOf(st.address)) - w0, eth: (await ethOf(st.address)) - e0 + rc.gasUsed * rc.gasPrice };
+  };
+  const v4RouterPays = (amount) => coder.encode(["bytes", "bytes[]"], [ethers.solidityPacked(["uint8", "uint8", "uint8"], [SETTLE, SWAP_EXACT_IN_SINGLE, TAKE_ALL]),
+    [coder.encode(["address", "uint256", "bool"], [WETH, amount, false]), exactInParams(cashKey, zfoW, amount, 1n), coder.encode(["address", "uint256"], [CASHCAT, 1n])]]);
+  const subPlan = (v4Input) => coder.encode(["bytes", "bytes[]"], [ethers.solidityPacked(["uint8"], [0x10]), [v4Input]]);
+  const sweepBack = (to) => coder.encode(["address", "address", "uint256"], [WETH, to, 0n]);
+  const plan = async (who, cmds, inputs, value) => (await ur.connect(who).execute(ethers.solidityPacked(cmds.map(() => "uint8"), cmds), inputs, (await now()) + 600, { ...SWAP_GAS, value })).wait();
+  // a USDG payer for the multi-step route
+  const usdgSrc = await impersonate(WETH_USDG_V3);
+  const payerU = await throwaway();
+  await (await usdg.connect(usdgSrc).transfer(payerU.address, 50_000n * 10n ** 6n)).wait();
+  await (await usdg.connect(payerU).approve(PERMIT2, ethers.MaxUint256)).wait();
+  await (await permit2.connect(payerU).approve(USDG, UNIVERSAL_ROUTER, MAX160, far)).wait();
+  const [sqrtWU] = await new ethers.Contract(WETH_USDG_V3, V3_ABI, ethers.provider).slot0(); // token0 aeWETH, token1 USDG
+  const usdgPerWeth = (sqrtWU * sqrtWU * 10n ** 18n) / (1n << 192n); // USDG raw per 1 WETH
+  // this router build's V3_SWAP_EXACT_IN takes a per-hop price floor array after payerIsUser (empty = none)
+  const v3In = (usdgAmount, recipient) => coder.encode(["address", "uint256", "uint256", "bytes", "bool", "uint256[]"],
+    [recipient, usdgAmount, 0n, ethers.solidityPacked(["address", "uint24", "address"], [USDG, 100, WETH]), true, []]);
+  const v4AfterV3 = coder.encode(["bytes", "bytes[]"], [ethers.solidityPacked(["uint8", "uint8", "uint8"], [SETTLE, SWAP_EXACT_IN_SINGLE, TAKE_ALL]),
+    [coder.encode(["address", "uint256", "bool"], [WETH, 1n << 255n, false]), exactInParams(cashKey, zfoW, 0n, 1n), coder.encode(["address", "uint256"], [CASHCAT, 1n])]]);
+  const rows7 = [];
+  const case7 = async (label, fn) => { const r = await fn(); rows7.push([label, r]); console.log(`   ${label}: ${r}`); };
+  const freshStock = async () => { const sx = await seller(CASHCAT, cashSrc, lot); await list(sx, lot); return sizeAll(buyer, cashKey, WETH); };
+
+  await case7("a. WRAP_ETH, slice = our stock", async () => {
+    const st = await freshStock(), u0 = await urState(), b = await throwaway(), c0 = await cash.balanceOf(b.address);
+    await plan(b, [WRAP_ETH, 0x10], [coder.encode(["address", "uint256"], [ADDRESS_THIS, st.charged]), v4RouterPays(st.charged)], st.charged);
+    const got = (await cash.balanceOf(b.address)) - c0;
+    if (got !== st.filled) fail("7a: slice not filled completely"); if (!sameUr(u0, await urState())) fail("7a: the router kept a balance");
+    return `filled ${ethers.formatUnits(got, 18)} CASHCAT completely; router unchanged`;
+  });
+  await case7("b. WRAP_ETH 10 ETH, oversized, no allow-revert", async () => {
+    await freshStock(); const u0 = await urState(), b = await throwaway(), e0 = await ethOf(b.address);
+    let reverted = false; try { await plan(b, [WRAP_ETH, 0x10], [coder.encode(["address", "uint256"], [ADDRESS_THIS, 10n ** 19n]), v4RouterPays(10n ** 19n)], 10n ** 19n); } catch { reverted = true; }
+    if (!reverted) fail("7b: an oversized slice went through"); if (!sameUr(u0, await urState())) fail("7b: the router kept a balance");
+    return `whole transaction reverted; buyer's 10 ETH never left (balance change ${ethers.formatUnits((await ethOf(b.address)) - e0, 18)} ETH, gas only); router unchanged`;
+  });
+  await case7("c0. WRAP_ETH 10 ETH, oversized, allow-revert flag set directly on V4_SWAP", async () => {
+    const u0 = await urState(), b = await throwaway();
+    let reverted = false; try { await plan(b, [WRAP_ETH, 0x10 | ALLOW_REVERT], [coder.encode(["address", "uint256"], [ADDRESS_THIS, 10n ** 19n]), v4RouterPays(10n ** 19n)], 10n ** 19n); } catch { reverted = true; }
+    if (!sameUr(u0, await urState())) fail("7c0: the router kept a balance");
+    return reverted ? "the flag does not catch V4_SWAP on this router: the whole transaction reverted; router unchanged" : "the flag caught it (unexpected)";
+  });
+  await case7("c. WRAP_ETH 10 ETH, oversized, our swap inside a sub-plan allowed to fail, NO sweep", async () => {
+    const u0 = await urState(), b = await throwaway();
+    await plan(b, [WRAP_ETH, EXECUTE_SUB_PLAN | ALLOW_REVERT], [coder.encode(["address", "uint256"], [ADDRESS_THIS, 10n ** 19n]), subPlan(v4RouterPays(10n ** 19n))], 10n ** 19n);
+    const u1 = await urState(), left = u1.weth - u0.weth, sw = await strangerSweep();
+    return `transaction succeeded, our swap reverted inside it; ${ethers.formatUnits(left, 18)} aeWETH left in the router by the PLAN; a stranger's SWEEP took ${ethers.formatUnits(sw.weth, 18)} aeWETH`;
+  });
+  await case7("d. same as c, plus SWEEP of aeWETH back to the buyer", async () => {
+    const u0 = await urState(), b = await throwaway(), w0 = await weth.balanceOf(b.address);
+    await plan(b, [WRAP_ETH, EXECUTE_SUB_PLAN | ALLOW_REVERT, SWEEP], [coder.encode(["address", "uint256"], [ADDRESS_THIS, 10n ** 19n]), subPlan(v4RouterPays(10n ** 19n)), sweepBack(b.address)], 10n ** 19n);
+    const back = (await weth.balanceOf(b.address)) - w0, sw = await strangerSweep();
+    if (!sameUr(u0, await urState())) fail("7d: the router kept a balance");
+    return `buyer's own sweep returned ${ethers.formatUnits(back, 18)} aeWETH; router unchanged; a stranger's SWEEP took ${ethers.formatUnits(sw.weth, 18)}`;
+  });
+  await case7("e. USDG -> WETH on V3 to the router, then our pool, slice inside our stock", async () => {
+    const st = await freshStock(), u0 = await urState(), c0 = await cash.balanceOf(payerU.address), usd0 = await usdg.balanceOf(payerU.address);
+    const usdgIn = (st.charged / 2n) * usdgPerWeth / 10n ** 18n; // about half the stock's value: the V3 output stays inside it
+    await plan(payerU, [V3_SWAP_EXACT_IN, 0x10], [v3In(usdgIn, ADDRESS_THIS), v4AfterV3], 0n);
+    const got = (await cash.balanceOf(payerU.address)) - c0;
+    if (got === 0n) fail("7e: nothing bought"); if (!sameUr(u0, await urState())) fail("7e: the router kept a balance");
+    return `${ethers.formatUnits(usd0 - (await usdg.balanceOf(payerU.address)), 6)} USDG -> ${ethers.formatUnits(got, 18)} CASHCAT; router unchanged`;
+  });
+  await case7("f. USDG -> WETH -> our pool, oversized, no allow-revert", async () => {
+    await freshStock(); const u0 = await urState(), usd0 = await usdg.balanceOf(payerU.address);
+    let reverted = false; try { await plan(payerU, [V3_SWAP_EXACT_IN, 0x10], [v3In(20_000n * 10n ** 6n, ADDRESS_THIS), v4AfterV3], 0n); } catch { reverted = true; }
+    if (!reverted) fail("7f: an oversized multi-step went through"); if (!sameUr(u0, await urState()) || (await usdg.balanceOf(payerU.address)) !== usd0) fail("7f: funds moved");
+    return "whole transaction reverted; buyer's USDG unchanged; router unchanged";
+  });
+  await case7("g. same as f, our swap inside a sub-plan allowed to fail, NO sweep", async () => {
+    const u0 = await urState();
+    await plan(payerU, [V3_SWAP_EXACT_IN, EXECUTE_SUB_PLAN | ALLOW_REVERT], [v3In(20_000n * 10n ** 6n, ADDRESS_THIS), subPlan(v4AfterV3)], 0n);
+    const left = (await weth.balanceOf(UNIVERSAL_ROUTER)) - u0.weth, sw = await strangerSweep();
+    return `V3 leg ran, our swap reverted; ${ethers.formatUnits(left, 18)} aeWETH left in the router by the PLAN; a stranger's SWEEP took ${ethers.formatUnits(sw.weth, 18)}`;
+  });
+  await case7("h. same as g, plus SWEEP of aeWETH back to the buyer", async () => {
+    const u0 = await urState(), w0 = await weth.balanceOf(payerU.address);
+    await plan(payerU, [V3_SWAP_EXACT_IN, EXECUTE_SUB_PLAN | ALLOW_REVERT, SWEEP], [v3In(20_000n * 10n ** 6n, ADDRESS_THIS), subPlan(v4AfterV3), sweepBack(payerU.address)], 0n);
+    const back = (await weth.balanceOf(payerU.address)) - w0, sw = await strangerSweep();
+    if (!sameUr(u0, await urState())) fail("7h: the router kept a balance");
+    return `buyer's own sweep returned ${ethers.formatUnits(back, 18)} aeWETH; router unchanged; a stranger's SWEEP took ${ethers.formatUnits(sw.weth, 18)}`;
+  });
+  ok("router-held input: an exact slice fills; an oversized slice reverts the whole transaction; only a plan that wraps our swap in an allowed-to-fail sub-plan AND omits a sweep leaves its own funds in the router");
+
+  // ── [8] Gen-3 pairs on the deployed gen-3 hook (must all be unregistered before any passive lane reopens) ──
+  console.log("\n[8] gen-3 pairs on " + GEN3_HOOK);
+  const g3 = new ethers.Contract(GEN3_HOOK, ["function pairs(bytes32) view returns (address marketPool, bool quoteIsCurrency0, bool registered, uint16 baseSpreadBps, address marketAsset)"], ethers.provider);
+  const pk = (a, b) => { const [c0, c1] = sortKey(a, b); return ethers.keccak256(coder.encode(["address", "address"], [c0, c1])); };
+  const g3pairs = [["CASHCAT/WETH", CASHCAT, WETH], ["CASHCAT/USDG", CASHCAT, USDG], ["HOODRAT/WETH", HOODRAT, WETH], ["HOODRAT/USDG", HOODRAT, USDG], ["TENDIES/USDG", TENDIES, USDG], ["TENDIES/WETH", TENDIES, WETH]];
+  let stillRegistered = 0;
+  for (const [label, a, b] of g3pairs) { const r = await g3.pairs(pk(a, b)); if (r.registered) stillRegistered++; console.log(`   ${label}: registered ${r.registered}`); }
+  if (process.env.PREOPEN && stillRegistered) fail(`${stillRegistered} gen-3 pairs still registered: unregister all six before any passive lane reopens`);
+  ok(`${stillRegistered} of 6 gen-3 pairs registered on this fork (the live state; the cutover unregisters all six before a passive lane reopens; PREOPEN=1 makes this a hard gate)`);
+
+  // ── [9] gas matrix through the live Universal Router: gas used, estimate, lowest limit that fills ──
+  console.log("\n[9] gas matrix (each case sized to the whole stock; under all-or-nothing a limit fills completely or reverts)");
+  const matrix = [];
+  // GAS_MARKS=1 with a measurement-only hook build that emits GasMark(tag, gasleft()) around every part of a
+  // swap (never the production hook): prints what each part cost inside this matrix case.
+  const MARK = ethers.id("GasMark(uint8,uint256)");
+  const gasMarks = async (label, amount) => {
+    const sn = await send("evm_snapshot", []);
+    try {
+      const c = await urCall(buyer, cashKey, WETH, CASHCAT, "in", amount, 1n, 0n, { gasLimit: 30_000_000 });
+      const rc = await (await c.run()).wait();
+      const marks = rc.logs.filter((l) => l.address.toLowerCase() === hookAddr.toLowerCase() && l.topics[0] === MARK).map((l) => coder.decode(["uint8", "uint256"], l.data)).map(([t, g]) => [Number(t), Number(g)]);
+      const out = { attemptReads: [], poolLegs: [], listingLegs: [] };
+      for (let i = 0; i < marks.length; i++) {
+        const [t, g] = marks[i], next = marks[i + 1];
+        if (t === 1 && next && (next[0] === 2 || next[0] === 4)) out.attemptReads.push(g - next[1]);
+        if (t === 2 && next && next[0] === 3) out.poolLegs.push(g - next[1]);
+        if (t === 4 && next && next[0] === 5) out.listingLegs.push(g - next[1]);
+        if (t === 0) out.hookEntry = g;
+        if (t === 6) out.loopEnd = g;
+        if (t === 8) out.hookExit = g;
+      }
+      out.finalisation = out.loopEnd - out.hookExit;
+      out.hookTotal = out.hookEntry - out.hookExit;
+      out.outsideHook = Number(rc.gasUsed) - out.hookTotal;
+      console.log(`     marks ${label}: ${JSON.stringify(out)}`);
+    } finally { await send("evm_revert", [sn]); }
+  };
+  const measure = async (label, setup) => {
+    const snap = await send("evm_snapshot", []);
+    try {
+      await setup();
+      const st = await sizeAll(buyer, cashKey, WETH);
+      const call = await urCall(buyer, cashKey, WETH, CASHCAT, "in", st.charged, 1n);
+      const est = await call.est();
+      const at = async (gasLimit) => {
+        const sn = await send("evm_snapshot", []);
+        try { const c = await urCall(buyer, cashKey, WETH, CASHCAT, "in", st.charged, 1n, 0n, { gasLimit }); const rc = await (await c.run()).wait(); return { ok: rc.status === 1, used: rc.gasUsed }; }
+        catch { return { ok: false }; }
+        finally { await send("evm_revert", [sn]); }
+      };
+      const full = await at(30_000_000);
+      if (!full.ok) fail(`${label}: does not fill at 30M`);
+      let lo = 300_000, hi = 30_000_000;
+      while (hi - lo > 25_000) { const mid = Math.floor((lo + hi) / 2); if ((await at(mid)).ok) hi = mid; else lo = mid; }
+      const used = Number(full.used);
+      if (process.env.GAS_MARKS) await gasMarks(label, st.charged);
+      matrix.push([label, used, Number(est), hi]);
+      console.log(`   ${label}: used ${used}, estimate ${est} (${(Number(est) / used).toFixed(2)}x), lowest limit that fills ${hi} (${(hi / used).toFixed(2)}x used)`);
+    } finally { await send("evm_revert", [snap]); }
+  };
+  await measure("pool only (1 deposit)", async () => { await deposit(lot * 2n); });
+  await measure("pool (1 deposit) + 1 listing", async () => { await deposit(lot * 2n); const a = await seller(CASHCAT, cashSrc, lot); await list(a, lot); });
+  await measure("pool (1 deposit) + 2 listings", async () => { await deposit(lot * 2n); const a = await seller(CASHCAT, cashSrc, lot), b = await seller(CASHCAT, cashSrc, lot); await list(a, lot); await list(b, lot); });
+  await measure("pool (1 deposit) + 1 dead + 1 live listing", async () => {
+    await deposit(lot * 2n); const a = await seller(CASHCAT, cashSrc, lot), b = await seller(CASHCAT, cashSrc, lot); await list(a, lot); await list(b, lot);
+    await (await cash.connect(a).transfer(cashSrc.address, lot)).wait(); // the first listing dies
+  });
+  await measure("pool (5 deposits)", async () => { for (let i = 0; i < 5; i++) await deposit(lot); });
+
+  // ── [10] two ETH pairs on one stock: native-ETH and aeWETH V4 pairs, shares 60/40 ────────────────
+  console.log("\n[10] two ETH pairs on one stock (native-ETH and aeWETH V4 pairs, native share 60%)");
+  {
+    await (await hook.registerPair(ethers.ZeroAddress, CASHCAT, cashPoolAddr, 16)).wait();
+    await (await hook.setNativeShare(cashPoolAddr, 6000)).wait();
+    await deposit(lot * 4n);
+    const L10 = await seller(CASHCAT, cashSrc, lot); await list(L10, lot);
+    // each pair's largest exact-input slice, found the way an aggregator finds it: simulate, halve, repeat
+    const maxIn = async (key, inC) => {
+      const value = (a) => (inC === ethers.ZeroAddress ? a : 0n);
+      let lo = 0n, hi = 10n ** 19n;
+      while (hi - lo > 10n ** 9n) {
+        const mid = (lo + hi) / 2n;
+        try { await (await urCall(buyer, key, inC, CASHCAT, "in", mid, 1n, value(mid))).sim(); lo = mid; } catch { hi = mid; }
+      }
+      return lo;
+    };
+    const [floorW, minW] = [await m.inventoryFloor(WETH), await m.minContribution(WETH)];
+    const nIn = await maxIn(nativeKey, ethers.ZeroAddress), wIn = await maxIn(cashKey, WETH);
+    const tokensAt = async (key, inC, amount) => { const c0 = await cash.balanceOf(buyer.address); const sn = await send("evm_snapshot", []); try { await (await (await urCall(buyer, key, inC, CASHCAT, "in", amount, 1n, inC === ethers.ZeroAddress ? amount : 0n)).run()).wait(); return (await cash.balanceOf(buyer.address)) - c0; } finally { await send("evm_revert", [sn]); } };
+    const nTok = await tokensAt(nativeKey, ethers.ZeroAddress, nIn), wTok = await tokensAt(cashKey, WETH, wIn);
+    const [maxBuyTok] = await m.maxBuy(cashPoolAddr, WETH);
+    console.log(`   largest slice: native-ETH pair ${ethers.formatUnits(nTok, 18)} CASHCAT, aeWETH pair ${ethers.formatUnits(wTok, 18)} CASHCAT (market maxBuy ${ethers.formatUnits(maxBuyTok, 18)}; floor ${floorW}, minimum ${minW})`);
+    // the native pair (the larger share) gets 60% of the noted stock; the aeWETH pair 40% less the strand
+    const [, rate10] = await settlement.price(CASHCAT, WETH);
+    const minimum10 = minW > floorW ? minW : floorW;
+    const strand = ((floorW + minimum10 + minimum10 / 4n) * 10n ** 18n + rate10 - 1n) / rate10;
+    const noteD = (nTok * 10000n) / 6000n, expectW = (noteD * 4000n) / 10000n > strand ? (noteD * 4000n) / 10000n - strand : 0n;
+    const off = wTok > expectW ? wTok - expectW : expectW - wTok;
+    console.log(`   noted stock about ${ethers.formatUnits(noteD, 18)}; strand ${ethers.formatUnits(strand, 18)} off the aeWETH pair; expected aeWETH ${ethers.formatUnits(expectW, 18)}`);
+    if (off * 200n > noteD) fail(`10: aeWETH slice ${wTok} not 40% of the note less the strand (${expectW})`);
+    // one Universal Router plan buying both slices in one transaction, both orders
+    const both = (first) => {
+      const sw = [[nativeKey, true, nIn], [cashKey, BigInt(WETH) === BigInt(cashKey.currency0), wIn]];
+      const ord = first === "native" ? sw : [sw[1], sw[0]];
+      const actions = ethers.solidityPacked(["uint8", "uint8", "uint8", "uint8", "uint8"], [SWAP_EXACT_IN_SINGLE, SWAP_EXACT_IN_SINGLE, SETTLE_ALL, SETTLE_ALL, TAKE_ALL]);
+      return (scaleW = 1n) => [coder.encode(["bytes", "bytes[]"], [actions, [
+        exactInParams(ord[0][0], ord[0][1], ord[0][0] === cashKey ? ord[0][2] * scaleW : ord[0][2], 1n),
+        exactInParams(ord[1][0], ord[1][1], ord[1][0] === cashKey ? ord[1][2] * scaleW : ord[1][2], 1n),
+        coder.encode(["address", "uint256"], [ethers.ZeroAddress, nIn]), coder.encode(["address", "uint256"], [WETH, wIn * scaleW]),
+        coder.encode(["address", "uint256"], [CASHCAT, 1n])]])];
+    };
+    for (const first of ["native", "aeWETH"]) {
+      const sn = await send("evm_snapshot", []);
+      try {
+        const c0 = await cash.balanceOf(buyer.address);
+        const rc = await plan(buyer, [V4_SWAP], both(first)(), nIn);
+        const got = (await cash.balanceOf(buyer.address)) - c0;
+        const want = nTok + wTok, diff = got > want ? got - want : want - got;
+        if (diff * 10n ** 12n > want) fail(`10 (${first} first): got ${got}, expected ${want}`); // rounding only: both slices filled
+        console.log(`   ${first} first: one transaction bought ${ethers.formatUnits(got, 18)} CASHCAT through both pairs (gas ${rc.gasUsed})`);
+      } finally { await send("evm_revert", [sn]); }
+    }
+    // the fade shape: the aeWETH slice at 1.5x its share. Refused whole; nothing moves
+    {
+      const c0 = await cash.balanceOf(buyer.address), w0 = await weth.balanceOf(buyer.address);
+      let reverted = false;
+      try { await plan(buyer, [V4_SWAP], [coder.encode(["bytes", "bytes[]"], [ethers.solidityPacked(["uint8", "uint8", "uint8", "uint8", "uint8"], [SWAP_EXACT_IN_SINGLE, SWAP_EXACT_IN_SINGLE, SETTLE_ALL, SETTLE_ALL, TAKE_ALL]), [
+        exactInParams(nativeKey, true, nIn, 1n), exactInParams(cashKey, BigInt(WETH) === BigInt(cashKey.currency0), (wIn * 3n) / 2n, 1n),
+        coder.encode(["address", "uint256"], [ethers.ZeroAddress, nIn]), coder.encode(["address", "uint256"], [WETH, (wIn * 3n) / 2n]), coder.encode(["address", "uint256"], [CASHCAT, 1n])]])], nIn); } catch { reverted = true; }
+      if (!reverted) fail("10: a slice above the aeWETH pair's share went through");
+      if ((await cash.balanceOf(buyer.address)) !== c0 || (await weth.balanceOf(buyer.address)) !== w0) fail("10: funds moved on the refused plan");
+      console.log("   aeWETH slice at 1.5x its share: the whole plan reverted, nothing moved (a quote shows this before any route is built)");
+    }
+    // the note lasts one transaction: after a native buy, the next transaction's share is of what is left
+    {
+      const sn = await send("evm_snapshot", []);
+      try {
+        const half = nIn / 2n;
+        const c0 = await cash.balanceOf(buyer.address);
+        await (await (await urCall(buyer, nativeKey, ethers.ZeroAddress, CASHCAT, "in", half, 1n, half)).run()).wait();
+        const sold = (await cash.balanceOf(buyer.address)) - c0;
+        const nIn2 = await maxIn(nativeKey, ethers.ZeroAddress), nTok2 = await tokensAt(nativeKey, ethers.ZeroAddress, nIn2);
+        if (nTok2 <= nTok - sold) fail(`10: the next transaction still counted the earlier sale (${nTok2} <= ${nTok - sold})`);
+        console.log(`   next transaction after a ${ethers.formatUnits(sold, 18)} native buy: the native pair may sell ${ethers.formatUnits(nTok2, 18)} (60% of the stock left, not ${ethers.formatUnits(nTok - sold, 18)})`);
+      } finally { await send("evm_revert", [sn]); }
+    }
+    await (await hook.unregisterPair(ethers.ZeroAddress, CASHCAT)).wait();
+    ok("two ETH pairs: each quotes only its share, both slices fill in one transaction in either order, an over-share slice is refused whole, and the share resets every transaction");
+  }
 
   console.log("\ngas (execution on the fork; Robinhood Chain adds an L1 data component the fork does not model):");
   for (const [k, v] of gasTable) console.log(`   ${String(v).padStart(10)}  ${k}`);

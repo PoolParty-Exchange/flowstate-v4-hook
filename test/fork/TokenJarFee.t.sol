@@ -216,15 +216,14 @@ contract TokenJarFeeForkTest is ForkTestBase {
         );
     }
 
-    /// Short fill (inventory runs out mid-swap, JUP-559 path): the fee is charged on
-    /// what was actually filled (quotePaid), not on the amount the buyer specified,
-    /// the unspent remainder is refunded as before, and the buyer's charge is exactly
-    /// cost + spread with the jar's share inside the spread.
-    function test_ShortFill_JarFeeOnFilledAmountOnly() public {
+    /// Exact-depth fill (WSR F5, 27 Sep 2026): the fee is charged on what was filled, the buyer pays
+    /// cost + spread with the jar's share inside the spread. 500.8 USDG at a 16 bps spread leaves a
+    /// budget of exactly 500 USDG, which buys the pool's whole 1,000 tokens.
+    function test_ExactDepthFill_JarFeeOnFilledAmount() public {
         vm.prank(lister);
         market.withdrawTokens(pool, 0); // empty it
         _contributeInventory(1_000e18); // 1,000 tokens == 500 USDG of depth at rate 5e5
-        uint256 amountIn = 5_000e6; // ten times available depth
+        uint256 amountIn = 500e6 + _ceilBps(500e6, 16);
 
         uint256 jarBefore = IERC20(USDG).balanceOf(TOKEN_JAR);
         uint256 marginBefore = hook.accruedSpreadMargin(Currency.wrap(USDG));
@@ -236,8 +235,26 @@ contract TokenJarFeeForkTest is ForkTestBase {
         uint256 marginKept = hook.accruedSpreadMargin(Currency.wrap(USDG)) - marginBefore;
         uint256 spent = buyerBefore - IERC20(USDG).balanceOf(swapper);
         assertEq(poolContract.tokenBalance(), 0, "inventory fully consumed");
-        assertEq(jarFee, _ceilBps(500e6, JAR_FEE_BPS), "fee on the 500 USDG actually filled, not on 5,000");
+        assertEq(jarFee, _ceilBps(500e6, JAR_FEE_BPS), "fee on the 500 USDG filled");
         assertEq(jarFee + marginKept, _ceilBps(500e6, 16), "jar + margin == full spread on the filled cost");
-        assertEq(spent, 500e6 + _ceilBps(500e6, 16), "buyer charged cost + spread only; remainder refunded");
+        assertEq(spent, amountIn, "buyer charged cost + spread");
+    }
+
+    /// A slice larger than the stock reverts: no fee, no margin, no charge.
+    function test_ShortFill_RevertsWithNoFeeAndNoCharge() public {
+        vm.prank(lister);
+        market.withdrawTokens(pool, 0);
+        _contributeInventory(1_000e18);
+        uint256 jarBefore = IERC20(USDG).balanceOf(TOKEN_JAR);
+        uint256 buyerBefore = IERC20(USDG).balanceOf(swapper);
+        vm.expectRevert();
+        this.routeExternal(5_000e6);
+        assertEq(IERC20(USDG).balanceOf(TOKEN_JAR), jarBefore, "no fee");
+        assertEq(IERC20(USDG).balanceOf(swapper), buyerBefore, "no charge");
+        assertEq(poolContract.tokenBalance(), 1_000e18, "stock untouched");
+    }
+
+    function routeExternal(uint128 amountIn) external {
+        _routeThroughUniversalRouter(amountIn);
     }
 }

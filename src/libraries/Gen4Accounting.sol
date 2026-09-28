@@ -12,7 +12,6 @@ library Gen4Accounting {
 
     error AttemptCapExceeded(uint256 attempts, uint256 cap);
     error CostExceedsCommittedInput(uint256 required, uint256 committed);
-    error RefundExceedsRemainder(uint256 refund, uint256 remainder);
     error JarFeeExceedsSpread(uint256 jarFee, uint256 spread);
     error OutputTargetExceeded(uint256 filled, uint256 target);
     error MinimumOutputNotMet(uint256 received, uint256 minimum);
@@ -32,7 +31,6 @@ library Gen4Accounting {
         uint256 jarFee;
         uint256 retainedSpread;
         uint256 dust;
-        uint256 refund;
         uint256 charged;
     }
 
@@ -53,11 +51,10 @@ library Gen4Accounting {
         totals.listingQuote += quote;
     }
 
-    /// @notice Finalize exact input from actual successful source receipts.
-    /// @param refund Amount the executor has classified as genuinely unspent. The
-    ///        remaining committed input is inversion/carve dust, matching gen-3's
-    ///        distinct dust bucket rather than being silently folded into spread.
-    function exactInput(Totals memory totals, uint256 committed, uint256 spreadBps, uint256 jarFeeBps, uint256 refund)
+    /// @notice Finalize a COMPLETE exact input from actual successful source receipts. Nothing is
+    ///         refunded (WSR F5): the executor has already reverted any short fill, so the remaining
+    ///         committed input is inversion/carve dust, gen-3's distinct dust bucket.
+    function exactInput(Totals memory totals, uint256 committed, uint256 spreadBps, uint256 jarFeeBps)
         internal
         pure
         returns (Final memory result)
@@ -66,10 +63,8 @@ library Gen4Accounting {
         uint256 required = result.cost + result.spread;
         if (required > committed) revert CostExceedsCommittedInput(required, committed);
         uint256 remainder = committed - required;
-        if (refund > remainder) revert RefundExceedsRemainder(refund, remainder);
-        result.refund = refund;
-        result.dust = remainder - refund;
-        result.charged = committed - refund;
+        result.dust = remainder;
+        result.charged = committed;
     }
 
     function exactOutput(Totals memory totals, uint256 spreadBps, uint256 jarFeeBps)
