@@ -6,7 +6,6 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
-import {IV4Quoter} from "@uniswap/v4-periphery/src/interfaces/IV4Quoter.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ForkTestBase} from "./ForkTestBase.sol";
 import {FlowstateBeaconSeeder, AnchorFloor} from "../../src/FlowstateBeaconSeeder.sol";
@@ -17,7 +16,9 @@ import {MockInventoryToken} from "../mocks/MockInventoryToken.sol";
 ///         periphery bundles that add with a first deposit in one transaction.
 ///         Invariants under test, in order of blast radius:
 ///           1. no position of real size can EVER be created (gate fuzz);
-///           2. the dust never affects pricing (quote invariance to the wei);
+///           2. the dust never affects pricing (quote invariance to the wei): since 29 Sep
+///              2026 in test/stack/gen4-stack.test.cjs (the quote runs a swap, and this fork's
+///              hook, wired to test/fork/ListingStandIn.sol, cannot swap);
 ///           3. one approval + one transaction gives deposit + beacon, with a
 ///              beacon failure never blocking the deposit;
 ///           4. once-per-pool semantics are per poolId, not global.
@@ -68,25 +69,6 @@ contract BeaconSeederForkTest is ForkTestBase {
         lpRouter.modifyLiquidity(
             poolKey, ModifyLiquidityParams({tickLower: -600, tickUpper: 600, liquidityDelta: 1, salt: bytes32(uint256(1))}), ""
         );
-    }
-
-    // -- 2. dust never prices -------------------------------------------------
-
-    function test_PricingInvariance_QuotesIdenticalBeforeAndAfterSeed() public {
-        uint128[3] memory sizes = [uint128(10e6), uint128(1_000e6), uint128(25_000e6)];
-        uint256[3] memory before_;
-        for (uint256 i; i < 3; i++) {
-            (before_[i],) = _quoteExactIn(sizes[i]);
-        }
-
-        vm.prank(depositor);
-        seeder.seed(poolKey, address(token));
-        assertTrue(hook.beaconSeeded(poolKey.toId()), "beacon lit");
-
-        for (uint256 i; i < 3; i++) {
-            (uint256 after_,) = _quoteExactIn(sizes[i]);
-            assertEq(after_, before_[i], "dust changed a quote");
-        }
     }
 
     // -- 3. one approval, one transaction; failure isolation ------------------
@@ -182,20 +164,6 @@ contract BeaconSeederForkTest is ForkTestBase {
         vm.prank(makeAddr("stranger"));
         vm.expectRevert(FlowstateBeaconSeeder.NotPayer.selector);
         seeder.seedFor(poolKey, address(token), depositor);
-    }
-
-    // -- helper ---------------------------------------------------------------
-
-    function _quoteExactIn(uint128 quoteIn) internal returns (uint256 amountOut, uint256 gasEst) {
-        vm.prank(makeAddr("fresh-quoter"));
-        return quoter.quoteExactInputSingle(
-            IV4Quoter.QuoteExactSingleParams({
-                poolKey: poolKey,
-                zeroForOne: _buyZeroForOne(),
-                exactAmount: quoteIn,
-                hookData: ""
-            })
-        );
     }
 
     // -- 4. JUP-611 consent travels unchanged (Wilko, PR #11 review) ------------
