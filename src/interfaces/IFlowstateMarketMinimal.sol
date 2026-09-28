@@ -29,8 +29,6 @@ interface IFlowstateMarketMinimal {
     /// @notice Per-asset inventory floor: a pool whose sellable stock is worth less stops selling.
     function inventoryFloor(address asset) external view returns (uint256);
 
-    /// @notice Per-asset minimum contribution; with the floor, sets the listing minimum.
-    function minContribution(address asset) external view returns (uint256);
 
     /// @notice JUP-696 passive-lane rate used by both pool and listing settlement.
     function previewRate(address pool, address asset) external view returns (bool ok, uint256 rate);
