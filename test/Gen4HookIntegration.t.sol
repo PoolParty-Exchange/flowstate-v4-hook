@@ -759,9 +759,16 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(_buyNative(1_000e18), 1_000e18);
     }
 
+    // native at 20 bps, aeWETH at 16, the floor raised to 18: only the sibling drops below it (Adv pass)
+    function _spreads(uint16 nativeBps, uint16 wrappedBps) internal {
+        hook.setBaseSpread(Currency.wrap(address(0)), Currency.wrap(address(token)), nativeBps);
+        hook.setBaseSpread(Currency.wrap(address(weth)), Currency.wrap(address(token)), wrappedBps);
+    }
+
     function test_E_SiblingBelowTheSpreadFloorDoesNotCount() public {
         _twoEthPools(1_000e18, 0);
-        hook.setBaseSpreadFloor(1); // both registered at spread 0: the sibling cannot trade
+        _spreads(20, 16);
+        hook.setBaseSpreadFloor(18); // the aeWETH pool can no longer trade; the native pool still can
         assertEq(_buyNative(1_000e18), 1_000e18);
     }
 
@@ -1045,11 +1052,78 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(recorder.step(from + 1), 101, "nested: the listing, not a second credited leg");
     }
 
+    // Adversarial pass on beff9e8: a credited leg with deposits still ahead of the listing. Entry 1 =
+    // 100, listings L1 and L2 (10 each) queued after it, entry 2 = 900; K = 0 -> second 200, main 800.
+    // Taking half of entry 1 first leaves the main door both physical stock and credit before L1.
+    function _partialAhead() internal {
+        _twoEthPools(100e18, 0);
+        pool.addNode(2, 900e18);
+        token.mint(address(pool), 900e18);
+        token.mint(address(settlement), 20e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
+        registry.push(Gen4MockRegistry.Candidate(1, 2, 10e18, 1, 1));
+    }
+
+    function test_E_PartialAhead_MainDoorFirst() public {
+        _partialAhead();
+        assertEq(_mainExactOutput(60e18), 60e18); // 60 of entry 1
+        assertEq(_mainExactOutput(50e18), 50e18); // the other 40, then 10 of L1
+        assertEq(_buyWrapped(50e18), 50e18);
+        assertEq(registry.cursor(), 1, "only L1 sold");
+        assertEq(pool.available(), 850e18);
+    }
+
+    function test_E_PartialAhead_SecondDoorFirstSellsTheSameStock() public {
+        _partialAhead();
+        assertEq(_buyWrapped(50e18), 50e18, "second door: half of entry 1");
+        uint256 from = recorder.length();
+        assertEq(_mainExactOutput(60e18), 60e18);
+        uint256[] memory s1 = new uint256[](1);
+        s1[0] = 200; // one credited leg: the other 50 of entry 1, then 10 of entry 2
+        _assertSteps(from, s1);
+        from = recorder.length();
+        assertEq(_mainExactOutput(50e18), 50e18);
+        uint256[] memory s2 = new uint256[](2);
+        (s2[0], s2[1]) = (200, 101); // 40 on the rest of the credit, then L1
+        _assertSteps(from, s2);
+        assertEq(registry.cursor(), 1, "only L1 sold, as with the main door first");
+        assertEq(pool.available(), 850e18);
+    }
+
+    // FIFO case 2 on JUP-698 (for Wilko to confirm): with its deposit budget spent, the main door sells
+    // a listing queued after deposits that stay unsold (the second door's share). K = 0: main 800.
+    function test_E_MainDoorWithItsBudgetSpentSellsANewerListing() public {
+        _twoEthPools(1_000e18, 0);
+        token.mint(address(settlement), 100e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 100e18, 1, 1)); // queued after entry 1
+        assertEq(_buyNative(900e18), 900e18, "800 of deposits, then the listing");
+        assertEq(registry.cursor(), 1, "the newer listing sold");
+        assertEq(pool.available(), 200e18, "the second door's 200 still unsold");
+    }
+
+    // the sibling counts once its V4 pool is initialised: beforeInitialize itself records it (the
+    // other design E tests set the flag through the harness)
+    function test_E_InitialisingTheSiblingPoolTurnsSharingOn() public {
+        pool.setNode(1, 1_000e18, 0);
+        token.mint(address(pool), 1_000e18);
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
+        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool), 0);
+        hook.openPair(address(0), address(token));
+        (address a, address b) = address(weth) < address(token) ? (address(weth), address(token)) : (address(token), address(weth));
+        PoolKey memory k = PoolKey(Currency.wrap(a), Currency.wrap(b), 0, 60, IHooks(address(hook)));
+        vm.prank(address(manager));
+        hook.beforeInitialize(address(this), k, TickMath.MIN_SQRT_PRICE);
+        vm.expectRevert(_shortfall(800e18, 801e18));
+        _buyNative(801e18);
+        assertEq(_buyNative(800e18), 800e18, "the native door is now capped at its 80%");
+    }
+
     // Robin pass 65: an owner call between two swaps of one transaction cannot lift a cap or swap roles
     function test_E_SpreadFloorRaisedMidTransactionKeepsTheCap() public {
         _twoEthPools(1_000e18, 10e18); // second 188, main 802
+        _spreads(20, 16);
         assertEq(_buyWrapped(188e18), 188e18);
-        hook.setBaseSpreadFloor(1); // the sibling now sits below the floor
+        hook.setBaseSpreadFloor(18); // only the sibling (aeWETH, 16) now sits below the floor
         vm.expectRevert(_shortfall(802e18, 803e18));
         _buyNative(803e18);
         assertEq(_buyNative(802e18), 802e18);

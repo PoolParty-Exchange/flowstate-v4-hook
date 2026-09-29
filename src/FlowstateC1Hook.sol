@@ -616,9 +616,10 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         emit MarginSwept(held, to, spreadPortion, dustPortion, swept);
     }
 
-    /// @notice Recover ETH. None accrues: native taken for a swap is wrapped in the same
-    ///         swap, and receive() accepts only the PoolManager and weth9 inside a swap,
-    ///         so only force-sent ETH can remain here.
+    /// @notice Recover ETH. None accrues from swaps: native taken for a swap is wrapped in the
+    ///         same swap. receive() accepts only the PoolManager and weth9, but anyone can have
+    ///         the PoolManager send native here from their own unlock, or force-send it; this
+    ///         recovers either.
     function sweepETH() external onlyOwner returns (uint256 swept) {
         address to = sweepDestination;
         if (to == address(0)) revert SweepDestinationNotSet();
