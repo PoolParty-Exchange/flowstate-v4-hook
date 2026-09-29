@@ -386,6 +386,54 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(token.balanceOf(address(manager)), 3e18);
     }
 
+    // Wilko, 29 Sep 2026: dead listings at the front are retired on the way, outside the 16 steps,
+    // up to GEN4_MAX_DEAD_RETIREMENTS per swap. Each dead listing here was queued before the deposit.
+    function _deadAhead(uint64 n) internal {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        for (uint64 id = 1; id <= n; ++id) registry.push(Gen4MockRegistry.Candidate(2, id, 0, 1, 0));
+    }
+
+    function test_DeadListingsDoNotUseTheSixteenSteps() public {
+        _deadAhead(20);
+        (uint256 tokens,,) = hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        assertEq(tokens, 1e18);
+        assertEq(recorder.length(), 21, "20 retirements, then the deposit");
+        for (uint256 i; i < 20; ++i) assertEq(recorder.step(i), 101 + i);
+        assertEq(recorder.step(20), 200);
+        assertEq(registry.cursor(), 20, "all 20 retired");
+    }
+
+    function test_DeadListingsUpToTheCapFillExactInput() public {
+        assertEq(hook.GEN4_MAX_DEAD_RETIREMENTS(), 32);
+        _deadAhead(32);
+        (uint256 tokens,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        assertEq(tokens, 1e18);
+        assertEq(registry.cursor(), 32);
+    }
+
+    function test_DeadListingsAboveTheCapRevertAndRetireNothing() public {
+        _deadAhead(33);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4AttemptCapExceeded.selector, 0));
+        hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 1e18, uint8(7)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        assertEq(registry.cursor(), 0, "the reverted swaps retired nothing");
+    }
+
+    // Robin pass 69: a dead candidate the settlement never retires (STALE every time, still linked) is
+    // bounded by the same cap: the walk stops after 32 dead steps
+    function test_AStuckDeadListingIsBoundedByTheDeadCap() public {
+        _deadAhead(1);
+        settlement.setAlwaysStale(true);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4AttemptCapExceeded.selector, 0));
+        hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        uint256 before = recorder.length();
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 1e18, uint8(7)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        assertEq(recorder.length(), before, "reverted calls leave no record");
+    }
+
     // WSR F5 (27 Sep 2026): a slice fills completely or reverts; nothing is ever handed back
     function test_ExactInputShortFillRevertsAndHandsNothingBack() public {
         pool.setNode(1, 1e18, 0);

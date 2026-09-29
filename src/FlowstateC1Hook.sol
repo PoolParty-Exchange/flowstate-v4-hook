@@ -137,6 +137,11 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     uint256 public constant GEN4_MAX_ATTEMPTS = 16;
+    /// @notice Dead listings one swap may retire on the way to stock, outside GEN4_MAX_ATTEMPTS
+    ///         (Wilko, 29 Sep 2026: 17 dead listings at the front walled a swap off). Retiring sells
+    ///         nothing, so queue order is unchanged; each still needs GEN4_LISTING_LEG_MIN_GAS left.
+    ///         Measured on the real stack: about 231k gas per retirement inside a swap.
+    uint256 public constant GEN4_MAX_DEAD_RETIREMENTS = 32;
     uint256 public constant GEN4_MAX_POOL_NODES = 50;
     /// @notice Kept back for finalisation after the walk (accounting, jar fee, settle) and the frames
     ///         above the hook. Measured on a Robinhood Chain fork through the live Universal Router
@@ -788,6 +793,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
 
         Gen4Accounting.Totals memory totals;
         uint256 attempts;
+        uint256 retired;
         uint8 stop;
         uint256 nodeGas = _poolNodeGas(cfg);
         (uint8 role, uint256 secondBps) = _doorRole(cfg, input, output);
@@ -817,7 +823,16 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
                 break;
             }
 
-            ++attempts;
+            // a dead listing is retired, not sold: it counts against its own cap, not the steps
+            if (source == Gen4Queue.Source.Listing && listing.state == LISTING_DEAD) {
+                if (retired == GEN4_MAX_DEAD_RETIREMENTS) {
+                    stop = STOP_ATTEMPT_CAP;
+                    break;
+                }
+                ++retired;
+            } else {
+                ++attempts;
+            }
             uint256 legGas = _legGas();
             if (source == Gen4Queue.Source.Pool) {
                 // never more nodes than the gas this leg can be given will walk
@@ -882,7 +897,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
                     }
                     Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, true, listingTokens, listingQuote);
                 } else if (outcome == LISTING_SKIPPED || outcome == LISTING_STALE) {
-                    Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+                    if (listing.state != LISTING_DEAD) Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
                 } else if (outcome == LISTING_CLOSED) {
                     stop = STOP_CLOSED;
                     break;
@@ -924,6 +939,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         uint256 target = uint256(amountSpecified);
         Gen4Accounting.Totals memory totals;
         uint256 attempts;
+        uint256 retired;
         address token = Currency.unwrap(output);
         uint256 nodeGas = _poolNodeGas(cfg);
         (bool priceRead, uint8 priceWhy, uint256 priceRate) = _readPrice(token, cfg.marketAsset);
@@ -941,7 +957,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
             (uint256 poolCap, Gen4Queue.Source source) = _plan(cfg, input, role, secondBps, listing, pool, priceRate);
             if (source == Gen4Queue.Source.None) break;
 
-            ++attempts;
+            // a dead listing is retired, not sold: it counts against its own cap, not the steps
+            if (source == Gen4Queue.Source.Listing && listing.state == LISTING_DEAD) {
+                if (retired == GEN4_MAX_DEAD_RETIREMENTS) break;
+                ++retired;
+            } else {
+                ++attempts;
+            }
             uint256 remaining = Gen4Accounting.remainingOutput(totals, target);
             uint256 legGas = _legGas();
             if (source == Gen4Queue.Source.Pool) {
@@ -1005,7 +1027,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
                     outcome == LISTING_SKIPPED || outcome == LISTING_STALE || outcome == LISTING_CLOSED
                 ) {
                     if (listingPrefund != 0) _returnPrefund(input, listingPrefund);
-                    Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
+                    if (listing.state != LISTING_DEAD) Gen4Accounting.recordListingAttempt(totals, GEN4_MAX_ATTEMPTS, false, 0, 0);
                     if (outcome == LISTING_CLOSED) break;
                 } else {
                     revert UnexpectedListingOutcome(outcome);
@@ -1018,7 +1040,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
 
         uint256 filled = totals.poolTokens + totals.listingTokens;
         if (filled != target) {
-            if (attempts == GEN4_MAX_ATTEMPTS) revert Gen4AttemptCapExceeded(attempts);
+            if (attempts == GEN4_MAX_ATTEMPTS || retired == GEN4_MAX_DEAD_RETIREMENTS) revert Gen4AttemptCapExceeded(attempts);
             revert Gen4FillShortfall(filled, target);
         }
         Gen4Accounting.Final memory result =

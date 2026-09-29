@@ -789,31 +789,38 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       assert.equal(order[order.length - 1], "listing1", "the listing only after the whole queue ahead of it");
     });
 
-    it("16 dead listings ahead of stock: a buy that needs it reverts; an independent prune clears the queue and the buy fills", async () => {
+    it("17 dead listings ahead of stock (Wilko, 29 Sep): one swap retires them on the way and fills", async () => {
       const s = await stack();
       const sellers = [];
-      for (let i = 0; i < 16; i++) { const w = await s.seller(TOK(60)); await (await s.list(w, TOK(60))).wait(); sellers.push(w); }
-      await s.deposit(TOK(50)); // node 2, behind all 16 listings
-      for (const w of sellers) await (await s.fx.token.connect(w).transfer(s.fx.signers.alice.address, TOK(60))).wait(); // all 16 die
+      for (let i = 0; i < 17; i++) { const w = await s.seller(TOK(60)); await (await s.list(w, TOK(60))).wait(); sellers.push(w); }
+      await s.deposit(TOK(50)); // node 2, behind all 17 listings
+      for (const w of sellers) await (await s.fx.token.connect(w).transfer(s.fx.signers.alice.address, TOK(60))).wait(); // all 17 die
+      const rc = await s.buy({}, { buyAll: true });
+      const f = fills(rc, s);
+      assert.equal(f.reduce((t, x) => t + x.amount, 0n), TOK(150), "the seed and node 2, past 17 dead listings");
+      for (let id = 1n; id <= 17n; id++) assert.equal((await s.registry.listing(id)).status, 3n, `L${id} retired by the swap`);
+      console.log(`      17 dead listings: one swap retired them and filled ${f.reduce((t, x) => t + x.amount, 0n)}; gas ${rc.gasUsed}`);
+    });
+
+    it("33 dead listings ahead of stock: a buy past them reverts at the dead-listing cap; an independent prune clears the queue and the buy fills", async () => {
+      const s = await stack();
+      const sellers = [];
+      for (let i = 0; i < 33; i++) { const w = await s.seller(TOK(60)); await (await s.list(w, TOK(60))).wait(); sellers.push(w); }
+      await s.deposit(TOK(50));
+      for (const w of sellers) await (await s.fx.token.connect(w).transfer(s.fx.signers.alice.address, TOK(60))).wait();
       const buyer = s.fx.signers.buyerEOA;
       const p = { zeroForOne: s.zeroForOne, sqrtPriceLimitX96: s.zeroForOne ? MIN_SQRT : MAX_SQRT };
-      // the seed (node 1) is at or below every snapshot and sells first; node 2 sits behind the 16 dead listings
       const seedOnly = await s.priceAll(GAS);
       let wall;
       try { await s.live.connect(buyer).swap.staticCall(s.key, { ...p, amountSpecified: -(seedOnly.charged * 2n) }, GAS); assert.fail("must revert"); }
       catch (e) { if (e.code === "ERR_ASSERTION") throw e; wall = s.shortfallOf(e); }
-      console.log(`      16 dead listings: a buy past them reverts reason ${wall.reason} with ${wall.filled} filled (the seed)`);
-      assert.equal(wall.reason, 7, "the attempt cap");
-      // independent cleanup, in its own transactions, by anyone
+      console.log(`      33 dead listings: a buy past them reverts reason ${wall.reason} with ${wall.filled} filled (the seed)`);
+      assert.equal(wall.reason, 7, "the attempt cap (32 retirements)");
       const keeper = s.fx.signers.alice;
-      for (let id = 1n; id <= 16n; id++) await (await s.registry.connect(keeper).prune(id, GAS)).wait();
-      for (let id = 1n; id <= 16n; id++) assert.equal((await s.registry.listing(id)).status, 3n, `L${id} retired by prune`);
-      const all = await s.priceAll(GAS);
-      assert.equal(all.filled, TOK(100) + TOK(50), "the seed and node 2 are now reachable");
+      for (let id = 1n; id <= 33n; id++) await (await s.registry.connect(keeper).prune(id, GAS)).wait();
       const rc = await s.buy({}, { buyAll: true });
       const f = fills(rc, s);
       assert.equal(f.reduce((t, x) => t + x.amount, 0n), TOK(150), "the buy past the cleared queue fills completely");
-      console.log(`      after prune: filled ${f.reduce((t, x) => t + x.amount, 0n)}; gas ${rc.gasUsed}`);
     });
 
     it("a 50-deposit buy under tight gas limits either fills completely or reverts, never fills part", async () => {
