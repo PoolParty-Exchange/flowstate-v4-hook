@@ -14,7 +14,7 @@ const H = require(path.resolve(process.cwd(), "test/unit/flowstate/helpers"));
 const S = require(path.resolve(process.cwd(), "test/unit/flowstate/signedHelpers"));
 const { deployListings } = require(path.resolve(process.cwd(), "deploy/lib/listings"));
 
-const PINNED = "3e899f0486e6050a4a6aa096fc4dd67c61eb4d90";
+const PINNED = process.env.CONTRACTS_HEAD || "JUP-752-REV4-WORKTREE";
 const OUT = process.env.HOOK_OUT || path.resolve(__dirname, "../../out");
 const PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const CREATE2 = "0x4e59b44847b379578588920ca78fbf26c0b4956c"; // the canonical deterministic deployer
@@ -63,7 +63,7 @@ async function dustyVenue(fx, pool, positions) {
     await venue.setTickLiquidity(Math.min(a, b), 1);
     await venue.setTickLiquidity(Math.max(a, b), -1);
   }
-  await fx.market.connect(fx.signers.admin).setRegistrarParams(25_000n * 10n ** 6n, 20_000n * 10n ** 6n, 723, ethers.ZeroAddress);
+  await fx.market.connect(fx.signers.timelock48).setRegistrarParams(ethers.ZeroAddress, 50, 16);
   if ((await fx.market.quoteReference(fx.usdc.target)) === ethers.ZeroAddress) await fx.market.connect(fx.signers.admin).setQuoteReference(fx.usdc.target, fx.usdc.target);
   await fx.market.connect(fx.signers.admin).registerVenue(pool.target, venue.target);
   return venue;
@@ -123,6 +123,10 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     const hook = new ethers.Contract(hookAddr, HK.abi, admin);
     assert.notEqual(await ethers.provider.getCode(hookAddr), "0x", "hook deployed at the mined address");
     await (await hook.registerPair(fx.usdc.target, fx.token.target, pool.target, 16)).wait();
+    await (await fx.market.connect(timelock48).setRegistrarParams(ethers.ZeroAddress, 50, 16)).wait();
+    await (await fx.market.connect(timelock48).setTrustedHook(hookAddr)).wait();
+    assert.equal(await fx.market.hookSpreadBps(), await hook.spreadBpsFor(fx.usdc.target, fx.token.target, 1n),
+      "JUP-752: Market spread equals the hook's actual configured spread");
 
     const [c0, c1] = BigInt(fx.usdc.target) < BigInt(fx.token.target) ? [fx.usdc.target, fx.token.target] : [fx.token.target, fx.usdc.target];
     const key = { currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: hookAddr };
@@ -571,14 +575,16 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
         { label: "exact input $50 + 1 raw unit (one over: +7)", params: { amountSpecified: -(USD(50) + 1n) }, notional: USD(50) + 1n, bps: 23,
           cost: 49_885_264n, spread: 114_737n, got: 24_942_632_000_000_000_000n },
         { label: "large exact input $1,500 (above the top ceiling: top rung +20)", params: { amountSpecified: -USD(1_500) }, notional: USD(1_500), bps: 36,
-          cost: 1_494_619_370n, spread: 5_380_630n, got: 747_309_685_000_000_000_000n },
+          cost: 1_494_619_370n, spread: 5_380_630n, got: 747_824_936_381_166_623_803n },
         { label: "small exact output 10 tokens (cost $20: +0)", params: { amountSpecified: TOK(10) }, notional: USD(20), bps: 16,
           cost: USD(20), spread: 32_000n, got: TOK(10) },
         { label: "large exact output 300 tokens (cost $600: +20)", params: { amountSpecified: TOK(300) }, notional: USD(600), bps: 36,
-          cost: USD(600), spread: 2_160_000n, got: TOK(300) },
+          cost: 599_586_600n, spread: 2_158_512n, got: TOK(300) },
       ];
       for (const c of cases) {
         assert.equal(await s.hook.spreadBpsFor(usdc, token, c.notional), BigInt(c.bps), `${c.label}: spreadBpsFor`);
+        await (await s.fx.market.connect(s.fx.signers.timelock48).setRegistrarParams(ethers.ZeroAddress, 50, c.bps)).wait();
+        assert.equal(await s.fx.market.hookSpreadBps(), await s.hook.spreadBpsFor(usdc, token, c.notional), `${c.label}: Market/hook spread invariant`);
         const m = await measuredBuy(s, c.params);
         const spread = m.retained + m.jar;
         console.log(`      ${c.label}: ${c.bps} bps, cost ${m.cost}, spread ${spread}, tokens ${m.got}, paid ${m.paid}`);
@@ -983,14 +989,14 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       assert.equal(rows[rows.length - 1].got, full, "enough gas fills everything");
     });
 
-    it("review F2: 72 dust ticks in a spacing-10 venue raise the reads above 1M but cannot stop swaps", async () => {
+    it("JUP-752 Rev 4: 72 dust ticks do not reintroduce the retired depth walk and cannot stop swaps", async () => {
       const s = await stack({ dustTicks: 36 });
       const from = s.fx.signers.buyerEOA.address;
       const g = async (c, name, args) => (await ethers.provider.estimateGas({ from, to: c.target, data: c.interface.encodeFunctionData(name, args) })) - 21000n;
       const maxBuyGas = await g(s.fx.market, "maxBuy", [s.pool.target, s.fx.usdc.target]);
       const priceGas = await g(s.settlement, "price", [s.fx.token.target, s.fx.usdc.target]);
       const ev = await s.fx.market.evaluateVenue(s.pool.target);
-      assert.ok(maxBuyGas > 1_000_000n, `maxBuy costs ${maxBuyGas}: above the old fixed 1M read cap`);
+      assert.ok(maxBuyGas < 250_000n, `maxBuy costs ${maxBuyGas}: Rev 4 no longer walks depth for a bucket cap`);
       const a = await s.seller(TOK(60));
       await (await s.list(a, TOK(60))).wait();
       const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
