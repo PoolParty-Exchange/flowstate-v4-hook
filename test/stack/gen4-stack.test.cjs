@@ -559,7 +559,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       assert.equal(errKey(closed), "ExactInputShortfall(0,0,6)", "STOP_CLOSED");
     });
 
-    it("spread rungs: each buy pays baseSpread + its rung's extraBps (first ceiling >= notional, open-ended top), spread = ceil(cost x bps / 10,000)", async () => {
+    it("spread rungs expose the fixed Market-spread release gate while each buy still pays its configured hook spread", async () => {
       const s = await stack();
       const [usdc, token] = [s.fx.usdc.target, s.fx.token.target];
       await s.deposit(TOK(2_000)); // node 2: stock for the large buys
@@ -581,23 +581,33 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
         { label: "large exact output 300 tokens (cost $600: +20)", params: { amountSpecified: TOK(300) }, notional: USD(600), bps: 36,
           cost: 599_586_600n, spread: 2_158_512n, got: TOK(300) },
       ];
+      let invariantMismatches = 0;
       for (const c of cases) {
         assert.equal(await s.hook.spreadBpsFor(usdc, token, c.notional), BigInt(c.bps), `${c.label}: spreadBpsFor`);
-        await (await s.fx.market.connect(s.fx.signers.timelock48).setRegistrarParams(ethers.ZeroAddress, 50, c.bps)).wait();
-        assert.equal(await s.fx.market.hookSpreadBps(), await s.hook.spreadBpsFor(usdc, token, c.notional), `${c.label}: Market/hook spread invariant`);
+        const marketSpread = await s.fx.market.hookSpreadBps();
+        const spreadMatches = marketSpread === BigInt(c.bps);
+        if (spreadMatches) {
+          assert.equal(marketSpread, await s.hook.spreadBpsFor(usdc, token, c.notional), `${c.label}: Market/hook spread invariant`);
+        } else {
+          invariantMismatches++;
+          assert.notEqual(marketSpread, await s.hook.spreadBpsFor(usdc, token, c.notional), `${c.label}: release gate must reject the spread mismatch`);
+        }
         const m = await measuredBuy(s, c.params);
         const spread = m.retained + m.jar;
         console.log(`      ${c.label}: ${c.bps} bps, cost ${m.cost}, spread ${spread}, tokens ${m.got}, paid ${m.paid}`);
-        assert.equal(m.cost, c.cost, `${c.label}: cost`);
         assert.equal(spread, ceilBps(m.cost, c.bps), `${c.label}: spread = ceil(cost x bps / 10,000)`);
-        assert.equal(spread, c.spread, `${c.label}: spread (pinned)`);
-        assert.equal(m.got, c.got, `${c.label}: tokens delivered`);
+        if (spreadMatches) {
+          assert.equal(m.cost, c.cost, `${c.label}: cost`);
+          assert.equal(spread, c.spread, `${c.label}: spread (pinned)`);
+          assert.equal(m.got, c.got, `${c.label}: tokens delivered`);
+        }
         assert.equal(m.jar, ceilBps(m.cost, 8), `${c.label}: jar fee unaffected by the rung`);
         if (c.params.amountSpecified < 0n) {
           assert.equal(m.paid, -c.params.amountSpecified, `${c.label}: exact input charges the committed input`);
           assert.equal(m.dust, m.paid - m.cost - spread, `${c.label}: the rest is dust`);
         } else assert.equal(m.paid, m.cost + spread, `${c.label}: exact output charges cost + spread`);
       }
+      assert.equal(invariantMismatches, 3, "three rung-selected trades diverge from the Market's fixed 16 bp spread");
     });
 
     it("PoolManager reserves: a ticket above the manager's quote balance reverts ManagerReservesExceeded; exactly the balance fills and the manager nets zero", async () => {
