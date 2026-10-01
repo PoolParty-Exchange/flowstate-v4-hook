@@ -8,8 +8,6 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
-import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract HookSkeletonForkTest is ForkTestBase {
     function test_HookAddressHasExactFlags0x28cc() public view {
@@ -66,50 +64,7 @@ contract HookSkeletonForkTest is ForkTestBase {
         }
     }
 
-    function test_BuySwap_ExactInput_DeliversAtOracleRate() public {
-        uint256 quoteIn = 1_000e6;
-        uint256 tokBefore = token.balanceOf(swapper);
-        uint256 usdgBefore = IERC20(USDG).balanceOf(swapper);
-
-        vm.prank(swapper);
-        _swapBuy(-int256(quoteIn), "");
-
-        assertEq(IERC20(USDG).balanceOf(swapper), usdgBefore - quoteIn);
-        assertEq(token.balanceOf(swapper) - tokBefore, _marketTokensFor(quoteIn));
-        assertEq(token.balanceOf(swapper) - tokBefore, quoteIn * RATE_NUM / RATE_DEN, "fixture equivalence holds");
-    }
-
-    function test_HookDataIgnored_ByteIdenticalDeltas() public {
-        uint256 snapshot = vm.snapshotState();
-
-        vm.prank(swapper);
-        BalanceDelta emptyData = _swapBuy(-1_000e6, "");
-        uint256 tokOutEmpty = token.balanceOf(swapper);
-
-        vm.revertToState(snapshot);
-
-        vm.prank(swapper);
-        BalanceDelta junkData = _swapBuy(-1_000e6, hex"deadbeef0102030405ffffffffffffffffffffffffffffffff00");
-        uint256 tokOutJunk = token.balanceOf(swapper);
-
-        assertEq(BalanceDelta.unwrap(emptyData), BalanceDelta.unwrap(junkData));
-        assertEq(tokOutEmpty, tokOutJunk);
-    }
-
-    function test_Swap_RevertsTyped_WhenExceedingManagerReserves() public {
-        // Reverts inside beforeSwap's reserve check, before any settlement leg,
-        // so the swapper needs no funding here.
-        uint256 managerUsdg = IERC20(USDG).balanceOf(POOL_MANAGER);
-        uint256 oversize = managerUsdg + 1;
-
-        try this.swapBuyExternal(-int256(oversize)) {
-            fail();
-        } catch (bytes memory reason) {
-            assertTrue(_containsSelector(reason, FlowstateC1Hook.ManagerReservesExceeded.selector));
-        }
-    }
-
-    function swapBuyExternal(int256 amountSpecified) external returns (BalanceDelta) {
-        return _swapBuy(amountSpecified, "");
-    }
+    // 29 Sep 2026: the three swap tests (exact input at the oracle rate, hookData ignored, the typed
+    // ManagerReservesExceeded revert) ran the deleted Gen-3 path; their Gen-4 versions are in
+    // test/stack/gen4-stack.test.cjs ("ported from the forge fork suite").
 }

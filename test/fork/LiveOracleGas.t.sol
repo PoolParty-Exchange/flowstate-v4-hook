@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {ForkTestBase} from "./ForkTestBase.sol";
+import {ListingStandIn} from "./ListingStandIn.sol";
 import {ITestSpotOracle, AnchorFloorInput} from "./RealStackDeployer.sol";
 import {FlowstateC1Hook} from "../../src/FlowstateC1Hook.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
@@ -10,7 +11,6 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {PoolModifyLiquidityTest} from "@uniswap/v4-core/src/test/PoolModifyLiquidityTest.sol";
-import {IV4Quoter} from "@uniswap/v4-periphery/src/interfaces/IV4Quoter.sol";
 import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -29,13 +29,13 @@ import {console2} from "forge-std/console2.sol";
 ///         real oracle, real ERC20s. The only thing on the fixture side is the swapper's
 ///         balance and the lister's inventory, both dealt.
 ///
-/// @dev Subtracting the stub-oracle numbers in `GasColdWarm.t.sol` from these gives the
-///      oracle's own contribution, which is what Phase 3's slim RH oracle replaces. The
-///      isolated oracle read is also measured directly below so the decomposition does
-///      not rest on cross-suite subtraction.
+/// @dev 29 Sep 2026: the swap, quoter and conservation tests here (and the seasoned variant)
+///      ran the deleted Gen-3 path, whose price came from this oracle through the old
+///      vendored market; they are retired with GasColdWarm.t.sol. Gen-4 prices from the
+///      listing settlement's passive rule; its gas is measured on the real stack
+///      (test/stack/gen4-stack.test.cjs gas matrix and gate 2, test/stack/fork-rh-gen4.cjs).
+///      What is left is the isolated oracle read, which never touched the hook.
 contract LiveOracleGasForkTest is ForkTestBase {
-    uint128 constant QUOTE_IN = 1_000e6; // 1,000 USDG
-    uint128 constant TOKENS_OUT = 0.25e18; // 0.25 aeWETH
     uint256 constant LIVE_INVENTORY = 200e18; // 200 aeWETH of holder inventory
 
     IERC20 constant inv = IERC20(AEWETH);
@@ -65,14 +65,15 @@ contract LiveOracleGasForkTest is ForkTestBase {
         }
         vm.stopPrank();
 
+        (address standInRegistry, address standInSettlement) = ListingStandIn.deploy(address(market));
         (address hookAddress, bytes32 salt) = HookMiner.find(
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, 0, address(0), address(0))
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, 0, standInRegistry, standInSettlement)
         );
         hook = new FlowstateC1Hook{salt: salt}(
-            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, 0, address(0), address(0)
+            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, 0, standInRegistry, standInSettlement
         );
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
         hook.registerPair(Currency.wrap(USDG), Currency.wrap(AEWETH), pool, 0);
@@ -104,14 +105,6 @@ contract LiveOracleGasForkTest is ForkTestBase {
         return uint160(sqrtPrice);
     }
 
-    function _liveTokensFor(uint256 quoteIn) internal view returns (uint256) {
-        return quoteIn * 1e18 / liveRate;
-    }
-
-    function _liveCostFor(uint256 tokens) internal view returns (uint256) {
-        return (tokens * liveRate + 1e18 - 1) / 1e18;
-    }
-
     // -- the isolated oracle term ---------------------------------------------
 
     /// @dev The single most important number for Phase 3: what one cold read of RH's
@@ -128,119 +121,5 @@ contract LiveOracleGasForkTest is ForkTestBase {
         console2.log("RH live oracle getRate(aeWETH,USDG) rate:", r);
         console2.log("RH live oracle read COLD (gas):", cold);
         console2.log("RH live oracle read WARM (gas):", warm);
-    }
-
-    // -- the end-to-end path --------------------------------------------------
-
-    function test_LiveOracle_BuyExecutesAndQuoterMatchesToTheWei() public {
-        uint256 expected = _liveTokensFor(QUOTE_IN);
-        assertGt(expected, 0, "priced");
-
-        vm.prank(makeAddr("arbitrary-fresh-eoa"));
-        (uint256 quoted, uint256 gasEst) = quoter.quoteExactInputSingle(
-            IV4Quoter.QuoteExactSingleParams({
-                poolKey: poolKey,
-                zeroForOne: _buyZeroForOne(),
-                exactAmount: QUOTE_IN,
-                hookData: ""
-            })
-        );
-        assertEq(quoted, expected, "quote != oracle-priced expectation");
-
-        uint256 invBefore = inv.balanceOf(swapper);
-        uint256 usdgBefore = IERC20(USDG).balanceOf(swapper);
-        vm.prank(swapper);
-        _swapBuy(-int256(uint256(QUOTE_IN)), "");
-
-        assertEq(inv.balanceOf(swapper) - invBefore, quoted, "delivered != quoted, against the LIVE oracle");
-        assertEq(usdgBefore - IERC20(USDG).balanceOf(swapper), QUOTE_IN, "paid != specified");
-        console2.log("live rate (USDG raw per 1e18 aeWETH raw):", liveRate);
-        console2.log("quoter gasEstimate (live oracle):", gasEst);
-    }
-
-    function test_Gas_LiveOracle_SwapExactIn_ColdThenWarm() public {
-        vm.prank(swapper);
-        uint256 g = gasleft();
-        _swapBuy(-int256(uint256(QUOTE_IN)), "");
-        uint256 cold = g - gasleft();
-
-        vm.prank(swapper);
-        g = gasleft();
-        _swapBuy(-int256(uint256(QUOTE_IN)), "");
-        uint256 warm = g - gasleft();
-
-        console2.log("LIVE swap exactIn COLD (fresh oracle read):", cold);
-        console2.log("LIVE swap exactIn WARM (same-timestamp cache):", warm);
-        assertLt(warm, cold);
-    }
-
-    function test_Gas_LiveOracle_SwapExactOut_ColdThenWarm() public {
-        vm.prank(swapper);
-        uint256 g = gasleft();
-        _swapBuy(int256(uint256(TOKENS_OUT)), "");
-        uint256 cold = g - gasleft();
-
-        vm.prank(swapper);
-        g = gasleft();
-        _swapBuy(int256(uint256(TOKENS_OUT)), "");
-        uint256 warm = g - gasleft();
-
-        console2.log("LIVE swap exactOut COLD (fresh oracle read):", cold);
-        console2.log("LIVE swap exactOut WARM (same-timestamp cache):", warm);
-        assertLt(warm, cold);
-    }
-
-    function test_Gas_LiveOracle_QuoterColdThenWarm() public {
-        IV4Quoter.QuoteExactSingleParams memory pIn = IV4Quoter.QuoteExactSingleParams({
-            poolKey: poolKey,
-            zeroForOne: _buyZeroForOne(),
-            exactAmount: QUOTE_IN,
-            hookData: ""
-        });
-        (, uint256 estCold) = quoter.quoteExactInputSingle(pIn);
-        (, uint256 estWarm) = quoter.quoteExactInputSingle(pIn);
-        console2.log("LIVE quoter exactIn gasEstimate COLD:", estCold);
-        console2.log("LIVE quoter exactIn gasEstimate WARM:", estWarm);
-
-        IV4Quoter.QuoteExactSingleParams memory pOut = IV4Quoter.QuoteExactSingleParams({
-            poolKey: poolKey,
-            zeroForOne: _buyZeroForOne(),
-            exactAmount: TOKENS_OUT,
-            hookData: ""
-        });
-        (, uint256 outCold) = quoter.quoteExactOutputSingle(pOut);
-        console2.log("LIVE quoter exactOut gasEstimate COLD:", outCold);
-    }
-
-    /// @dev Conservation still holds with a live oracle and two real ERC20 legs.
-    function test_LiveOracle_TakeSettleConservation() public {
-        uint256 managerUsdg = IERC20(USDG).balanceOf(POOL_MANAGER);
-        uint256 managerInv = inv.balanceOf(POOL_MANAGER);
-        uint256 sunkBefore = _quoteReceived();
-
-        uint256 tokensOut = _liveTokensFor(QUOTE_IN);
-        uint256 quotePaid = _liveCostFor(tokensOut);
-
-        vm.prank(swapper);
-        _swapBuy(-int256(uint256(QUOTE_IN)), "");
-
-        assertEq(IERC20(USDG).balanceOf(POOL_MANAGER), managerUsdg, "manager USDG nets zero");
-        assertEq(inv.balanceOf(POOL_MANAGER), managerInv, "manager aeWETH nets zero");
-        assertEq(_quoteReceived() - sunkBefore, quotePaid, "pool + receiver got the payment");
-        assertEq(IERC20(USDG).balanceOf(address(hook)), quotePaid == QUOTE_IN ? 0 : QUOTE_IN - quotePaid, "dust only");
-        assertEq(inv.balanceOf(address(hook)), 0, "no inventory residue on the hook");
-    }
-}
-
-/// @notice The same live-oracle measurements against a SEASONED pool (routed steady
-///         state: one fill already executed, so no path pays a one-time
-///         zero-to-nonzero storage initialization), with the rate cache expired again
-///         so COLD still means "fresh oracle read".
-contract LiveOracleGasSeasonedForkTest is LiveOracleGasForkTest {
-    function setUp() public override {
-        super.setUp();
-        vm.prank(swapper);
-        _swapBuy(-int256(10e6), "");
-        _expireRateCache();
     }
 }

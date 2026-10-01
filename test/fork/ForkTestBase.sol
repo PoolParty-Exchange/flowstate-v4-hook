@@ -15,6 +15,7 @@ import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FlowstateC1Hook} from "../../src/FlowstateC1Hook.sol";
+import {ListingStandIn} from "./ListingStandIn.sol";
 import {MockInventoryToken} from "../mocks/MockInventoryToken.sol";
 import {RealStackDeployer, IFlowstateMarketTest, IFlowstatePoolTest, ITestSpotOracle, AnchorFloorInput} from "./RealStackDeployer.sol";
 
@@ -160,14 +161,15 @@ abstract contract ForkTestBase is RealStackDeployer {
         poolContract = IFlowstatePoolTest(pool);
 
         // 3. the hook, mined to 0x28cc against the real market address
+        (address standInRegistry, address standInSettlement) = ListingStandIn.deploy(address(market));
         (address hookAddress, bytes32 salt) = HookMiner.find(
             address(this),
             HOOK_FLAGS,
             type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), address(0), address(0))
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), standInRegistry, standInSettlement)
         );
         hook = new FlowstateC1Hook{salt: salt}(
-            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), address(0), address(0)
+            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), standInRegistry, standInSettlement
         );
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
 

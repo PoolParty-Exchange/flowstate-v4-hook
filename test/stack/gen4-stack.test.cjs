@@ -14,7 +14,7 @@ const H = require(path.resolve(process.cwd(), "test/unit/flowstate/helpers"));
 const S = require(path.resolve(process.cwd(), "test/unit/flowstate/signedHelpers"));
 const { deployListings } = require(path.resolve(process.cwd(), "deploy/lib/listings"));
 
-const PINNED = "de4464fb79e67d09212944f00ee64c9fae772bab";
+const PINNED = "3e899f0486e6050a4a6aa096fc4dd67c61eb4d90";
 const OUT = process.env.HOOK_OUT || path.resolve(__dirname, "../../out");
 const PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const CREATE2 = "0x4e59b44847b379578588920ca78fbf26c0b4956c"; // the canonical deterministic deployer
@@ -29,7 +29,7 @@ const { TOK } = S;
 
 function artifact(file, name) {
   const a = JSON.parse(fs.readFileSync(path.join(OUT, file, name + ".json"), "utf8"));
-  return { abi: a.abi, bytecode: a.bytecode.object };
+  return { abi: a.abi, bytecode: a.bytecode.object, deployed: a.deployedBytecode.object };
 }
 
 /** Review F2: a flat venue like registerFlatVenue's, but at tick spacing 10 (the registrar's
@@ -72,10 +72,22 @@ async function dustyVenue(fx, pool, positions) {
 describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${PINNED.slice(0, 7)})`, function () {
   this.timeout(600_000);
 
-  /** The real stack: market, pool with its seed node, a flat venue, the lane open, listings. */
+  /** The real stack: market, pool with its seed node, a flat venue, the lane open, listings.
+   *  opts: dustTicks (review F2 venue), jarBps (the hook's jar fee, default the production 8),
+   *  managerReserve (USDC the PoolManager holds from other pools, default $1M). */
   async function stack(opts = {}) {
     const fx = await S.deploySignedFixture();
     const { admin, timelock48, buyerEOA } = fx.signers;
+    // Design E on the stack (Daniel, 30 Sep): the fixture's USDC gains WETH's deposit/withdraw
+    // (test/stack/StackWrappedDollar.sol, runtime code only) and becomes the hook's weth9, so the
+    // native-ETH pool and the "aeWETH" pool both sell this one C1 pool, priced by the fixture's venue.
+    if (opts.ethPools) {
+      const read = async () => [await fx.usdc.name(), await fx.usdc.symbol(), await fx.usdc.decimals(), await fx.usdc.totalSupply(),
+        await fx.usdc.balanceOf(fx.signers.alice.address), await fx.usdc.balanceOf(buyerEOA.address)];
+      const before = await read();
+      await network.provider.send("hardhat_setCode", [fx.usdc.target, artifact("StackWrappedDollar.sol", "StackWrappedDollar").deployed]);
+      assert.deepEqual(await read(), before, "the WETH-capable token keeps the fixture USDC's storage (name, symbol, decimals, supply, balances)");
+    }
     await network.provider.send("hardhat_setCode", [PERMIT2, fs.readFileSync(path.resolve(process.cwd(), "test/fixtures/permit2-rh-runtime.hex"), "utf8").trim()]);
     const permit2 = new ethers.Contract(PERMIT2, ["function approve(address token, address spender, uint160 amount, uint48 expiration)"], ethers.provider);
     const pool = opts.dustTicks
@@ -98,7 +110,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     const jar = ethers.Wallet.createRandom().address;
     const args = ethers.AbiCoder.defaultAbiCoder().encode(
       ["address", "address", "address", "address", "address", "uint16", "address", "address"],
-      [manager.target, fx.market.target, admin.address, ethers.ZeroAddress, jar, 8, registry.target, settlement.target]);
+      [manager.target, fx.market.target, admin.address, opts.ethPools ? fx.usdc.target : ethers.ZeroAddress, jar, opts.jarBps ?? 8, registry.target, settlement.target]);
     const initCode = HK.bytecode + args.slice(2);
     const initHash = ethers.keccak256(initCode);
     let salt, hookAddr;
@@ -120,10 +132,23 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     // The hook takes the buyer's input from the PoolManager inside beforeSwap, before the router
     // settles it (gen-3's ManagerReservesExceeded rule): the manager must already hold reserves of
     // the quote currency, as the live Robinhood Chain PoolManager does from its other pools.
-    await fx.usdc.mint(manager.target, 1_000_000n * 10n ** 6n);
+    await fx.usdc.mint(manager.target, opts.managerReserve ?? 1_000_000n * 10n ** 6n);
     await fx.usdc.mint(buyerEOA.address, 1_000_000n * 10n ** 6n);
     await fx.usdc.connect(buyerEOA).approve(router.target, ethers.MaxUint256);
     await fx.usdc.connect(buyerEOA).approve(live.target, ethers.MaxUint256);
+
+    // the native-ETH pool beside the "aeWETH" (USDC) one, and a router that runs both in one unlock
+    let nativeKey, twoPool;
+    if (opts.ethPools) {
+      await (await hook.registerPair(ethers.ZeroAddress, fx.token.target, pool.target, 16)).wait();
+      nativeKey = { currency0: ethers.ZeroAddress, currency1: fx.token.target, fee: 0, tickSpacing: 60, hooks: hookAddr };
+      await (await manager.initialize(nativeKey, 1n << 96n)).wait();
+      // the hook takes native from the PoolManager in beforeSwap, so the manager holds native reserves
+      await network.provider.send("hardhat_setBalance", [manager.target, "0x" + (10n ** 21n).toString(16)]);
+      const TR = artifact("Gen4TwoPoolRouter.sol", "Gen4TwoPoolRouter");
+      twoPool = await new ethers.ContractFactory(TR.abi, TR.bytecode, admin).deploy(manager.target);
+      await fx.usdc.connect(buyerEOA).approve(twoPool.target, ethers.MaxUint256);
+    }
 
     const sellers = [];
     const seller = async (amount) => {
@@ -142,15 +167,34 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       await fx.market.connect(fx.signers.alice).contributeTokens(pool.target, amount, w, await H.consentFloors(pool.target), { ...GAS, ...opts });
       return w;
     };
-    // PoolSwapTest for fills with no refund; the live-delta router (SETTLE_ALL semantics) wherever the
-    // hook may refund unspent input (more asked for than is for sale)
+    // WSR F5 (27 Sep 2026): exact input fills the whole slice or reverts. `buyAll` sizes the slice the way
+    // a splitting aggregator does: an oversized probe reverts ExactInputShortfall(filled, ...), an
+    // exact-output quote of `filled` tokens gives the exact price, and that price is sent as exact input.
+    const WRAPPED = new ethers.Interface(["error WrappedError(address target, bytes4 selector, bytes reason, bytes details)"]);
+    const shortfallOf = (e) => {
+      const data = e.data ?? e.error?.data ?? e.info?.error?.data;
+      const w = WRAPPED.parseError(data);
+      const inner = hook.interface.parseError(w.args.reason);
+      assert.equal(inner.name, "ExactInputShortfall", `expected ExactInputShortfall, got ${inner.name}`);
+      return { filled: inner.args[0], wanted: inner.args[1], reason: Number(inner.args[2]) };
+    };
+    const priceAll = async (gas) => {
+      const p = { zeroForOne, sqrtPriceLimitX96: zeroForOne ? MIN_SQRT : MAX_SQRT };
+      let filled;
+      try { await live.connect(buyerEOA).swap.staticCall(key, { ...p, amountSpecified: -(10n ** 12n) }, gas); assert.fail("an oversized probe must revert"); }
+      catch (e) { if (e.code === "ERR_ASSERTION") throw e; filled = shortfallOf(e).filled; }
+      const [d0, d1] = await live.connect(buyerEOA).swap.staticCall(key, { ...p, amountSpecified: filled }, gas);
+      return { filled, charged: -(zeroForOne ? d0 : d1) };
+    };
     const buy = async (params, opts = {}) => {
+      const gas = opts.gasLimit ? { gasLimit: opts.gasLimit } : GAS;
+      let sized;
+      if (opts.buyAll) { sized = await priceAll(GAS); params = { ...params, amountSpecified: -sized.charged }; }
       const p = { zeroForOne, sqrtPriceLimitX96: zeroForOne ? MIN_SQRT : MAX_SQRT, ...params };
       const usdc0 = await fx.usdc.balanceOf(buyerEOA.address);
-      const gas = opts.gasLimit ? { gasLimit: opts.gasLimit } : GAS;
-      const tx = opts.refundable
+      const tx = opts.buyAll || opts.live
         ? await live.connect(buyerEOA).swap(key, p, gas)
-        : await router.connect(buyerEOA).swap(key, p, { takeClaims: false, settleUsingBurn: false }, "0x", gas);
+        : await router.connect(buyerEOA).swap(key, p, { takeClaims: false, settleUsingBurn: false }, opts.hookData ?? "0x", gas);
       const rc = await tx.wait();
       // money in equals money out: the buyer pays exactly both sources' payments plus the hook's
       // spread, jar fee and dust; on an exact input nothing else is kept (the rest was refunded)
@@ -165,11 +209,12 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
         } catch {}
       }
       assert.equal(paid, sources + spread + jarFee + dust, `paid ${paid} != sources ${sources} + spread ${spread} + jar ${jarFee} + dust ${dust}`);
-      if (opts.refundable && params.amountSpecified < 0n) assert.ok(paid < -params.amountSpecified, "unspent input refunded");
+      if (params.amountSpecified < 0n) assert.equal(paid, -params.amountSpecified, "exact input charges the whole slice, nothing handed back");
+      if (sized) rc.sized = sized;
       rc.money = { paid, sources, spread, jarFee, dust };
       return rc;
     };
-    return { fx, pool, registry, settlement, manager, router, hook, key, jar, seller, list, deposit, buy, zeroForOne };
+    return { fx, pool, registry, settlement, manager, router, live, hook, key, jar, seller, list, deposit, buy, priceAll, shortfallOf, zeroForOne, nativeKey, twoPool };
   }
 
   /** The fills of one swap, in execution order: pool fills (PoolBuy) and listing sales (ListingFilled). */
@@ -185,6 +230,76 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     return out;
   }
   const queueOf = async (s) => (await s.pool.queue(100)).map((n) => [n.index, n.amount]);
+
+  // -- helpers for the tests ported from the retired forge fork suite (29 Sep 2026) --------------
+  const USD = (n) => BigInt(n) * 10n ** 6n;
+  const ceilBps = (amount, bps) => (amount * BigInt(bps) + 9_999n) / 10_000n; // the hook's _ceilBps
+  const SETTINGS = { takeClaims: false, settleUsingBurn: false };
+  const WRAPPED_ERR = new ethers.Interface(["error WrappedError(address target, bytes4 selector, bytes reason, bytes details)"]);
+  const QUOTER_ERR = new ethers.Interface(["error UnexpectedRevertBytes(bytes revertData)"]);
+  const revertData = (e) => e.data ?? e.error?.data ?? e.info?.error?.data;
+  /** The hook's own error inside a swap's revert (the PoolManager wraps a hook revert in WrappedError). */
+  const hookErrorOf = (s, data) => {
+    const w = WRAPPED_ERR.parseError(data);
+    assert.equal(w.args.target.toLowerCase(), s.hook.target.toLowerCase(), "the revert comes from the hook");
+    return s.hook.interface.parseError(w.args.reason);
+  };
+  const errKey = (err) => `${err.name}(${err.args.map((a) => a.toString()).join(",")})`;
+  /** The hook error a swap would revert with, or null when it would go through. */
+  const swapError = async (s, amountSpecified) => {
+    const p = { zeroForOne: s.zeroForOne, sqrtPriceLimitX96: s.zeroForOne ? MIN_SQRT : MAX_SQRT, amountSpecified };
+    try { await s.router.connect(s.fx.signers.buyerEOA).swap.staticCall(s.key, p, SETTINGS, "0x", GAS); return null; }
+    catch (e) { return hookErrorOf(s, revertData(e)); }
+  };
+  const hookEvents = (rc, s) => rc.logs.filter((l) => l.address.toLowerCase() === s.hook.target.toLowerCase()).map((l) => s.hook.interface.parseLog(l));
+  const poolIdOf = (key) => ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(
+    ["address", "address", "uint24", "int24", "address"], [key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks]));
+  /** Uniswap's V4Quoter (v4-periphery, unmodified; compiled via test/stack/StackV4Quoter.sol) on the stack's PoolManager. */
+  const deployQuoter = async (s) => {
+    const Q = artifact("V4Quoter.sol", "V4Quoter");
+    const quoter = await new ethers.ContractFactory(Q.abi, Q.bytecode, s.fx.signers.admin).deploy(s.manager.target);
+    const params = (exactAmount) => ({ poolKey: s.key, zeroForOne: s.zeroForOne, exactAmount, hookData: "0x" });
+    const from = (who) => quoter.connect(who ?? s.fx.signers.buyerEOA);
+    return {
+      quoter,
+      exactIn: async (amount, who) => (await from(who).quoteExactInputSingle.staticCall(params(amount), GAS))[0],
+      exactOut: async (amount, who) => (await from(who).quoteExactOutputSingle.staticCall(params(amount), GAS))[0],
+      /** The hook error a quote reverts with (the quoter wraps the swap's revert in UnexpectedRevertBytes). */
+      exactInError: async (amount) => {
+        try { await from().quoteExactInputSingle.staticCall(params(amount), GAS); return null; }
+        catch (e) { return hookErrorOf(s, QUOTER_ERR.parseError(revertData(e)).args.revertData); }
+      },
+    };
+  };
+  /** Everything one buy did to the hook's books, the jar and the PoolManager, asserted conserved. */
+  const measuredBuy = async (s, params, opts = {}) => {
+    const { usdc, token, signers } = s.fx;
+    const buyer = signers.buyerEOA.address;
+    const at = async () => ({
+      jar: await usdc.balanceOf(s.jar), tok: await token.balanceOf(buyer),
+      margin: await s.hook.accruedSpreadMargin(usdc.target), dust: await s.hook.accruedDust(usdc.target),
+      mgrUsdc: await usdc.balanceOf(s.manager.target), mgrTok: await token.balanceOf(s.manager.target),
+    });
+    const b = await at();
+    const rc = await s.buy(params, opts);
+    const a = await at();
+    const ev = hookEvents(rc, s);
+    const fees = ev.filter((e) => e.name === "ProtocolFeePaid"), buys = ev.filter((e) => e.name === "BuyExecuted");
+    assert.equal(buys.length, 1, "one BuyExecuted per swap");
+    const out = {
+      rc, cost: rc.money.sources, paid: rc.money.paid, got: a.tok - b.tok, jar: a.jar - b.jar, fees,
+      retained: buys[0].args.spreadAccrued, dust: buys[0].args.dustAccrued, srcs: fills(rc, s).map((x) => x.src + (x.id ? x.id : "")),
+    };
+    // the hook's books move by exactly what the swap reported, the manager nets zero on both currencies,
+    // and outside the swap the hook holds nothing but its booked margin and dust (scope §8 custody rule)
+    assert.equal(a.margin - b.margin, out.retained, "accruedSpreadMargin grew by the reported spread");
+    assert.equal(a.dust - b.dust, out.dust, "accruedDust grew by the reported dust");
+    assert.equal(a.mgrUsdc, b.mgrUsdc, "PoolManager USDC nets zero");
+    assert.equal(a.mgrTok, b.mgrTok, "PoolManager token nets zero");
+    assert.equal(await usdc.balanceOf(s.hook.target), a.margin + a.dust, "the hook holds exactly its margin + dust");
+    assert.equal(await token.balanceOf(s.hook.target), 0n, "the hook holds no inventory token");
+    return out;
+  };
 
   it("pool-only fill: the pool's own buy, jar fee and spread as gen-3 charges them", async () => {
     const s = await stack();
@@ -212,7 +327,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     await (await s.list(b, TOK(60))).wait(); // L2: poolTail = 2
     assert.equal((await s.registry.listing(1)).poolTail, 1n);
     assert.equal((await s.registry.listing(2)).poolTail, 2n);
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true }); // more than everything listed and deposited
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true }); // more than everything listed and deposited
     const f = fills(rc, s);
     const order = f.map((x) => x.src + (x.id ? x.id : ""));
     console.log(`      order: ${order.join(" > ")}; gas ${rc.gasUsed}`);
@@ -229,7 +344,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     await (await s.list(b, TOK(60))).wait();
     // L1 dies: its seller moves the tokens away
     await (await s.fx.token.connect(a).transfer(s.fx.signers.alice.address, TOK(60))).wait();
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
     const f = fills(rc, s), order = f.map((x) => x.src + (x.id ? x.id : ""));
     console.log(`      order: ${order.join(" > ")}; gas ${rc.gasUsed}`);
     assert.ok(!order.includes("listing1"), "the dead listing sold nothing");
@@ -250,7 +365,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       await network.provider.send("evm_mine", []);
     } finally { await network.provider.send("evm_setAutomine", [true]); }
     assert.equal((await s.registry.listing(1)).poolTail, 2n); // the first deposit (node 2) came before the listing
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
     const order = fills(rc, s).map((x) => x.src + (x.id ? x.id : ""));
     console.log(`      order: ${order.join(" > ")}`);
     // seed and node 2 (one pool leg, both at or below the snapshot), then the listing, then node 3
@@ -266,7 +381,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     const q = await S.makeQuote(s.fx, s.pool, { tokenAmount: TOK(100), nonce: 9 });
     await S.placeHold(s.fx, q);
     assert.equal((await s.pool.queue(10))[0].pinned, TOK(100));
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
     const order = fills(rc, s).map((x) => x.src + (x.id ? x.id : ""));
     console.log(`      order: ${order.join(" > ")}`);
     assert.deepEqual(order.slice(0, 2), ["listing1", "pool"]);
@@ -300,21 +415,505 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     await s.fx.market.connect(s.fx.signers.alice).contributeTokens(s.pool.target, TOK(100), d, await H.consentFloors(s.pool.target), GAS);
     const node2 = (await s.pool.queue(10)).find((n) => n.index === 2n);
     assert.equal(node2.amount, TOK(150), "the top-up merged into node 2, which keeps its number");
-    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+    const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
     const f = fills(rc, s);
     assert.deepEqual(f.map((x) => x.src + (x.id ? x.id : "")), ["pool", "listing1"]);
     assert.equal(f[0].amount, TOK(250), "the seed and all of node 2, top-up included, before the listing");
   });
 
-  it("a closed swap route (lane closed by the timelock) sells nothing and refunds the whole input", async () => {
+  it("a closed swap route (lane closed by the timelock) reverts with its reason and charges nothing", async () => {
     const s = await stack();
     const a = await s.seller(TOK(60));
     await (await s.list(a, TOK(60))).wait();
     await (await s.fx.market.connect(s.fx.signers.timelock48).closePassiveLane(s.pool.target)).wait();
-    const rc = await s.buy({ amountSpecified: -(20n * 10n ** 6n) }, { refundable: true });
-    assert.equal(fills(rc, s).length, 0);
-    assert.equal(rc.money.paid, 0n, "nothing charged");
+    const buyer = s.fx.signers.buyerEOA, usdc0 = await s.fx.usdc.balanceOf(buyer.address);
+    const p = { zeroForOne: s.zeroForOne, sqrtPriceLimitX96: s.zeroForOne ? MIN_SQRT : MAX_SQRT, amountSpecified: -(20n * 10n ** 6n) };
+    let reason;
+    try { await s.live.connect(buyer).swap.staticCall(s.key, p, GAS); assert.fail("a closed route must revert"); }
+    catch (e) { if (e.code === "ERR_ASSERTION") throw e; reason = s.shortfallOf(e).reason; }
+    assert.equal(reason, 6, "STOP_CLOSED");
+    assert.equal(await s.fx.usdc.balanceOf(buyer.address), usdc0, "nothing charged");
     assert.equal((await s.registry.listing(1)).remaining, TOK(60), "the listing untouched");
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Ported from the forge fork suite (29 Sep 2026): its swap tests ran the deleted Gen-3 path
+  // against an older vendored market with no listings. These carry the Gen-4-relevant properties
+  // onto the real stack. Expected numbers are pinned where they can be derived by hand at the
+  // fixture's flat rate (RATE = 2e6: $2 per token), so any change in the hook's arithmetic fails.
+  // ---------------------------------------------------------------------------------------------
+
+  describe("ported from the forge fork suite", () => {
+    it("TokenJar fee: every fill pays the jar exactly ceil(cost x 8 / 10,000) out of the spread; the buyer is charged what a jar-free hook charges", async () => {
+      // two stacks identical but for the hook's jar fee (8 bps, the production value, and 0): every buy
+      // runs on both, and the buyer must be charged and served identically on both
+      const J = await stack(), Z = await stack({ jarBps: 0 });
+      assert.equal(await J.hook.jarFeeBps(), 8n); assert.equal(await Z.hook.jarFeeBps(), 0n);
+      const both = async (params, opts) => [await measuredBuy(J, params, opts), await measuredBuy(Z, params, opts)];
+      const check = (label, j, z, exactInput) => {
+        assert.equal(j.cost, z.cost, `${label}: the sources charged the same`);
+        assert.equal(j.got, z.got, `${label}: the buyer received the same tokens`);
+        assert.equal(j.paid, z.paid, `${label}: the buyer paid the same (the jar changes nothing for the buyer)`);
+        assert.equal(j.dust, z.dust, `${label}: same dust`);
+        const spread = ceilBps(j.cost, 16); // the pair's 16 bps, no rungs
+        const fee = ceilBps(j.cost, 8);
+        assert.ok(fee > 0n && fee <= spread, `${label}: 0 < jar fee <= spread`);
+        assert.equal(j.fees.length, 1, `${label}: one ProtocolFeePaid per fill`);
+        assert.equal(j.fees[0].args.amount, fee, `${label}: ProtocolFeePaid = ceil(cost x 8 / 10,000)`);
+        assert.equal(j.fees[0].args.poolId, poolIdOf(J.key), `${label}: ProtocolFeePaid names the V4 pool`);
+        assert.equal(j.fees[0].args.asset, J.fx.usdc.target, `${label}: paid in the quote asset`);
+        assert.equal(j.jar, fee, `${label}: the jar received exactly the fee, in the same transaction`);
+        assert.equal(j.retained + j.jar, spread, `${label}: jar + kept margin = the whole spread`);
+        assert.equal(z.retained, spread, `${label}: the jar-free hook keeps the whole spread`);
+        assert.equal(z.fees.length, 0, `${label}: no jar fee, no event`); assert.equal(z.jar, 0n);
+        if (exactInput) assert.equal(j.paid, j.cost + spread + j.dust, `${label}: exact input charge = cost + spread + dust`);
+        else assert.equal(j.paid, j.cost + spread, `${label}: exact output charge = cost + spread`);
+        console.log(`      ${label}: cost ${j.cost}, spread ${spread} = jar ${j.jar} + kept ${j.retained}, dust ${j.dust}, sources ${j.srcs.join(" > ")}`);
+      };
+
+      // pool only, exact input $20 at 16 bps: budget floor(20e6 x 10,000 / 10,016) = 19,968,051 buys
+      // 9.9840255 tokens; spread ceil(19,968,051 x 16 / 10,000) = 31,949, jar ceil(x 8) = 15,975
+      let [j, z] = await both({ amountSpecified: -USD(20) });
+      check("pool-only exact input $20", j, z, true);
+      assert.equal(j.cost, 19_968_051n); assert.equal(j.got, 9_984_025_500_000_000_000n);
+      assert.equal(j.jar, 15_975n); assert.equal(j.retained, 15_974n); assert.equal(j.dust, 0n);
+
+      // pool only, exact output 10 tokens: cost $20, spread 32,000, jar 16,000, charge 20,032,000
+      [j, z] = await both({ amountSpecified: TOK(10) });
+      check("pool-only exact output 10 tokens", j, z, false);
+      assert.equal(j.cost, USD(20)); assert.equal(j.jar, 16_000n); assert.equal(j.retained, 16_000n); assert.equal(j.paid, 20_032_000n);
+
+      // the lowest legal spread is the jar fee itself: then the jar takes all of it and the hook keeps 0
+      const [usdc, token] = [J.fx.usdc.target, J.fx.token.target];
+      let snap = await network.provider.send("evm_snapshot", []);
+      await assert.rejects(J.hook.setBaseSpread(usdc, token, 7), (e) => J.hook.interface.parseError(revertData(e)).name === "SpreadOutOfRange");
+      await (await J.hook.setBaseSpread(usdc, token, 8)).wait();
+      j = await measuredBuy(J, { amountSpecified: TOK(5) }); // cost $10: spread = jar = 8,000
+      assert.equal(j.cost, USD(10)); assert.equal(j.jar, 8_000n); assert.equal(j.retained, 0n, "spread = jar fee: the hook keeps nothing");
+      assert.equal(j.paid, USD(10) + 8_000n, "and the buyer pays cost + the 8 bps spread");
+      await network.provider.send("evm_revert", [snap]);
+
+      // a listing behind the seed: fills that mix the pool and the listing
+      for (const s of [J, Z]) await (await s.list(await s.seller(TOK(60)), TOK(60))).wait();
+      snap = await network.provider.send("evm_snapshot", []);
+      [j, z] = await both({ amountSpecified: -USD(200) });
+      check("pool + listing exact input $200", j, z, true);
+      assert.deepEqual(j.srcs, ["pool", "listing1"], "the fill mixed the pool and the listing");
+      await network.provider.send("evm_revert", [snap]);
+      [j, z] = await both({ amountSpecified: TOK(100) });
+      check("pool + listing exact output 100 tokens", j, z, false);
+      assert.deepEqual(j.srcs, ["pool", "listing1"], "the fill mixed the pool and the listing");
+    });
+
+    it("quote parity: Uniswap's V4Quoter returns exactly what the swap delivers or charges (pool only, pool + listing, both directions), from any sender, and declines identically", async () => {
+      const s = await stack();
+      const q = await deployQuoter(s);
+      const other = s.fx.signers.bob;
+
+      // pool only, exact input $20: the same quote from any sender, and exactly what the swap delivers
+      let quoted = await q.exactIn(USD(20));
+      assert.equal(await q.exactIn(USD(20), other), quoted, "the quote does not depend on the sender");
+      assert.equal(quoted, 9_984_025_500_000_000_000n, "the hand-derived amount at $2 and 16 bps");
+      let m = await measuredBuy(s, { amountSpecified: -USD(20) });
+      assert.equal(m.got, quoted, "exact input: delivered == quoted");
+
+      // pool only, exact output 10 tokens: the quoted input is exactly the charge
+      quoted = await q.exactOut(TOK(10));
+      assert.equal(await q.exactOut(TOK(10), other), quoted, "the quote does not depend on the sender");
+      assert.equal(quoted, 20_032_000n, "cost $20 + ceil(16 bps) spread");
+      m = await measuredBuy(s, { amountSpecified: TOK(10) });
+      assert.equal(m.paid, quoted, "exact output: charged == quoted");
+
+      // pool + listing, both directions (the listing sits behind the seed)
+      await (await s.list(await s.seller(TOK(60)), TOK(60))).wait();
+      const snap = await network.provider.send("evm_snapshot", []);
+      quoted = await q.exactIn(USD(200));
+      m = await measuredBuy(s, { amountSpecified: -USD(200) });
+      assert.deepEqual(m.srcs, ["pool", "listing1"]);
+      assert.equal(m.got, quoted, "pool + listing exact input: delivered == quoted");
+      await network.provider.send("evm_revert", [snap]);
+      quoted = await q.exactOut(TOK(100));
+      m = await measuredBuy(s, { amountSpecified: TOK(100) });
+      assert.deepEqual(m.srcs, ["pool", "listing1"]);
+      assert.equal(m.paid, quoted, "pool + listing exact output: charged == quoted");
+      console.log(`      pool + listing: exact output 100 tokens quoted and charged ${quoted}`);
+
+      // declines: the quote reverts with exactly the hook error the swap reverts with
+      const declines = async (label, amount) => {
+        const fromQuote = await q.exactInError(amount), fromSwap = await swapError(s, -amount);
+        assert.ok(fromQuote && fromSwap, `${label}: both decline`);
+        assert.equal(errKey(fromQuote), errKey(fromSwap), `${label}: identical hook error`);
+        console.log(`      ${label}: quoter and swap both revert ${errKey(fromSwap)}`);
+        return fromSwap;
+      };
+      const big = await declines("a slice larger than the stock", USD(100_000));
+      assert.equal(big.name, "ExactInputShortfall"); assert.equal(big.args.reason, 5n, "STOP_STOCK");
+      const tiny = await declines("one raw unit (below the spread carve)", 1n);
+      assert.equal(errKey(tiny), "TradeTooSmallForSpread(1,16)");
+      await (await s.fx.market.connect(s.fx.signers.timelock48).closePassiveLane(s.pool.target)).wait();
+      const closed = await declines("a closed swap route", USD(20));
+      assert.equal(errKey(closed), "ExactInputShortfall(0,0,6)", "STOP_CLOSED");
+    });
+
+    it("spread rungs: each buy pays baseSpread + its rung's extraBps (first ceiling >= notional, open-ended top), spread = ceil(cost x bps / 10,000)", async () => {
+      const s = await stack();
+      const [usdc, token] = [s.fx.usdc.target, s.fx.token.target];
+      await s.deposit(TOK(2_000)); // node 2: stock for the large buys
+      // setSizeRungs rejects anything but strictly ascending ceilings with non-decreasing extraBps
+      await assert.rejects(s.hook.setSizeRungs(usdc, [{ notionalCeiling: USD(500), extraBps: 7 }, { notionalCeiling: USD(50), extraBps: 9 }]),
+        (e) => s.hook.interface.parseError(revertData(e)).name === "RungScheduleInvalid");
+      const rungs = [{ notionalCeiling: USD(50), extraBps: 0 }, { notionalCeiling: USD(500), extraBps: 7 }, { notionalCeiling: USD(1_000), extraBps: 20 }];
+      await (await s.hook.setSizeRungs(usdc, rungs)).wait();
+      // base 16 (the fixture) + rung: exact input measures the committed input, exact output the cost
+      const cases = [
+        { label: "small exact input $50 (at the first ceiling: +0)", params: { amountSpecified: -USD(50) }, notional: USD(50), bps: 16,
+          cost: 49_920_127n, spread: 79_873n, got: 24_960_063_500_000_000_000n },
+        { label: "exact input $50 + 1 raw unit (one over: +7)", params: { amountSpecified: -(USD(50) + 1n) }, notional: USD(50) + 1n, bps: 23,
+          cost: 49_885_264n, spread: 114_737n, got: 24_942_632_000_000_000_000n },
+        { label: "large exact input $1,500 (above the top ceiling: top rung +20)", params: { amountSpecified: -USD(1_500) }, notional: USD(1_500), bps: 36,
+          cost: 1_494_619_370n, spread: 5_380_630n, got: 747_309_685_000_000_000_000n },
+        { label: "small exact output 10 tokens (cost $20: +0)", params: { amountSpecified: TOK(10) }, notional: USD(20), bps: 16,
+          cost: USD(20), spread: 32_000n, got: TOK(10) },
+        { label: "large exact output 300 tokens (cost $600: +20)", params: { amountSpecified: TOK(300) }, notional: USD(600), bps: 36,
+          cost: USD(600), spread: 2_160_000n, got: TOK(300) },
+      ];
+      for (const c of cases) {
+        assert.equal(await s.hook.spreadBpsFor(usdc, token, c.notional), BigInt(c.bps), `${c.label}: spreadBpsFor`);
+        const m = await measuredBuy(s, c.params);
+        const spread = m.retained + m.jar;
+        console.log(`      ${c.label}: ${c.bps} bps, cost ${m.cost}, spread ${spread}, tokens ${m.got}, paid ${m.paid}`);
+        assert.equal(m.cost, c.cost, `${c.label}: cost`);
+        assert.equal(spread, ceilBps(m.cost, c.bps), `${c.label}: spread = ceil(cost x bps / 10,000)`);
+        assert.equal(spread, c.spread, `${c.label}: spread (pinned)`);
+        assert.equal(m.got, c.got, `${c.label}: tokens delivered`);
+        assert.equal(m.jar, ceilBps(m.cost, 8), `${c.label}: jar fee unaffected by the rung`);
+        if (c.params.amountSpecified < 0n) {
+          assert.equal(m.paid, -c.params.amountSpecified, `${c.label}: exact input charges the committed input`);
+          assert.equal(m.dust, m.paid - m.cost - spread, `${c.label}: the rest is dust`);
+        } else assert.equal(m.paid, m.cost + spread, `${c.label}: exact output charges cost + spread`);
+      }
+    });
+
+    it("PoolManager reserves: a ticket above the manager's quote balance reverts ManagerReservesExceeded; exactly the balance fills and the manager nets zero", async () => {
+      // the hook takes the buyer's input from the PoolManager inside beforeSwap, before the router pays
+      // it in (_takeChecked), so the largest ticket is what the manager holds from its other pools
+      const s = await stack({ managerReserve: 0n });
+      const [usdc, mgr] = [s.fx.usdc, s.manager.target];
+      const expectReserves = async (label, amountSpecified, requested, available) => {
+        const err = await swapError(s, amountSpecified);
+        assert.ok(err, `${label}: reverts`);
+        assert.equal(errKey(err), `ManagerReservesExceeded(${usdc.target},${requested},${available})`, label);
+      };
+
+      // exact input: the take is the whole committed input
+      await usdc.mint(mgr, USD(20));
+      await expectReserves("exact input one raw unit above the reserve", -(USD(20) + 1n), USD(20) + 1n, USD(20));
+      const m = await measuredBuy(s, { amountSpecified: -USD(20) }); // exactly the reserve
+      assert.equal(m.got, 9_984_025_500_000_000_000n, "the full-reserve ticket fills");
+      assert.equal(await usdc.balanceOf(mgr), USD(20), "and the manager nets zero at the ceiling");
+
+      // exact output: each leg's pre-funding is taken, then the spread, all before the router pays in,
+      // so 10 tokens (cost $20, spread 32,000) needs the manager to hold 20,032,000
+      await expectReserves("exact output with the reserve covering only the cost", TOK(10), 32_000n, 0n);
+      await usdc.mint(mgr, 31_999n);
+      await expectReserves("exact output one raw unit short", TOK(10), 32_000n, 31_999n);
+      await usdc.mint(mgr, 1n);
+      const o = await measuredBuy(s, { amountSpecified: TOK(10) });
+      assert.equal(o.paid, 20_032_000n, "exactly cost + spread in reserve fills");
+      assert.equal(await usdc.balanceOf(mgr), 20_032_000n, "and the manager nets zero");
+    });
+
+    it("the 1-wei visibility beacon: one dust add per pool, from anyone, and it never changes a quote or a fill", async () => {
+      const s = await stack();
+      const q = await deployQuoter(s);
+      const before = [await q.exactIn(USD(20)), await q.exactOut(TOK(10))];
+      const LT = artifact("PoolModifyLiquidityTest.sol", "PoolModifyLiquidityTest");
+      const lp = await new ethers.ContractFactory(LT.abi, LT.bytecode, s.fx.signers.admin).deploy(s.manager.target);
+      const anyone = s.fx.signers.bob;
+      await s.fx.usdc.mint(anyone.address, USD(1));
+      await s.fx.usdc.connect(anyone).approve(lp.target, ethers.MaxUint256);
+      await s.fx.token.connect(anyone).approve(lp.target, ethers.MaxUint256);
+      const add = (delta, salt) => lp.connect(anyone)["modifyLiquidity((address,address,uint24,int24,address),(int24,int24,int256,bytes32),bytes)"](
+        s.key, { tickLower: -600, tickUpper: 600, liquidityDelta: delta, salt }, "0x", GAS);
+      const poolId = poolIdOf(s.key);
+      assert.equal(await s.hook.beaconSeeded(poolId), false);
+      await assert.rejects(add(2, ethers.ZeroHash), (e) => hookErrorOf(s, revertData(e)).name === "LiquidityNotAllowed", "a real-size add is refused");
+      await (await add(1, ethers.ZeroHash)).wait();
+      assert.equal(await s.hook.beaconSeeded(poolId), true, "the beacon is lit");
+      await assert.rejects(add(1, ethers.zeroPadValue("0x01", 32)), (e) => hookErrorOf(s, revertData(e)).name === "LiquidityNotAllowed", "and closed after one add");
+      assert.deepEqual([await q.exactIn(USD(20)), await q.exactOut(TOK(10))], before, "the dust changed no quote");
+      const m = await measuredBuy(s, { amountSpecified: -USD(20) });
+      assert.equal(m.got, before[0], "nor the fill");
+    });
+
+    it("hookData is never read: the same buys with junk hookData deliver, charge and accrue identically", async () => {
+      const s = await stack();
+      await (await s.list(await s.seller(TOK(60)), TOK(60))).wait();
+      for (const params of [{ amountSpecified: -USD(250) }, { amountSpecified: TOK(130) }]) { // past the seed's 100 tokens
+        const runs = [];
+        for (const hookData of ["0x", "0xdeadbeef0102030405ffffffffffffffffffffffffffffffff00"]) {
+          const snap = await network.provider.send("evm_snapshot", []);
+          const m = await measuredBuy(s, params, { hookData });
+          runs.push([m.got, m.paid, m.cost, m.retained, m.jar, m.dust, m.srcs.join(">")].map(String));
+          await network.provider.send("evm_revert", [snap]);
+        }
+        assert.deepEqual(runs[1], runs[0], `hookData changed the outcome of ${params.amountSpecified}`);
+        assert.equal(runs[0][6], "pool>listing1");
+      }
+    });
+
+    it("margin custody and sweep: the hook holds exactly its booked margin + dust; the owner's sweep takes it all, with the split, and accrual resumes", async () => {
+      const s = await stack();
+      const [usdc, token] = [s.fx.usdc, s.fx.token];
+      const sweepTo = ethers.Wallet.createRandom().address;
+      await (await s.list(await s.seller(TOK(60)), TOK(60))).wait();
+      // several fill shapes, including an exact output while margin already sits on the hook
+      // (the Gen-4 walk pre-funds each leg from the PoolManager, so the margin is never working capital)
+      let spread = 0n, dust = 0n;
+      // 21,000,423 is an exact input that leaves 1 raw unit of dust at 16 bps (budget 20,966,875, spread 33,547)
+      for (const params of [{ amountSpecified: -21_000_423n }, { amountSpecified: TOK(10) }, { amountSpecified: -USD(33) }, { amountSpecified: TOK(100) }]) {
+        const m = await measuredBuy(s, params); // asserts the custody invariant after every fill
+        spread += m.retained; dust += m.dust;
+      }
+      assert.ok(spread > 0n && dust > 0n, "margin and dust accrued");
+      assert.equal(await s.hook.accruedSpreadMargin(usdc.target), spread, "the counter is the sum of the fills' kept spread");
+      assert.equal(await s.hook.accruedDust(usdc.target), dust);
+      assert.equal(await s.hook.accruedSpreadMargin(token.target), 0n, "an unrelated asset accrues nothing");
+      assert.equal(await ethers.provider.getBalance(s.hook.target), 0n, "no native on the hook");
+
+      await assert.rejects(s.hook.sweepMargin(usdc.target), (e) => s.hook.interface.parseError(revertData(e)).name === "SweepDestinationNotSet");
+      await assert.rejects(s.hook.connect(s.fx.signers.bob).sweepMargin(usdc.target), (e) => s.hook.interface.parseError(revertData(e)).name === "OwnableUnauthorizedAccount");
+      await assert.rejects(s.hook.setSweepDestination(ethers.ZeroAddress), (e) => s.hook.interface.parseError(revertData(e)).name === "ZeroAddress");
+      await (await s.hook.setSweepDestination(sweepTo)).wait();
+      await assert.rejects(s.hook.connect(s.fx.signers.bob).sweepMargin(usdc.target), (e) => s.hook.interface.parseError(revertData(e)).name === "OwnableUnauthorizedAccount");
+      const donation = 1_234_567n; // force-sent: recovered by the same sweep, reported as the excess over the split
+      await usdc.mint(s.hook.target, donation);
+      const rc = await (await s.hook.sweepMargin(usdc.target)).wait();
+      const swept = hookEvents(rc, s).find((e) => e.name === "MarginSwept");
+      assert.equal(swept.args.asset, usdc.target); assert.equal(swept.args.to, sweepTo);
+      assert.equal(swept.args.spreadPortion, spread); assert.equal(swept.args.dustPortion, dust);
+      assert.equal(swept.args.swept, spread + dust + donation);
+      assert.equal(await usdc.balanceOf(sweepTo), spread + dust + donation, "the destination received everything");
+      assert.equal(await usdc.balanceOf(s.hook.target), 0n, "the hook is empty");
+      assert.equal(await s.hook.accruedSpreadMargin(usdc.target), 0n); assert.equal(await s.hook.accruedDust(usdc.target), 0n);
+
+      // restock: the seed is sold out, and the listing's 23-token remainder is below the pool's minimum
+      // (the fixture's $100 minContribution = 50 tokens), so the registry reports it dead (peek)
+      await s.deposit(TOK(100));
+      const again = await measuredBuy(s, { amountSpecified: -USD(20) });
+      assert.ok(again.retained > 0n, "accrual resumes after a sweep");
+      assert.equal(await s.hook.accruedSpreadMargin(usdc.target), again.retained);
+    });
+
+    it("a paused market, a paused pool and a frozen hook: quote and swap decline with the same typed error, and service resumes when lifted", async () => {
+      const s = await stack();
+      const q = await deployQuoter(s);
+      const { market, signers } = s.fx;
+      const declinesAlike = async (label) => {
+        const fromQuote = await q.exactInError(USD(20)), fromSwap = await swapError(s, -USD(20));
+        assert.ok(fromQuote && fromSwap, `${label}: both decline`);
+        assert.equal(errKey(fromQuote), errKey(fromSwap), `${label}: identical hook error`);
+        console.log(`      ${label}: quoter and swap both revert ${errKey(fromSwap)}`);
+        return errKey(fromSwap);
+      };
+      const fillsAgain = async (label) => assert.equal((await measuredBuy(s, { amountSpecified: -USD(20) })).got, 9_984_025_500_000_000_000n, `${label}: fills again`);
+      const wanted = 9_984_025_500_000_000_000n; // $20 at 16 bps and $2
+
+      // the settlement's price() reports a paused market (why 2) and a paused pool (why 4) as closed
+      await (await market.connect(signers.admin).pause()).wait();
+      assert.equal(await declinesAlike("market paused"), "ExactInputShortfall(0,0,6)");
+      await (await market.connect(signers.admin).unpause()).wait();
+      await fillsAgain("market unpaused");
+      await (await market.connect(signers.admin).pausePool(s.pool.target, true)).wait();
+      assert.equal(await declinesAlike("pool paused"), "ExactInputShortfall(0,0,6)");
+      await (await market.connect(signers.admin).pausePool(s.pool.target, false)).wait();
+      await fillsAgain("pool unpaused");
+
+      // the market's freeze tests the pool leg's msg.sender and buyer, both the hook: freezing the
+      // swapper changes nothing, freezing the hook stops every pool leg (the runbook's "never freeze
+      // the hook address"); the price stays open, so the walk stops on the failed leg (STOP_POOL_LEG)
+      await (await market.connect(signers.freeze24).setFreezeEnabled(true)).wait();
+      await (await market.connect(signers.admin).setFrozen(signers.buyerEOA.address, true)).wait();
+      await fillsAgain("the swapper frozen");
+      await (await market.connect(signers.admin).setFrozen(s.hook.target, true)).wait();
+      assert.equal(await declinesAlike("the hook frozen"), `ExactInputShortfall(0,${wanted},3)`);
+      await (await market.connect(signers.admin).setFrozen(s.hook.target, false)).wait();
+      await fillsAgain("the hook unfrozen");
+    });
+
+    it("the reseller code reaches both legs verbatim; an unregistered code still trades", async () => {
+      const codesOf = (s, rc) => {
+        const out = [];
+        for (const log of rc.logs) {
+          const a = log.address.toLowerCase();
+          try {
+            if (a === s.pool.target.toLowerCase()) { const e = s.pool.interface.parseLog(log); if (e && e.name === "PoolBuy") out.push(["pool", e.args.resellerCode]); }
+            else if (a === s.settlement.target.toLowerCase()) { const e = s.settlement.interface.parseLog(log); if (e && e.name === "ListingFeeDistributed") out.push(["listing", e.args.resellerCode]); }
+          } catch {}
+        }
+        return out;
+      };
+      for (const code of ["KYBER", "not-registered-anywhere"]) { // KYBER is the fixture's registered reseller
+        const s = await stack();
+        await (await s.list(await s.seller(TOK(60)), TOK(60))).wait();
+        await (await s.hook.setResellerCode(code)).wait();
+        const m = await measuredBuy(s, { amountSpecified: TOK(130) }); // the seed's 100, then 30 from the listing
+        assert.equal(m.got, TOK(130), `${code}: the buy fills`);
+        assert.deepEqual(m.srcs, ["pool", "listing1"]);
+        assert.deepEqual(codesOf(s, m.rc), [["pool", code], ["listing", code]], `${code}: forwarded verbatim to both legs`);
+      }
+    });
+  });
+
+  // Gas matrix (WSR F5 build, 27-28 Sep 2026): gas used, eth_estimateGas and the LOWEST gas limit that
+  // fills, per case. Run with GAS_MATRIX=1. Each case sizes its slice to the whole stock, as a splitting
+  // aggregator would; under all-or-nothing a limit either fills completely or reverts.
+  (process.env.GAS_MATRIX ? describe : describe.skip)("gas matrix", () => {
+    const measure = async (s, label) => {
+      const { charged } = await s.priceAll(GAS);
+      const p = { zeroForOne: s.zeroForOne, sqrtPriceLimitX96: s.zeroForOne ? MIN_SQRT : MAX_SQRT, amountSpecified: -charged };
+      const buyer = s.fx.signers.buyerEOA;
+      const est = await s.live.connect(buyer).swap.estimateGas(s.key, p);
+      const at = async (gasLimit) => {
+        const snap = await network.provider.send("evm_snapshot", []);
+        try { const rc = await (await s.live.connect(buyer).swap(s.key, p, { gasLimit })).wait(); return { ok: true, used: rc.gasUsed }; }
+        catch { return { ok: false }; }
+        finally { await network.provider.send("evm_revert", [snap]); }
+      };
+      const full = await at(30_000_000);
+      assert.ok(full.ok, `${label}: fills at 30M`);
+      let lo = 300_000, hi = 30_000_000;
+      while (hi - lo > 25_000) { const mid = Math.floor((lo + hi) / 2); if ((await at(mid)).ok) hi = mid; else lo = mid; }
+      const used = Number(full.used);
+      console.log(`      ${label}: used ${used}, estimate ${est} (${(Number(est) / used).toFixed(2)}x), lowest limit that fills ${hi} (${(hi / used).toFixed(2)}x used)`);
+    };
+    it("matrix", async () => {
+      { const s = await stack(); await measure(s, "pool only, 1 node (seed)"); }
+      { const s = await stack(); for (let i = 0; i < 19; i++) await s.deposit(TOK(50)); await measure(s, "pool only, 20 nodes"); }
+      { const s = await stack(); for (let i = 0; i < 49; i++) await s.deposit(TOK(50)); await measure(s, "pool only, 50 nodes"); }
+      { const s = await stack(); const a = await s.seller(TOK(60)); await (await s.list(a, TOK(60))).wait(); await measure(s, "seed + 1 listing"); }
+      { const s = await stack(); const a = await s.seller(TOK(60)), b = await s.seller(TOK(60)); await (await s.list(a, TOK(60))).wait(); await (await s.list(b, TOK(60))).wait(); await measure(s, "seed + 2 listings"); }
+      { const s = await stack(); const a = await s.seller(TOK(60)), b = await s.seller(TOK(60)); await (await s.list(a, TOK(60))).wait(); await (await s.list(b, TOK(60))).wait();
+        await (await s.fx.token.connect(a).transfer(s.fx.signers.alice.address, TOK(60))).wait(); await measure(s, "seed + 1 dead + 1 live listing"); }
+      { const s = await stack({ dustTicks: 36 }); const a = await s.seller(TOK(60)); await (await s.list(a, TOK(60))).wait(); await measure(s, "dusty venue (72 ticks), seed + 1 listing"); }
+    });
+  });
+
+  describe("design E on the stack: native-ETH and aeWETH pools selling one C1 pool (Daniel, 30 Sep)", () => {
+    // The real market, pool, venue, listing registry and settlement, the real PoolManager, the hook's
+    // real 16 bps spread and 8 bps jar fee. Queue: the seed (100) and a deposit (100), then a listing
+    // of 60, then ten deposits of 100 behind it. Native is the main pool (the 80% default); the
+    // "aeWETH" pool (the wrapped fixture token) is the second pool and never sells listings.
+    async function ethStack() {
+      const s = await stack({ ethPools: true });
+      // a $20 inventory floor, so K (one floor in tokens) is real: 10 tokens at the fixture's rate
+      await (await s.fx.market.connect(s.fx.signers.admin).setInventoryFloor(s.fx.usdc.target, 20n * 10n ** 6n)).wait();
+      await s.deposit(TOK(100)); // node 2
+      const w = await s.seller(TOK(60));
+      await (await s.list(w, TOK(60))).wait(); // listing 1, queued after nodes 1 and 2
+      for (let i = 0; i < 10; i++) await s.deposit(TOK(100)); // nodes 3..12, behind the listing
+      const buyer = s.fx.signers.buyerEOA;
+      const leg = (native, amountSpecified) => {
+        const zeroForOne = native ? true : s.zeroForOne;
+        return { key: native ? s.nativeKey : s.key, params: { zeroForOne, amountSpecified, sqrtPriceLimitX96: zeroForOne ? MIN_SQRT : MAX_SQRT } };
+      };
+      // each pool's own quote: what an oversized exact input on it alone would fill
+      const probe = async (native) => {
+        try { await s.twoPool.connect(buyer).swapAll.staticCall([leg(native, -(10n ** 12n))], GAS); assert.fail("an oversized probe must revert"); }
+        catch (e) { if (e.code === "ERR_ASSERTION") throw e; return s.shortfallOf(e).filled; }
+      };
+      return { ...s, buyer, leg, probe };
+    }
+
+    async function bothPoolsInOneTransaction(order) {
+      const s = await ethStack();
+      const deposits = await s.pool.reachable();
+      const mainMax = await s.probe(true), secondMax = await s.probe(false);
+      const [, rate] = await s.fx.market.previewRate(s.pool.target, s.fx.usdc.target);
+      const floor = await s.fx.market.inventoryFloor(s.fx.usdc.target);
+      const K = (floor * 10n ** 18n + rate - 1n) / rate;
+      const shareable = deposits - K, second = (shareable * 2_000n) / 10_000n - K;
+      assert.ok(K > 0n, "the floor makes K real");
+      assert.equal(secondMax, second, "the second pool's quote is its share of (deposits - K), less K");
+      assert.equal(mainMax, shareable - second + TOK(60), "the main pool's quote is the rest of the deposits plus the listing");
+      const legs = order === "native first"
+        ? [s.leg(true, mainMax), s.leg(false, secondMax)]
+        : [s.leg(false, secondMax), s.leg(true, mainMax)];
+      const tokens0 = await s.fx.token.balanceOf(s.buyer.address);
+      const margin0 = await s.hook.accruedSpreadMargin(s.fx.usdc.target);
+      const jar0 = await s.fx.usdc.balanceOf(s.jar);
+      const rc = await (await s.twoPool.connect(s.buyer).swapAll(legs, { value: 10n ** 16n, ...GAS })).wait();
+      assert.equal((await s.fx.token.balanceOf(s.buyer.address)) - tokens0, mainMax + secondMax, "both pools' quotes fill in one transaction");
+      const buys = [], fees = [];
+      for (const log of rc.logs) {
+        if (log.address.toLowerCase() !== s.hook.target.toLowerCase()) continue;
+        try {
+          const e = s.hook.interface.parseLog(log);
+          if (e && e.name === "BuyExecuted") buys.push({ quoteIn: e.args[3], spread: e.args[6], dust: e.args[7] });
+          if (e && e.name === "ProtocolFeePaid") fees.push(e.args[2]);
+        } catch {}
+      }
+      assert.equal(buys.length, 2, "one buy per pool");
+      assert.equal(fees.length, 2, "one jar payment per pool");
+      // the event's spread is net of the jar fee (paid = sources + spread + jar + dust), so each pool's
+      // source cost is quoteIn - spread - jar - dust; the pair's 16 bps covers spread and jar together
+      for (let i = 0; i < 2; i++) {
+        const cost = buys[i].quoteIn - buys[i].spread - fees[i] - buys[i].dust;
+        assert.ok(buys[i].spread > 0n, "each pool keeps a spread");
+        assert.equal(fees[i], (cost * 8n + 9_999n) / 10_000n, "each pool pays the jar ceil(cost x 8 / 10,000)");
+        assert.equal(buys[i].spread + fees[i], (cost * 16n + 9_999n) / 10_000n, "spread plus jar fee is the pair's 16 bps of cost");
+      }
+      assert.equal((await s.fx.usdc.balanceOf(s.jar)) - jar0, fees[0] + fees[1], "the jar received both fees");
+      assert.equal((await s.hook.accruedSpreadMargin(s.fx.usdc.target)) - margin0, buys[0].spread + buys[1].spread, "the hook books both spreads (net of the jar fees)");
+      assert.equal(await ethers.provider.getBalance(s.hook.target), 0n, "no native left on the hook");
+      const listing = await s.registry.listing(1n);
+      console.log(`      ${order}: main ${mainMax}, second ${secondMax}, gas ${rc.gasUsed}; deposits left ${await s.pool.reachable()}, listing remaining ${listing.remaining}`);
+      assert.equal(await s.pool.reachable(), K, "exactly K stays in the pool");
+      return { mainMax, secondMax, left: await s.pool.reachable(), listingRemaining: listing.remaining };
+    }
+
+    it("both pools' quotes fill in one transaction in either order, with the real spread and jar fee, and sell the same stock", async () => {
+      const a = await bothPoolsInOneTransaction("native first");
+      const b = await bothPoolsInOneTransaction("aeWETH first");
+      assert.equal(b.mainMax, a.mainMax);
+      assert.equal(b.secondMax, a.secondMax);
+      assert.equal(b.left, a.left, "the same deposits sold in either order");
+      assert.equal(b.listingRemaining, a.listingRemaining, "the same listing stock sold in either order");
+      assert.equal(a.listingRemaining, 0n, "the main pool sold the listing");
+    });
+
+    // The Robin pass 65 case on the real registry and settlement: 200 of deposits sit ahead of the
+    // listing. A main slice of 150 is quoted as 150 of those deposits, listing untouched. When the
+    // aeWETH pool runs first and buys the deposits ahead of the listing, the main pool must still sell
+    // deposits (from further back), not jump to the listing: the same stock as with native first.
+    it("a smaller main slice sells what its own quote sold, whichever pool runs first", async () => {
+      const outcome = async (order) => {
+        const s = await ethStack();
+        const secondMax = await s.probe(false);
+        const legs = order === "native first"
+          ? [s.leg(true, TOK(150)), s.leg(false, secondMax)]
+          : [s.leg(false, secondMax), s.leg(true, TOK(150))];
+        const deposits0 = await s.pool.reachable();
+        await (await s.twoPool.connect(s.buyer).swapAll(legs, { value: 10n ** 16n, ...GAS })).wait();
+        const listing = await s.registry.listing(1n);
+        return { sold: deposits0 - (await s.pool.reachable()), listingRemaining: listing.remaining, secondMax };
+      };
+      const a = await outcome("native first"), b = await outcome("aeWETH first");
+      console.log(`      main 150 + second ${a.secondMax}: deposits sold ${a.sold} / ${b.sold}, listing remaining ${a.listingRemaining} / ${b.listingRemaining}`);
+      assert.equal(a.listingRemaining, TOK(60), "native first: the main slice sells deposits ahead of the listing");
+      assert.equal(b.listingRemaining, TOK(60), "aeWETH first: the main slice still sells deposits, not the listing");
+      assert.equal(b.sold, a.sold, "the same deposits sold in either order");
+      assert.equal(a.sold, TOK(150) + a.secondMax);
+    });
+
+    it("an aeWETH slice above its budget reverts the whole transaction and nothing moves", async () => {
+      const s = await ethStack();
+      const mainMax = await s.probe(true), secondMax = await s.probe(false);
+      const tokens0 = await s.fx.token.balanceOf(s.buyer.address), left0 = await s.pool.reachable();
+      await assert.rejects(s.twoPool.connect(s.buyer).swapAll([s.leg(true, mainMax), s.leg(false, secondMax + TOK(1))], { value: 10n ** 16n, ...GAS }));
+      assert.equal(await s.fx.token.balanceOf(s.buyer.address), tokens0);
+      assert.equal(await s.pool.reachable(), left0);
+    });
   });
 
   describe("gate 2: gas on the pinned stack", () => {
@@ -324,45 +923,63 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       const a = await s.seller(TOK(60));
       await (await s.list(a, TOK(60))).wait(); // poolTail = 50
       assert.equal((await s.pool.queue(100)).length, 50);
-      const rc = await s.buy({ amountSpecified: -(20_000n * 10n ** 6n) }, { refundable: true });
+      const rc = await s.buy({ amountSpecified: -(20_000n * 10n ** 6n) }, { buyAll: true });
       const f = fills(rc, s), order = f.map((x) => x.src + (x.id ? x.id : ""));
       console.log(`      50 nodes + 1 listing: order ${order.join(" > ")}; pool tokens ${f.filter((x) => x.src === "pool").reduce((t, x) => t + x.amount, 0n)}; gas ${rc.gasUsed}`);
       assert.equal(order[order.length - 1], "listing1", "the listing only after the whole queue ahead of it");
     });
 
-    it("16 dead listings ahead of the pool: the attempt cap stops the walk and refunds, never reverts", async () => {
+    it("17 dead listings ahead of stock (Wilko, 29 Sep): one swap retires them on the way and fills", async () => {
       const s = await stack();
-      // retire the seed's sellability first: move every deposit behind 16 listings by listing before any deposit
-      // (the seed is node 1 at or below every snapshot, so it sells first; the cap is measured on the listings after it)
       const sellers = [];
-      for (let i = 0; i < 16; i++) { const w = await s.seller(TOK(60)); await (await s.list(w, TOK(60))).wait(); sellers.push(w); }
-      await s.deposit(TOK(50)); // node 2, behind all 16 listings
-      for (const w of sellers) await (await s.fx.token.connect(w).transfer(s.fx.signers.alice.address, TOK(60))).wait(); // all 16 die
-      const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
-      const f = fills(rc, s), order = f.map((x) => x.src + (x.id ? x.id : ""));
-      const retired = rc.logs.filter((l) => l.address.toLowerCase() === s.registry.target.toLowerCase()).map((l) => { try { return s.registry.interface.parseLog(l); } catch { return null; } }).filter((e) => e && e.name === "Retired").length;
-      console.log(`      16 dead listings: order ${order.join(" > ") || "(none)"}; retired ${retired}; gas ${rc.gasUsed}; paid ${rc.money.paid}`);
-      assert.ok(retired >= 1);
+      for (let i = 0; i < 17; i++) { const w = await s.seller(TOK(60)); await (await s.list(w, TOK(60))).wait(); sellers.push(w); }
+      await s.deposit(TOK(50)); // node 2, behind all 17 listings
+      for (const w of sellers) await (await s.fx.token.connect(w).transfer(s.fx.signers.alice.address, TOK(60))).wait(); // all 17 die
+      const rc = await s.buy({}, { buyAll: true });
+      const f = fills(rc, s);
+      assert.equal(f.reduce((t, x) => t + x.amount, 0n), TOK(150), "the seed and node 2, past 17 dead listings");
+      for (let id = 1n; id <= 17n; id++) assert.equal((await s.registry.listing(id)).status, 3n, `L${id} retired by the swap`);
+      console.log(`      17 dead listings: one swap retired them and filled ${f.reduce((t, x) => t + x.amount, 0n)}; gas ${rc.gasUsed}`);
     });
 
-    it("a 50-deposit buy under tight gas limits fills what the gas allows and refunds the rest, never reverting", async () => {
+    it("33 dead listings ahead of stock: a buy past them reverts at the dead-listing cap; an independent prune clears the queue and the buy fills", async () => {
+      const s = await stack();
+      const sellers = [];
+      for (let i = 0; i < 33; i++) { const w = await s.seller(TOK(60)); await (await s.list(w, TOK(60))).wait(); sellers.push(w); }
+      await s.deposit(TOK(50));
+      for (const w of sellers) await (await s.fx.token.connect(w).transfer(s.fx.signers.alice.address, TOK(60))).wait();
+      const buyer = s.fx.signers.buyerEOA;
+      const p = { zeroForOne: s.zeroForOne, sqrtPriceLimitX96: s.zeroForOne ? MIN_SQRT : MAX_SQRT };
+      const seedOnly = await s.priceAll(GAS);
+      let wall;
+      try { await s.live.connect(buyer).swap.staticCall(s.key, { ...p, amountSpecified: -(seedOnly.charged * 2n) }, GAS); assert.fail("must revert"); }
+      catch (e) { if (e.code === "ERR_ASSERTION") throw e; wall = s.shortfallOf(e); }
+      console.log(`      33 dead listings: a buy past them reverts reason ${wall.reason} with ${wall.filled} filled (the seed)`);
+      assert.equal(wall.reason, 7, "the attempt cap (32 retirements)");
+      const keeper = s.fx.signers.alice;
+      for (let id = 1n; id <= 33n; id++) await (await s.registry.connect(keeper).prune(id, GAS)).wait();
+      const rc = await s.buy({}, { buyAll: true });
+      const f = fills(rc, s);
+      assert.equal(f.reduce((t, x) => t + x.amount, 0n), TOK(150), "the buy past the cleared queue fills completely");
+    });
+
+    it("a 50-deposit buy under tight gas limits either fills completely or reverts, never fills part", async () => {
       const s = await stack();
       for (let i = 0; i < 49; i++) await s.deposit(TOK(50));
       const full = TOK(100) + 49n * TOK(50);
+      const { charged } = await s.priceAll(GAS);
       const rows = [];
       for (const gasLimit of [2_000_000, 3_000_000, 4_000_000, 5_000_000, 8_000_000]) {
         const snap = await network.provider.send("evm_snapshot", []);
         try {
-          const rc = await s.buy({ amountSpecified: -(20_000n * 10n ** 6n) }, { refundable: true, gasLimit });
+          const rc = await s.buy({ amountSpecified: -charged }, { live: true, gasLimit });
           const got = fills(rc, s).reduce((t, x) => t + x.amount, 0n);
           rows.push({ gasLimit, got, gasUsed: rc.gasUsed, reverted: false });
         } catch (e) { rows.push({ gasLimit, reverted: true }); }
         finally { await network.provider.send("evm_revert", [snap]); }
       }
       console.log("      " + rows.map((r) => `${r.gasLimit}: ${r.reverted ? "REVERTED" : `${r.got / 10n ** 18n} of ${full / 10n ** 18n} tokens, gas ${r.gasUsed}`}`).join("; "));
-      // review F3: a limit either fills something (and refunds the rest) or reverts; never succeeds empty
-      for (const r of rows) assert.ok(r.reverted || r.got > 0n, `succeeded with no output at ${r.gasLimit}`);
-      assert.ok(rows.some((r) => !r.reverted && r.got > 0n && r.got < full), "some limit fills part and refunds the rest");
+      for (const r of rows) assert.ok(r.reverted || r.got === full, `filled part (${r.got}) at ${r.gasLimit}`);
       assert.equal(rows[rows.length - 1].got, full, "enough gas fills everything");
     });
 
@@ -376,7 +993,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       assert.ok(maxBuyGas > 1_000_000n, `maxBuy costs ${maxBuyGas}: above the old fixed 1M read cap`);
       const a = await s.seller(TOK(60));
       await (await s.list(a, TOK(60))).wait();
-      const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { refundable: true });
+      const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
       const order = fills(rc, s).map((x) => x.src + (x.id ? x.id : ""));
       console.log(`      dusty venue: maxBuy ${maxBuyGas}, price ${priceGas} (tier ${ev.tier}, depthOk ${ev.depthOk}); swap order ${order.join(" > ")}; gas ${rc.gasUsed}`);
       assert.deepEqual(order, ["pool", "listing1"]);
@@ -397,6 +1014,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       while (hi - lo > 50_000) { const mid = Math.floor((lo + hi) / 2); if ((await at(mid)).filled) hi = mid; else lo = mid; }
       const r = await at(hi), below = await at(lo);
       console.log(`      pool-only $20 swap: fills from gas limit ~${hi} (gas used ${r.gasUsed}); at ${lo}: ${below.reverted ? "reverts" : "succeeds with NO fill"}`);
+      assert.ok(below.reverted, "below the limit it reverts, never succeeds empty");
     });
   });
 });

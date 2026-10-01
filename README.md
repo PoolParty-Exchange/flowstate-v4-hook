@@ -110,12 +110,20 @@ Foundry 1.7.1 (`~/.foundry/bin`). The `robinhood` RPC endpoint is set in
 in `setUp` via `vm.createSelectFork`.
 
 ```bash
-forge test                     # full suite (109 tests), forks latest RH block
-FORK_BLOCK=21411475 forge test # pin the fork block (faster reruns, deterministic)
-forge test --match-path "test/fork/GasColdWarm.t.sol"  -vv  # stub-oracle gas table
-forge test --match-path "test/fork/LiveOracleGas.t.sol" -vv # LIVE-oracle gas table
-forge test --match-path "test/fork/RealStackWiring.t.sol"   # real-market behaviours
+forge test --no-match-path "test/fork/*"                   # offline suite (the Gen-4 walk on mocks)
+forge test --match-path "test/fork/HookSkeleton.t.sol"      # one fork file at a time (the public RPC rate-limits)
+FORK_BLOCK=21411475 forge test --match-path "test/fork/*"  # pin the fork block (faster reruns, deterministic)
+forge test --match-path "test/fork/LiveOracleGas.t.sol" -vv # the live oracle's read cost
+forge test --match-path "test/fork/RealStackWiring.t.sol"   # real-market deployment and governance wiring
 ```
+
+29 Sep 2026: the Gen-3 swap path is deleted and the hook's constructor requires a listing
+registry and settlement. The fork suite runs an older vendored market with no listings, so
+its hook is wired to stand-ins (`test/fork/ListingStandIn.sol`) and its swap tests are
+retired (`GasColdWarm`, `TakeSettle` and `UniversalRouterPartialFill` whole, the rest test by
+test); a swap there reverts `ExactInputShortfall(0, 0, 6)` (route closed). Swaps are tested
+against the real current contracts in `test/stack/` (see its README) and offline in
+`test/Gen4HookIntegration.t.sol`. The measurements below are the historical Gen-3 record.
 
 Submodules matter now (`--recursive`, or `git submodule update --init --recursive`):
 the build needs `lib/openzeppelin-contracts-upgradeable` alongside v4-core/v4-periphery.

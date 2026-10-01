@@ -24,40 +24,65 @@ contract Gen4Recorder {
     function step(uint256 i) external view returns (uint256) { return _steps[i]; }
 }
 
+/// @dev A deposit queue in index order; a sold-out entry leaves the queue, as in the real pool.
 contract Gen4MockPool {
     MockInventoryToken public immutable token;
-    uint64 public index;
-    uint128 public amount;
-    uint128 public pinned;
+    IGen4Pool.QueueNode[] internal _nodes;
 
     constructor(MockInventoryToken token_) { token = token_; }
 
+    /// @dev Resets the queue to one entry (none when amount_ is 0).
     function setNode(uint64 index_, uint128 amount_, uint128 pinned_) external {
-        index = index_;
-        amount = amount_;
-        pinned = pinned_;
+        delete _nodes;
+        if (amount_ != 0) _nodes.push(IGen4Pool.QueueNode(index_, address(0xA11CE), amount_, pinned_, pinned_ == 0 ? 0 : 1));
+    }
+
+    /// @dev Queues another entry behind the others.
+    function addNode(uint64 index_, uint128 amount_) external {
+        _nodes.push(IGen4Pool.QueueNode(index_, address(0xA11CE), amount_, 0, 0));
     }
 
     bool public buyBackEnabled;
     address public buybackAsset;
     function setBuyBack(bool enabled, address asset) external { buyBackEnabled = enabled; buybackAsset = asset; }
 
-    function available() public view returns (uint256) { return uint256(amount) - uint256(pinned); }
+    function amount() external view returns (uint256 total) {
+        for (uint256 i; i < _nodes.length; ++i) total += _nodes[i].amount;
+    }
+
+    function available() public view returns (uint256 total) {
+        for (uint256 i; i < _nodes.length; ++i) total += uint256(_nodes[i].amount) - uint256(_nodes[i].pinned);
+    }
 
     function tokenQueueEnds() external view returns (uint64 head, uint64 tail) {
-        if (amount != 0) return (index, index);
+        uint256 n = _nodes.length;
+        for (uint256 i; i < n; ++i) {
+            if (_nodes[i].amount != 0) return (_nodes[i].index, _nodes[n - 1].index);
+        }
     }
 
-    function queue(uint256) external view returns (IGen4Pool.QueueNode[] memory nodes) {
-        if (amount == 0) return new IGen4Pool.QueueNode[](0);
-        nodes = new IGen4Pool.QueueNode[](1);
-        nodes[0] = IGen4Pool.QueueNode(index, address(0xA11CE), amount, pinned, pinned == 0 ? 0 : 1);
+    /// @dev Pins stock on entry `i` (a signed-lane hold), as a hold landing inside a transaction would.
+    function pin(uint256 i, uint128 pinned_) external {
+        _nodes[i].pinned = pinned_;
     }
 
+    function queue(uint256 limit) external view returns (IGen4Pool.QueueNode[] memory nodes) {
+        uint256 live;
+        for (uint256 i; i < _nodes.length; ++i) if (_nodes[i].amount != 0) ++live;
+        if (live > limit) live = limit;
+        nodes = new IGen4Pool.QueueNode[](live);
+        uint256 j;
+        for (uint256 i; i < _nodes.length && j < live; ++i) if (_nodes[i].amount != 0) nodes[j++] = _nodes[i];
+    }
+
+    /// @dev Sells in queue order, as the market does; it does not see listings.
     function fill(uint256 requested, address buyer) external returns (uint256 filled) {
-        uint256 a = available();
-        filled = requested < a ? requested : a;
-        amount -= uint128(filled);
+        for (uint256 i; i < _nodes.length && filled < requested; ++i) {
+            uint256 a = uint256(_nodes[i].amount) - uint256(_nodes[i].pinned);
+            uint256 take = requested - filled < a ? requested - filled : a;
+            _nodes[i].amount -= uint128(take);
+            filled += take;
+        }
         token.transfer(buyer, filled);
     }
 }
@@ -94,6 +119,7 @@ contract Gen4MockSettlement {
     Gen4Recorder public immutable recorder;
     address public immutable market;
     uint256 public rate = 1e18;
+    function setRate(uint256 value) external { rate = value; }
     bool public alwaysStale;
     bool public closed;
 
@@ -148,8 +174,15 @@ contract Gen4MockMarket {
     MockInventoryToken public immutable token;
     Gen4Recorder public immutable recorder;
     uint256 public rate = 1e18;
+    function setRate(uint256 value) external { rate = value; }
     uint256 public executionRate = 1e18;
     mapping(address => bool) public approvedQuoteAssets;
+    mapping(address => uint256) public inventoryFloor;
+    mapping(address => uint256) public minContribution;
+    function setFloors(address asset, uint256 floor, uint256 minimum) external {
+        inventoryFloor[asset] = floor;
+        minContribution[asset] = minimum;
+    }
 
     constructor(Gen4MockPool pool_, MockInventoryToken token_, Gen4Recorder recorder_) {
         pool = pool_;
@@ -164,8 +197,10 @@ contract Gen4MockMarket {
     function approveAsset(address asset) external { approvedQuoteAssets[asset] = true; }
     function setExecutionRate(uint256 value) external { executionRate = value; }
     function setFailMode(uint8 value) external { failMode = value; }
+    mapping(address => bool) public otherPools; // more C1 pools of the same token, registration only
+    function addPool(address candidate) external { otherPools[candidate] = true; }
     function poolRecords(address candidate) external view returns (address inventoryToken, bool exists) {
-        return candidate == address(pool) ? (address(token), true) : (address(0), false);
+        return candidate == address(pool) || otherPools[candidate] ? (address(token), true) : (address(0), false);
     }
     function previewRate(address candidate, address asset) external view returns (bool ok, uint256 rate_) {
         return (candidate == address(pool) && approvedQuoteAssets[asset], rate);
@@ -176,6 +211,8 @@ contract Gen4MockMarket {
         maxTokens = pool.available();
         maxQuote = (maxTokens * rate + 1e18 - 1) / 1e18;
     }
+    address public reenter; // when set, called once during the next pool leg (a nested swap)
+    function setReenter(address value) external { reenter = value; }
     function buyFromPoolBounded(
         address,
         address asset,
@@ -187,6 +224,11 @@ contract Gen4MockMarket {
         uint256
     ) public returns (uint256 tokensFilled, uint256 quotePaid) {
         recorder.record(200);
+        if (reenter != address(0)) {
+            address r = reenter;
+            reenter = address(0);
+            Gen4Nested(r).nested();
+        }
         if (failMode == 1) revert("pool leg reverted");
         if (failMode == 2) while (true) {} // exhausts the forwarded gas
         tokensFilled = pool.fill(amount, buyer);
@@ -203,6 +245,10 @@ contract Gen4MockMarket {
     function buyFromPoolExactOut(address p, address a, uint256 n, string calldata c, address b)
         external returns (uint256, uint256)
     { return buyFromPoolBounded(p, a, n, c, b, type(uint256).max, n, 0); }
+}
+
+interface Gen4Nested {
+    function nested() external;
 }
 
 contract Gen4MockManager {
@@ -239,16 +285,22 @@ contract FlowstateC1HookHarness is FlowstateC1Hook {
         address settlement
     ) FlowstateC1Hook(manager, market, owner, weth, address(0xBEEF), 0, registry, settlement) {}
 
+    /// @dev What beforeInitialize records when the pool of a registered pair is created.
+    function openPair(address a, address b) external {
+        (Currency c0, Currency c1) = _sort(Currency.wrap(a), Currency.wrap(b));
+        _pairOpened[_pairKey(c0, c1)] = true;
+    }
+
     function runExactInput(
         address pool,
         address input,
         address marketAsset,
         address output,
         uint256 quoteIn,
-        address sender
+        address
     ) external returns (uint256 tokens, uint256 cost, uint256 refund, uint256 dust) {
         PairConfig memory cfg = PairConfig(pool, false, true, 0, marketAsset);
-        Fill memory f = _buyGen4ExactInput(cfg, Currency.wrap(input), Currency.wrap(output), -int256(quoteIn), sender);
+        Fill memory f = _buyGen4ExactInput(cfg, Currency.wrap(input), Currency.wrap(output), -int256(quoteIn));
         tokens = f.tokensOut;
         cost = f.costBase;
         dust = f.dustAccrued;
@@ -334,24 +386,127 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(token.balanceOf(address(manager)), 3e18);
     }
 
-    function test_ExactInputPartialFillRefundsUnspentQuote() public {
+    // Wilko, 29 Sep 2026: dead listings at the front are retired on the way, outside the 16 steps,
+    // up to GEN4_MAX_DEAD_RETIREMENTS per swap. Each dead listing here was queued before the deposit.
+    function _deadAhead(uint64 n) internal {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        for (uint64 id = 1; id <= n; ++id) registry.push(Gen4MockRegistry.Candidate(2, id, 0, 1, 0));
+    }
+
+    function test_DeadListingsDoNotUseTheSixteenSteps() public {
+        _deadAhead(20);
+        (uint256 tokens,,) = hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        assertEq(tokens, 1e18);
+        assertEq(recorder.length(), 21, "20 retirements, then the deposit");
+        for (uint256 i; i < 20; ++i) assertEq(recorder.step(i), 101 + i);
+        assertEq(recorder.step(20), 200);
+        assertEq(registry.cursor(), 20, "all 20 retired");
+    }
+
+    function test_DeadListingsUpToTheCapFillExactInput() public {
+        assertEq(hook.GEN4_MAX_DEAD_RETIREMENTS(), 32);
+        _deadAhead(32);
+        (uint256 tokens,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        assertEq(tokens, 1e18);
+        assertEq(registry.cursor(), 32);
+    }
+
+    function test_DeadListingsAboveTheCapRevertAndRetireNothing() public {
+        _deadAhead(33);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4AttemptCapExceeded.selector, 0));
+        hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 1e18, uint8(7)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        assertEq(registry.cursor(), 0, "the reverted swaps retired nothing");
+    }
+
+    // Robin pass 69: a dead candidate the settlement never retires (STALE every time, still linked) is
+    // bounded by the same cap: the walk stops after 32 dead steps
+    function test_AStuckDeadListingIsBoundedByTheDeadCap() public {
+        _deadAhead(1);
+        settlement.setAlwaysStale(true);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4AttemptCapExceeded.selector, 0));
+        hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        uint256 before = recorder.length();
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 1e18, uint8(7)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
+        assertEq(recorder.length(), before, "reverted calls leave no record");
+    }
+
+    // WSR F5 (27 Sep 2026): a slice fills completely or reverts; nothing is ever handed back
+    function test_ExactInputShortFillRevertsAndHandsNothingBack() public {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        uint256 beforeBalance = quote.balanceOf(address(manager));
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 1e18, 10e18, uint8(5)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 10e18, address(this));
+        assertEq(quote.balanceOf(address(manager)), beforeBalance);
+        assertEq(quote.balanceOf(address(hook)), 0);
+        assertEq(pool.available(), 1e18, "the stock is untouched");
+    }
+
+    function test_ExactInputAtExactDepthFillsCompletely() public {
         pool.setNode(1, 1e18, 0);
         token.mint(address(pool), 1e18);
         uint256 beforeBalance = quote.balanceOf(address(manager));
         (uint256 tokens, uint256 cost, uint256 refund, uint256 dust) = hook.runExactInput(
-            address(pool), address(quote), address(quote), address(token), 10e18, address(this)
+            address(pool), address(quote), address(quote), address(token), 1e18, address(this)
         );
         assertEq(tokens, 1e18);
         assertEq(cost, 1e18);
-        assertEq(refund, 9e18);
+        assertEq(refund, 0);
         assertEq(dust, 0);
         assertEq(quote.balanceOf(address(manager)), beforeBalance - 1e18);
         assertEq(quote.balanceOf(address(hook)), 0);
     }
 
+    function test_ExactInputJustAboveDepthReverts() public {
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 1e18, 1e18 + 1, uint8(5)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1e18 + 1, address(this));
+    }
+
+    function test_SubUnitLeftoverIsDustAndTheFillCompletes() public {
+        settlement.setRate(3e18);
+        market.setRate(3e18);
+        market.setExecutionRate(3e18);
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        (uint256 tokens,, uint256 refund, uint256 dust) = hook.runExactInput(
+            address(pool), address(quote), address(quote), address(token), 3e18 + 2, address(this)
+        );
+        assertEq(tokens, 1e18);
+        assertEq(refund, 0);
+        assertEq(dust, 2, "two wei, less than one token unit at 3, kept as dust");
+    }
+
+    function test_BudgetBelowOneTokenUnitRevertsWithNothingFilled() public {
+        settlement.setRate(3e18);
+        market.setRate(3e18);
+        market.setExecutionRate(3e18);
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 0, uint8(5)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 2, address(this));
+    }
+
+    function test_FillEndingOnTheSixteenthAttemptSucceeds() public {
+        uint256 n = hook.GEN4_MAX_ATTEMPTS();
+        for (uint64 i = 1; i <= n + 1; ++i) registry.push(Gen4MockRegistry.Candidate(1, i, 1e17, 1, 0));
+        token.mint(address(settlement), (n + 1) * 1e17);
+        (uint256 tokens,, uint256 refund,) = hook.runExactInput(
+            address(pool), address(quote), address(quote), address(token), n * 1e17, address(this)
+        );
+        assertEq(tokens, n * 1e17, "sixteen listings, the budget spent on the last");
+        assertEq(refund, 0);
+        assertEq(recorder.length(), n);
+    }
+
     function enforceMinimumOutput(uint256 minimum) external {
         (uint256 tokens,,,) = hook.runExactInput(
-            address(pool), address(quote), address(quote), address(token), 10e18, address(this)
+            address(pool), address(quote), address(quote), address(token), 1e18, address(this)
         );
         require(tokens >= minimum, "minimum output");
     }
@@ -388,19 +543,13 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(recorder.step(2), 102);
     }
 
-    function test_StaleAttemptCapRefundsAndRetainsNothing() public {
+    function test_StaleAttemptCapRevertsAndRetainsNothing() public {
         token.mint(address(settlement), 1e18);
         registry.push(Gen4MockRegistry.Candidate(1, 7, 1e18, 1, 0));
         settlement.setAlwaysStale(true);
         uint256 beforeBalance = quote.balanceOf(address(manager));
-        (uint256 tokens, uint256 cost, uint256 refund, uint256 dust) = hook.runExactInput(
-            address(pool), address(quote), address(quote), address(token), 5e18, address(this)
-        );
-        assertEq(tokens, 0);
-        assertEq(cost, 0);
-        assertEq(refund, 5e18);
-        assertEq(dust, 0);
-        assertEq(recorder.length(), hook.GEN4_MAX_ATTEMPTS());
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 5e18, uint8(7)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 5e18, address(this));
         assertEq(quote.balanceOf(address(manager)), beforeBalance);
         assertEq(quote.balanceOf(address(hook)), 0);
     }
@@ -433,19 +582,21 @@ contract Gen4HookIntegrationTest is Test {
         registry.push(Gen4MockRegistry.Candidate(1, 9, 1e18, 1, 0));
         settlement.setAlwaysStale(true);
         uint256 beforeGas = gasleft();
-        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 5e18, address(this));
+        try hook.runExactInput(address(pool), address(quote), address(quote), address(token), 5e18, address(this)) {
+            revert("sixteen stale attempts must revert");
+        } catch {}
         emit log_named_uint("gen4_16_stale_attempts_gas", beforeGas - gasleft());
     }
 
     // Failure handling (JUP-698 gate 1 finding, review F3/F5, 26 Sep 2026). A leg that reverts or runs
-    // out of gas is rolled back in the callee. Exact input keeps what already filled and refunds the
-    // rest; with nothing filled it reverts Gen4NothingFilled, so gas estimators search upward.
+    // out of gas is rolled back in the callee, and the walk stops. Since WSR F5 (27 Sep 2026) exact input
+    // then reverts the whole swap with ExactInputShortfall(filled, wanted, reason), filled or not.
     function test_ZeroFillPoolLegFailureRevertsNothingFilled() public {
         pool.setNode(1, 1e18, 0);
         token.mint(address(pool), 1e18);
         for (uint8 mode = 1; mode <= 2; ++mode) {
             market.setFailMode(mode);
-            vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4NothingFilled.selector, uint8(3)));
+            vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 10e18, uint8(3)));
             hook.runExactInput(address(pool), address(quote), address(quote), address(token), 10e18, address(this));
         }
     }
@@ -457,37 +608,30 @@ contract Gen4HookIntegrationTest is Test {
         registry.push(Gen4MockRegistry.Candidate(1, 2, 2e18, 1, 4)); // listing, poolTail 4: sells first
         market.setFailMode(mode);
         uint256 managerBefore = quote.balanceOf(address(manager));
-        (uint256 tokens, uint256 cost, uint256 refund,) = hook.runExactInput(
-            address(pool), address(quote), address(quote), address(token), 10e18, address(this)
-        );
-        assertEq(tokens, 2e18, "the listing sold before the pool leg failed");
-        assertEq(cost, 2e18);
-        assertEq(refund, 8e18, "the rest refunded");
-        assertEq(quote.balanceOf(address(manager)), managerBefore - 2e18, "only the listing's cost left the manager");
+        // the listing had sold 2e18 before the pool leg failed: the whole swap reverts
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 2e18, 10e18, uint8(3)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 10e18, address(this));
+        assertEq(quote.balanceOf(address(manager)), managerBefore, "nothing left the manager");
         assertEq(quote.balanceOf(address(hook)), 0, "hook keeps nothing");
         assertEq(pool.amount(), 1e18, "the pool node untouched");
     }
 
-    function test_RevertingPoolLegAfterAFillRefundsTheRest() public {
+    function test_RevertingPoolLegAfterAFillRevertsTheSwap() public {
         _listingThenFailingPool(1);
     }
 
-    function test_OutOfGasPoolLegAfterAFillIsCaughtAndRefunds() public {
+    function test_OutOfGasPoolLegAfterAFillRevertsTheSwap() public {
         _listingThenFailingPool(2);
     }
 
-    function test_RevertingListingLegRefundsAfterEarlierFills() public {
+    function test_RevertingListingLegAfterAFillRevertsTheSwap() public {
         pool.setNode(1, 1e18, 0);
         token.mint(address(pool), 1e18);
         token.mint(address(settlement), 2e18);
         registry.push(Gen4MockRegistry.Candidate(1, 2, 2e18, 1, 1)); // live listing behind node 1
         settlement.setRevertSettle(true);
-        (uint256 tokens, uint256 cost, uint256 refund,) = hook.runExactInput(
-            address(pool), address(quote), address(quote), address(token), 10e18, address(this)
-        );
-        assertEq(tokens, 1e18, "the pool leg before the listing still delivered");
-        assertEq(cost, 1e18);
-        assertEq(refund, 9e18, "the rest refunded");
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 1e18, 10e18, uint8(4)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 10e18, address(this));
         assertEq(quote.balanceOf(address(hook)), 0);
     }
 
@@ -495,7 +639,7 @@ contract Gen4HookIntegrationTest is Test {
         token.mint(address(settlement), 2e18);
         registry.push(Gen4MockRegistry.Candidate(1, 2, 2e18, 1, 0));
         settlement.setRevertSettle(true);
-        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4NothingFilled.selector, uint8(4)));
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 10e18, uint8(4)));
         hook.runExactInput(address(pool), address(quote), address(quote), address(token), 10e18, address(this));
     }
 
@@ -503,7 +647,7 @@ contract Gen4HookIntegrationTest is Test {
         pool.setNode(1, 1e18, 0);
         token.mint(address(pool), 1e18);
         market.setFailMode(3);
-        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4NothingFilled.selector, uint8(2)));
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 10e18, uint8(2)));
         hook.runExactInput(address(pool), address(quote), address(quote), address(token), 10e18, address(this));
         vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.CandidateInspectionFailed.selector, uint8(1)));
         hook.runExactOutput(address(pool), address(quote), address(quote), address(token), 1e18, address(this));
@@ -525,24 +669,20 @@ contract Gen4HookIntegrationTest is Test {
             abi.encodeCall(FlowstateC1HookHarness.runExactInput, (address(pool), address(quote), address(quote), address(token), 10e18, address(this)))
         );
         assertFalse(ok, "reverts rather than succeeding with no output");
-        assertEq(ret, abi.encodeWithSelector(FlowstateC1Hook.Gen4NothingFilled.selector, uint8(1)));
+        assertEq(ret, abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 10e18, uint8(1)));
         assertEq(recorder.length(), 0, "no leg attempted");
     }
 
     // The price is read once per swap: a closed swap route sells nothing from either source
-    function test_ClosedRouteExactInputRefundsEverythingWithoutAnAttempt() public {
+    function test_ClosedRouteExactInputRevertsWithItsReasonBeforeTakingInput() public {
         pool.setNode(1, 1e18, 0);
         token.mint(address(pool), 1e18);
         registry.push(Gen4MockRegistry.Candidate(1, 2, 2e18, 1, 1));
         settlement.setClosed(true);
-        (uint256 tokens, uint256 cost, uint256 refund,) = hook.runExactInput(
-            address(pool), address(quote), address(quote), address(token), 10e18, address(this)
-        );
-        assertEq(tokens, 0);
-        assertEq(cost, 0);
-        assertEq(refund, 10e18);
-        assertEq(recorder.length(), 0, "no leg attempted");
-        assertEq(quote.balanceOf(address(hook)), 0);
+        uint256 managerBefore = quote.balanceOf(address(manager));
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, 0, 0, uint8(6)));
+        hook.runExactInput(address(pool), address(quote), address(quote), address(token), 10e18, address(this));
+        assertEq(quote.balanceOf(address(manager)), managerBefore);
     }
 
     function test_ClosedRouteExactOutputRevertsAsShortfall() public {
@@ -580,6 +720,493 @@ contract Gen4HookIntegrationTest is Test {
         new FlowstateC1HookHarness{salt: salt}(
             address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
         );
+    }
+
+    // ---- Design E: two ETH Uniswap pools on one C1 pool (29 Sep 2026) ----
+    // Foundry runs a test function as one transaction, so two runs below are two pools hit in the same
+    // transaction, the case a router split across both pools creates. Native is the main door (80%).
+
+    function _twoEthPools(uint128 stock, uint256 floor) internal {
+        pool.setNode(1, stock, 0);
+        token.mint(address(pool), stock);
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
+        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool), 0);
+        hook.openPair(address(0), address(token));
+        hook.openPair(address(weth), address(token));
+        market.setFloors(address(weth), floor, 0); // K = floor tokens at rate 1
+        vm.deal(address(this), 4_000e18);
+        weth.deposit{value: 4_000e18}();
+        weth.transfer(address(manager), 4_000e18);
+    }
+
+    function _buyNative(uint256 amount) internal returns (uint256 tokens) {
+        (tokens,,,) = hook.runExactInput(address(pool), address(0), address(weth), address(token), amount, address(this));
+    }
+
+    function _buyWrapped(uint256 amount) internal returns (uint256 tokens) {
+        (tokens,,,) = hook.runExactInput(address(pool), address(weth), address(weth), address(token), amount, address(this));
+    }
+
+    function _shortfall(uint256 filled, uint256 wanted) internal pure returns (bytes memory) {
+        return abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, filled, wanted, uint8(5));
+    }
+
+    function test_E_BothDoorsFillTheirBudgetsInOneTransaction_MainFirst() public {
+        _twoEthPools(1_000e18, 0);
+        assertEq(_buyNative(800e18), 800e18, "main door: 80% of deposits");
+        assertEq(_buyWrapped(200e18), 200e18, "second door: 20%, same transaction");
+        assertEq(pool.available(), 0);
+    }
+
+    function test_E_BothDoorsFillTheirBudgetsInOneTransaction_SecondFirst() public {
+        _twoEthPools(1_000e18, 0);
+        assertEq(_buyWrapped(200e18), 200e18);
+        assertEq(_buyNative(800e18), 800e18);
+    }
+
+    function test_E_SecondDoorOverItsBudgetRevertsAndSellsNothing() public {
+        _twoEthPools(1_000e18, 0);
+        vm.expectRevert(_shortfall(200e18, 201e18));
+        _buyWrapped(201e18);
+        assertEq(pool.available(), 1_000e18, "nothing sold");
+        assertEq(_buyNative(800e18), 800e18, "the main door's budget is untouched");
+    }
+
+    // K = 14: deposits 1,000 -> shareable 986, second = 197.2 - 14 = 183.2, main = 802.8; 14 stay in the pool
+    function test_E_OneFloorStaysInThePoolWhileSharing() public {
+        _twoEthPools(1_000e18, 14e18);
+        assertEq(_buyNative(802.8e18), 802.8e18);
+        assertEq(_buyWrapped(183.2e18), 183.2e18);
+        assertEq(pool.available(), 14e18, "K left for the next transaction");
+        vm.expectRevert(_shortfall(0, 1e18));
+        _buyWrapped(1e18);
+    }
+
+    // deposits 60, K 14 -> second = 9.2 - 14 < 0 -> sharing off: main uncapped, second sells nothing
+    function test_E_SharingSwitchesOffBelowAboutSixFloors() public {
+        _twoEthPools(60e18, 14e18);
+        vm.expectRevert(_shortfall(0, 1e18));
+        _buyWrapped(1e18);
+        assertEq(_buyNative(60e18), 60e18, "main door sells everything");
+    }
+
+    function test_E_MainDoorManySlicesStayInItsBudget() public {
+        _twoEthPools(1_000e18, 0);
+        assertEq(_buyNative(500e18), 500e18);
+        assertEq(_buyNative(300e18), 300e18);
+        vm.expectRevert(_shortfall(0, 1e18));
+        _buyNative(1e18);
+    }
+
+    function test_E_NoCapUntilTheSiblingPoolIsOpened() public {
+        pool.setNode(1, 1_000e18, 0);
+        token.mint(address(pool), 1_000e18);
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
+        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool), 0);
+        hook.openPair(address(0), address(token)); // the aeWETH pool was never created
+        assertEq(_buyNative(1_000e18), 1_000e18);
+    }
+
+    // native at 20 bps, aeWETH at 16, the floor raised to 18: only the sibling drops below it (Adv pass)
+    function _spreads(uint16 nativeBps, uint16 wrappedBps) internal {
+        hook.setBaseSpread(Currency.wrap(address(0)), Currency.wrap(address(token)), nativeBps);
+        hook.setBaseSpread(Currency.wrap(address(weth)), Currency.wrap(address(token)), wrappedBps);
+    }
+
+    function test_E_SiblingBelowTheSpreadFloorDoesNotCount() public {
+        _twoEthPools(1_000e18, 0);
+        _spreads(20, 16);
+        hook.setBaseSpreadFloor(18); // the aeWETH pool can no longer trade; the native pool still can
+        assertEq(_buyNative(1_000e18), 1_000e18);
+    }
+
+    function test_E_UnregisteringTheSiblingRemovesTheCap() public {
+        _twoEthPools(1_000e18, 0);
+        hook.unregisterPair(Currency.wrap(address(weth)), Currency.wrap(address(token)));
+        assertEq(_buyNative(1_000e18), 1_000e18);
+    }
+
+    function test_E_NativeOnlyAtTenThousand() public {
+        _twoEthPools(1_000e18, 0);
+        hook.setNativeShare(address(pool), 10_000);
+        vm.expectRevert(_shortfall(0, 1e18));
+        _buyWrapped(1e18);
+        assertEq(_buyNative(1_000e18), 1_000e18);
+    }
+
+    function test_E_AeWETHIsTheMainDoorBelowFiveThousand() public {
+        _twoEthPools(1_000e18, 0);
+        hook.setNativeShare(address(pool), 2_000);
+        vm.expectRevert(_shortfall(200e18, 201e18));
+        _buyNative(201e18);
+        assertEq(_buyWrapped(800e18), 800e18);
+        assertEq(_buyNative(200e18), 200e18);
+    }
+
+    function test_E_NonEthPoolIsNeverCapped() public {
+        _twoEthPools(1_000e18, 0);
+        (uint256 tokens,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1_000e18, address(this));
+        assertEq(tokens, 1_000e18);
+    }
+
+    // listings are sold only through the main door: deposits 200 (K 0: second 40, main 160) + a listing of 800
+    function test_E_MainDoorSellsListingsUncapped() public {
+        _twoEthPools(200e18, 0);
+        token.mint(address(settlement), 800e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 800e18, 1, 0)); // older than the pool node
+        assertEq(_buyNative(960e18), 960e18, "800 listed + 160 deposits");
+        assertEq(_buyWrapped(40e18), 40e18);
+    }
+
+    function test_E_SecondDoorNeverTouchesListings() public {
+        _twoEthPools(1_000e18, 0);
+        token.mint(address(settlement), 500e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 500e18, 1, 0)); // older than the pool node
+        assertEq(_buyWrapped(100e18), 100e18);
+        assertEq(recorder.length(), 1);
+        assertEq(recorder.step(0), 200, "one pool leg, no listing leg");
+        assertEq(registry.cursor(), 0, "the listing is untouched");
+    }
+
+    function test_E_ExactOutputFollowsTheSameBudgets() public {
+        _twoEthPools(1_000e18, 0);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4FillShortfall.selector, 200e18, 201e18));
+        hook.runExactOutput(address(pool), address(weth), address(weth), address(token), 201e18, address(this));
+        (uint256 tokens,,) = hook.runExactOutput(address(pool), address(weth), address(weth), address(token), 200e18, address(this));
+        assertEq(tokens, 200e18);
+        (tokens,,) = hook.runExactOutput(address(pool), address(0), address(weth), address(token), 800e18, address(this));
+        assertEq(tokens, 800e18);
+    }
+
+    // a swap nested inside the main door's pool leg sees that leg's planned sale
+    uint256 internal nestedAmount;
+    uint256 internal nestedRuns;
+    bool internal nestedFilled;
+    function nested() external {
+        ++nestedRuns;
+        try hook.runExactInput(address(pool), address(0), address(weth), address(token), nestedAmount, address(this)) returns (
+            uint256 tokens, uint256, uint256, uint256
+        ) {
+            nestedFilled = tokens == nestedAmount;
+        } catch {
+            nestedFilled = false;
+        }
+    }
+
+    function test_E_NestedSwapDuringAPoolLegSeesThePlannedSale() public {
+        _twoEthPools(1_000e18, 0);
+        // main door budget 800; the outer leg plans 500 before it runs, so a nested 301 does not fit
+        nestedAmount = 301e18;
+        market.setReenter(address(this));
+        assertEq(_buyNative(500e18), 500e18);
+        assertEq(nestedRuns, 1, "the nested swap ran");
+        assertFalse(nestedFilled, "a nested 301 would take the main door past 800");
+        // outer 1 planned (501 recorded): a nested 299 fits exactly
+        nestedAmount = 299e18;
+        market.setReenter(address(this));
+        assertEq(_buyNative(1e18), 1e18);
+        assertEq(nestedRuns, 2);
+        assertTrue(nestedFilled, "299 fits beside the planned 501");
+        vm.expectRevert(_shortfall(0, 1e18));
+        _buyNative(1e18); // 500 + 1 + 299 = 800: the main door is full
+    }
+
+    function test_E_NativeShareSetterBoundsAndOwner() public {
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.InvalidShare.selector, uint16(10_001)));
+        hook.setNativeShare(address(pool), 10_001);
+        vm.prank(address(0xBAD));
+        vm.expectRevert();
+        hook.setNativeShare(address(pool), 5_000);
+        hook.setNativeShare(address(pool), 10_000);
+        assertEq(hook.nativeShareBps(address(pool)), 10_000);
+    }
+
+    // ---- Robin pass 65: the second door's sale must not push the main door past its own quote ----
+    // Queue: a deposit of 188 (entry 1), 17 listings of 20 queued after it, a deposit of 812 (entry 2).
+    // K = 10 -> shareable 990, second door 198 - 10 = 188, main door 802.
+    function _robin65Queue() internal {
+        _twoEthPools(188e18, 10e18);
+        pool.addNode(2, 812e18);
+        token.mint(address(pool), 812e18);
+        token.mint(address(settlement), 340e18);
+        for (uint64 id = 1; id <= 17; ++id) registry.push(Gen4MockRegistry.Candidate(1, id, 20e18, 1, 1));
+    }
+
+    function _mainExactOutput(uint256 target) internal returns (uint256 tokens) {
+        (tokens,,) = hook.runExactOutput(address(pool), address(0), address(weth), address(token), target, address(this));
+    }
+
+    /// @dev Steps recorded from entry `from` on: 200 = a pool leg, 100 + id = a listing.
+    function _assertSteps(uint256 from, uint256[] memory expected) internal view {
+        assertEq(recorder.length() - from, expected.length, "number of steps");
+        for (uint256 i; i < expected.length; ++i) assertEq(recorder.step(from + i), expected[i]);
+    }
+
+    function _robin65MainSteps() internal pure returns (uint256[] memory s) {
+        s = new uint256[](9);
+        s[0] = 200; // 188 of deposits
+        for (uint256 i = 1; i < 9; ++i) s[i] = 100 + i; // listings 1 to 8 (the 8th sells 12 of 20)
+    }
+
+    function test_E_Robin65_MainQuoteAloneTakesNineSteps() public {
+        _robin65Queue();
+        assertEq(_mainExactOutput(340e18), 340e18);
+        _assertSteps(0, _robin65MainSteps());
+    }
+
+    function test_E_Robin65_SecondDoorFirstLeavesTheMainDoorItsQuotedSteps() public {
+        _robin65Queue();
+        assertEq(_buyWrapped(188e18), 188e18, "second door: the first deposit");
+        uint256 from = recorder.length();
+        assertEq(_mainExactOutput(340e18), 340e18, "main door: 9 steps, not 17");
+        _assertSteps(from, _robin65MainSteps());
+        assertEq(pool.available(), 624e18, "188 + 188 of deposits sold");
+        assertEq(registry.cursor(), 8, "listings 1 to 8 sold");
+    }
+
+    function test_E_Robin65_MainDoorFirstSellsTheSameStock() public {
+        _robin65Queue();
+        assertEq(_mainExactOutput(340e18), 340e18);
+        assertEq(_buyWrapped(188e18), 188e18);
+        assertEq(pool.available(), 624e18, "the same deposits as the other order");
+        assertEq(registry.cursor(), 8, "the same listings as the other order");
+    }
+
+    function test_E_Robin65_ExactInputSecondDoorFirst() public {
+        _robin65Queue();
+        assertEq(_buyWrapped(188e18), 188e18);
+        uint256 from = recorder.length();
+        assertEq(_buyNative(340e18), 340e18);
+        _assertSteps(from, _robin65MainSteps());
+        assertEq(pool.available(), 624e18);
+        assertEq(registry.cursor(), 8);
+    }
+
+    // Deposits between listings: entry 1 = 100, listing 1 (10), entry 2 = 100, listings 2 to 20 (10 each),
+    // entry 3 = 1,000; K = 0 -> second door 240, main door 960. The main door's view must remember how
+    // far along the queue each listing sits: a plain "second door sold 100" credit would be spent on
+    // entry 2, which the main door reaches anyway, and leave it more listings than its quote.
+    function _betweenQueue() internal {
+        _twoEthPools(100e18, 0);
+        pool.addNode(2, 100e18);
+        pool.addNode(3, 1_000e18);
+        token.mint(address(pool), 1_100e18);
+        token.mint(address(settlement), 200e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
+        for (uint64 id = 2; id <= 20; ++id) registry.push(Gen4MockRegistry.Candidate(1, id, 10e18, 1, 2));
+    }
+
+    function _betweenMainSteps() internal pure returns (uint256[] memory s) {
+        s = new uint256[](6);
+        (s[0], s[1], s[2], s[3], s[4], s[5]) = (200, 101, 200, 102, 103, 104);
+    }
+
+    function test_E_DepositsBetweenListings_SecondDoorFirst() public {
+        _betweenQueue();
+        assertEq(_buyWrapped(100e18), 100e18);
+        uint256 from = recorder.length();
+        assertEq(_mainExactOutput(240e18), 240e18);
+        _assertSteps(from, _betweenMainSteps());
+        assertEq(pool.available(), 900e18);
+        assertEq(registry.cursor(), 4);
+    }
+
+    function test_E_DepositsBetweenListings_MainDoorFirst() public {
+        _betweenQueue();
+        assertEq(_mainExactOutput(240e18), 240e18);
+        _assertSteps(0, _betweenMainSteps());
+        assertEq(_buyWrapped(100e18), 100e18);
+        assertEq(pool.available(), 900e18, "the same deposits as the other order");
+        assertEq(registry.cursor(), 4, "the same listings as the other order");
+    }
+
+    // Robin pass 66: only the second door's sales count. Entry 1 = 100, a listing of 10 queued after it,
+    // entry 2 = 900; K = 0 -> second door 200, main door 800.
+    function _oneListingQueue() internal {
+        _twoEthPools(100e18, 0);
+        pool.addNode(2, 900e18);
+        token.mint(address(pool), 900e18);
+        token.mint(address(settlement), 10e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
+    }
+
+    // a USDG slice takes entry 1 after the note: the main door may pass the listing by the second
+    // door's 1 token only, then the listing sells in its turn
+    function test_E_AnotherPoolsSaleDoesNotLetTheMainDoorPassAListing() public {
+        _oneListingQueue();
+        assertEq(_buyWrapped(1e18), 1e18, "second door: 1 from entry 1 (the note is taken)");
+        (uint256 usdg,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 99e18, address(this));
+        assertEq(usdg, 99e18, "the USDG pool takes the rest of entry 1");
+        uint256 from = recorder.length();
+        assertEq(_mainExactOutput(20e18), 20e18);
+        uint256[] memory s = new uint256[](3);
+        (s[0], s[1], s[2]) = (200, 101, 200); // 1 of deposits, the listing, then 9 of deposits
+        _assertSteps(from, s);
+        assertEq(registry.cursor(), 1, "the listing sold");
+    }
+
+    // a hold pins the rest of entry 1 after the main door's first slice: with no second-door sale, the
+    // main door's next slice must sell the listing before any later deposit
+    function test_E_APinDoesNotLetTheMainDoorPassAListing() public {
+        _oneListingQueue();
+        assertEq(_mainExactOutput(1e18), 1e18, "main door: 1 from entry 1 (the note is taken)");
+        pool.pin(0, 99e18);
+        uint256 from = recorder.length();
+        assertEq(_mainExactOutput(20e18), 20e18);
+        uint256[] memory s = new uint256[](2);
+        (s[0], s[1]) = (101, 200); // the listing first, then entry 2
+        _assertSteps(from, s);
+    }
+
+    // Robin pass 67: the credit used at a listing position is kept per position. Entry 1 = 100, entry
+    // 2 = 100, entry 3 = 800; listings X (after entry 1), Y (after entry 2), then Z back at X's position
+    // (a listing position the walk returns to). The second door sells 1, a USDG slice the rest of entry
+    // 1, and a hold pins entry 2: the main door has 1 of credit at each position, once.
+    function test_E_CreditUsedAtAPositionIsNotResetByAnother() public {
+        _twoEthPools(100e18, 0);
+        pool.addNode(2, 100e18);
+        pool.addNode(3, 800e18);
+        token.mint(address(pool), 900e18);
+        token.mint(address(settlement), 30e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
+        registry.push(Gen4MockRegistry.Candidate(1, 2, 10e18, 1, 2));
+        registry.push(Gen4MockRegistry.Candidate(1, 3, 10e18, 1, 1));
+        assertEq(_buyWrapped(1e18), 1e18);
+        (uint256 usdg,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 99e18, address(this));
+        assertEq(usdg, 99e18);
+        pool.pin(1, 100e18);
+        uint256 from = recorder.length();
+        assertEq(_mainExactOutput(32e18), 32e18);
+        uint256[] memory s = new uint256[](5);
+        (s[0], s[1], s[2], s[3], s[4]) = (200, 101, 200, 102, 103); // Z sells without a third credit
+        _assertSteps(from, s);
+    }
+
+    // Robin pass 67: a swap nested inside a credited leg sees that leg's credit as used. After the
+    // second door sells 1 and a USDG slice the rest of entry 1, the main door's 1 of credit is taken
+    // by the outer leg, so the nested main-door swap sells the listing instead of a second credit.
+    function test_E_NestedSwapDuringACreditedLegSeesTheCreditUsed() public {
+        _oneListingQueue();
+        assertEq(_buyWrapped(1e18), 1e18);
+        (uint256 usdg,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 99e18, address(this));
+        assertEq(usdg, 99e18);
+        nestedAmount = 1e18;
+        market.setReenter(address(this));
+        uint256 from = recorder.length();
+        assertEq(_buyNative(1e18), 1e18);
+        assertEq(nestedRuns, 1, "the nested swap ran");
+        assertTrue(nestedFilled);
+        assertEq(recorder.step(from), 200, "outer: the credited leg");
+        assertEq(recorder.step(from + 1), 101, "nested: the listing, not a second credited leg");
+    }
+
+    // Adversarial pass on beff9e8: a credited leg with deposits still ahead of the listing. Entry 1 =
+    // 100, listings L1 and L2 (10 each) queued after it, entry 2 = 900; K = 0 -> second 200, main 800.
+    // Taking half of entry 1 first leaves the main door both physical stock and credit before L1.
+    function _partialAhead() internal {
+        _twoEthPools(100e18, 0);
+        pool.addNode(2, 900e18);
+        token.mint(address(pool), 900e18);
+        token.mint(address(settlement), 20e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
+        registry.push(Gen4MockRegistry.Candidate(1, 2, 10e18, 1, 1));
+    }
+
+    function test_E_PartialAhead_MainDoorFirst() public {
+        _partialAhead();
+        assertEq(_mainExactOutput(60e18), 60e18); // 60 of entry 1
+        assertEq(_mainExactOutput(50e18), 50e18); // the other 40, then 10 of L1
+        assertEq(_buyWrapped(50e18), 50e18);
+        assertEq(registry.cursor(), 1, "only L1 sold");
+        assertEq(pool.available(), 850e18);
+    }
+
+    function test_E_PartialAhead_SecondDoorFirstSellsTheSameStock() public {
+        _partialAhead();
+        assertEq(_buyWrapped(50e18), 50e18, "second door: half of entry 1");
+        uint256 from = recorder.length();
+        assertEq(_mainExactOutput(60e18), 60e18);
+        uint256[] memory s1 = new uint256[](1);
+        s1[0] = 200; // one credited leg: the other 50 of entry 1, then 10 of entry 2
+        _assertSteps(from, s1);
+        from = recorder.length();
+        assertEq(_mainExactOutput(50e18), 50e18);
+        uint256[] memory s2 = new uint256[](2);
+        (s2[0], s2[1]) = (200, 101); // 40 on the rest of the credit, then L1
+        _assertSteps(from, s2);
+        assertEq(registry.cursor(), 1, "only L1 sold, as with the main door first");
+        assertEq(pool.available(), 850e18);
+    }
+
+    // FIFO case 2 on JUP-698 (for Wilko to confirm): with its deposit budget spent, the main door sells
+    // a listing queued after deposits that stay unsold (the second door's share). K = 0: main 800.
+    function test_E_MainDoorWithItsBudgetSpentSellsANewerListing() public {
+        _twoEthPools(1_000e18, 0);
+        token.mint(address(settlement), 100e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 100e18, 1, 1)); // queued after entry 1
+        assertEq(_buyNative(900e18), 900e18, "800 of deposits, then the listing");
+        assertEq(registry.cursor(), 1, "the newer listing sold");
+        assertEq(pool.available(), 200e18, "the second door's 200 still unsold");
+    }
+
+    // the sibling counts once its V4 pool is initialised: beforeInitialize itself records it (the
+    // other design E tests set the flag through the harness)
+    function test_E_InitialisingTheSiblingPoolTurnsSharingOn() public {
+        pool.setNode(1, 1_000e18, 0);
+        token.mint(address(pool), 1_000e18);
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
+        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool), 0);
+        hook.openPair(address(0), address(token));
+        (address a, address b) = address(weth) < address(token) ? (address(weth), address(token)) : (address(token), address(weth));
+        PoolKey memory k = PoolKey(Currency.wrap(a), Currency.wrap(b), 0, 60, IHooks(address(hook)));
+        vm.prank(address(manager));
+        hook.beforeInitialize(address(this), k, TickMath.MIN_SQRT_PRICE);
+        vm.expectRevert(_shortfall(800e18, 801e18));
+        _buyNative(801e18);
+        assertEq(_buyNative(800e18), 800e18, "the native door is now capped at its 80%");
+    }
+
+    // Robin pass 65: an owner call between two swaps of one transaction cannot lift a cap or swap roles
+    function test_E_SpreadFloorRaisedMidTransactionKeepsTheCap() public {
+        _twoEthPools(1_000e18, 10e18); // second 188, main 802
+        _spreads(20, 16);
+        assertEq(_buyWrapped(188e18), 188e18);
+        hook.setBaseSpreadFloor(18); // only the sibling (aeWETH, 16) now sits below the floor
+        vm.expectRevert(_shortfall(802e18, 803e18));
+        _buyNative(803e18);
+        assertEq(_buyNative(802e18), 802e18);
+        assertEq(pool.available(), 10e18, "K stays");
+    }
+
+    function test_E_UnregisteringMidTransactionKeepsTheCap() public {
+        _twoEthPools(1_000e18, 10e18);
+        assertEq(_buyWrapped(188e18), 188e18);
+        hook.unregisterPair(Currency.wrap(address(weth)), Currency.wrap(address(token)));
+        vm.expectRevert(_shortfall(802e18, 803e18));
+        _buyNative(803e18);
+        assertEq(_buyNative(802e18), 802e18);
+    }
+
+    function test_E_ShareChangeMidTransactionKeepsTheRoles() public {
+        _twoEthPools(1_000e18, 10e18);
+        assertEq(_buyNative(802e18), 802e18);
+        hook.setNativeShare(address(pool), 2_000); // would make aeWETH the main door
+        assertEq(_buyWrapped(188e18), 188e18);
+        vm.expectRevert(_shortfall(0, 1e18));
+        _buyWrapped(1e18);
+        assertEq(pool.available(), 10e18, "K stays");
+    }
+
+    function test_E_EthPoolsOnDifferentC1PoolsAreNotShared() public {
+        Gen4MockPool other = new Gen4MockPool(token);
+        market.addPool(address(other));
+        pool.setNode(1, 1_000e18, 0);
+        token.mint(address(pool), 1_000e18);
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
+        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(other), 0);
+        hook.openPair(address(0), address(token));
+        hook.openPair(address(weth), address(token));
+        assertEq(_buyNative(1_000e18), 1_000e18, "no share cap across two C1 pools");
     }
 }
 
@@ -676,6 +1303,31 @@ contract Gen4PoolManagerIntegrationTest is Test {
         assertEq(token.balanceOf(swapper), 2e18);
         assertEq(quote.balanceOf(address(hook)), 0);
         assertEq(token.balanceOf(address(hook)), 0);
+    }
+
+    // WSR F5 pass (27 Sep 2026): one V4 pool per registered pair. A second pool of the same pair at any
+    // other tick spacing would sell the same stock and let a route count it twice.
+    function test_OnlyTheCanonicalTickSpacingCanBeInitialised() public {
+        PoolKey memory second = PoolKey({
+            currency0: key.currency0, currency1: key.currency1, fee: 0, tickSpacing: 10, hooks: IHooks(address(hook))
+        });
+        bytes memory inner = abi.encodeWithSelector(FlowstateC1Hook.TickSpacingNotCanonical.selector, int24(10));
+        try manager.initialize(second, uint160(1 << 96)) {
+            revert("a second pool of a registered pair must not initialise");
+        } catch (bytes memory ret) {
+            assertTrue(_contains(ret, inner), "the hook refused it for its tick spacing");
+        }
+        assertEq(hook.CANONICAL_TICK_SPACING(), key.tickSpacing, "the live pool uses the canonical spacing");
+    }
+
+    function _contains(bytes memory hay, bytes memory needle) internal pure returns (bool) {
+        if (needle.length > hay.length) return false;
+        for (uint256 i; i + needle.length <= hay.length; ++i) {
+            bool hit = true;
+            for (uint256 j; j < needle.length; ++j) if (hay[i + j] != needle[j]) { hit = false; break; }
+            if (hit) return true;
+        }
+        return false;
     }
 
     function test_OppositeCurrencyOrderingUsesProductionBeforeSwap() public {

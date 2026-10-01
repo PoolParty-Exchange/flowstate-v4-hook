@@ -121,9 +121,10 @@ contract Gen4MixedQueueConformanceTest is Test {
         Gen4Accounting.Totals memory totals;
         Gen4Accounting.recordPool(totals, 2, 20);
         Gen4Accounting.recordListingAttempt(totals, 4, false, 999, 999);
-        Gen4Accounting.Final memory result = Gen4Accounting.exactInput(totals, 100, SPREAD_BPS, JAR_BPS, 79);
+        // a complete fill (WSR F5): the committed input is cost + spread; nothing is refunded
+        Gen4Accounting.Final memory result = Gen4Accounting.exactInput(totals, 21, SPREAD_BPS, JAR_BPS);
         assertEq(result.cost, 20);
-        assertEq(result.refund, 79);
+        assertEq(result.dust, 0);
         assertEq(result.charged, 21);
     }
 
