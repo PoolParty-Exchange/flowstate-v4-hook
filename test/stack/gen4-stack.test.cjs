@@ -13,8 +13,9 @@ const { ethers, network } = require(path.resolve(process.cwd(), "node_modules/ha
 const H = require(path.resolve(process.cwd(), "test/unit/flowstate/helpers"));
 const S = require(path.resolve(process.cwd(), "test/unit/flowstate/signedHelpers"));
 const { deployListings } = require(path.resolve(process.cwd(), "deploy/lib/listings"));
+const { assertR0HookSpreadInvariant } = require(path.resolve(process.cwd(), "deploy/lib/jup752-r0-hook"));
 
-const PINNED = "3e899f0486e6050a4a6aa096fc4dd67c61eb4d90";
+const PINNED = process.env.CONTRACTS_HEAD || "d08858d3486f5aed9c9ba725662c9f31cb915994";
 const OUT = process.env.HOOK_OUT || path.resolve(__dirname, "../../out");
 const PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const CREATE2 = "0x4e59b44847b379578588920ca78fbf26c0b4956c"; // the canonical deterministic deployer
@@ -63,7 +64,7 @@ async function dustyVenue(fx, pool, positions) {
     await venue.setTickLiquidity(Math.min(a, b), 1);
     await venue.setTickLiquidity(Math.max(a, b), -1);
   }
-  await fx.market.connect(fx.signers.admin).setRegistrarParams(25_000n * 10n ** 6n, 20_000n * 10n ** 6n, 723, ethers.ZeroAddress);
+  await fx.market.connect(fx.signers.timelock48).setRegistrarParams(ethers.ZeroAddress, 50, 16);
   if ((await fx.market.quoteReference(fx.usdc.target)) === ethers.ZeroAddress) await fx.market.connect(fx.signers.admin).setQuoteReference(fx.usdc.target, fx.usdc.target);
   await fx.market.connect(fx.signers.admin).registerVenue(pool.target, venue.target);
   return venue;
@@ -122,7 +123,12 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     await (await admin.sendTransaction({ to: CREATE2, data: salt + initCode.slice(2), ...GAS })).wait();
     const hook = new ethers.Contract(hookAddr, HK.abi, admin);
     assert.notEqual(await ethers.provider.getCode(hookAddr), "0x", "hook deployed at the mined address");
-    await (await hook.registerPair(fx.usdc.target, fx.token.target, pool.target, 16)).wait();
+    const r0SpreadBps = await hook.marketRegistrationSpreadBps();
+    await (await hook.registerPair(fx.usdc.target, fx.token.target, pool.target, r0SpreadBps)).wait();
+    await (await fx.market.connect(timelock48).setRegistrarParams(ethers.ZeroAddress, 50, r0SpreadBps)).wait();
+    await (await fx.market.connect(timelock48).setTrustedHook(hookAddr)).wait();
+    assert.equal(await fx.market.hookSpreadBps(), await hook.spreadBpsFor(fx.usdc.target, fx.token.target, 1n),
+      "JUP-752: Market spread equals the hook's actual configured spread");
 
     const [c0, c1] = BigInt(fx.usdc.target) < BigInt(fx.token.target) ? [fx.usdc.target, fx.token.target] : [fx.token.target, fx.usdc.target];
     const key = { currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: hookAddr };
@@ -140,7 +146,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     // the native-ETH pool beside the "aeWETH" (USDC) one, and a router that runs both in one unlock
     let nativeKey, twoPool;
     if (opts.ethPools) {
-      await (await hook.registerPair(ethers.ZeroAddress, fx.token.target, pool.target, 16)).wait();
+      await (await hook.registerPair(ethers.ZeroAddress, fx.token.target, pool.target, r0SpreadBps)).wait();
       nativeKey = { currency0: ethers.ZeroAddress, currency1: fx.token.target, fee: 0, tickSpacing: 60, hooks: hookAddr };
       await (await manager.initialize(nativeKey, 1n << 96n)).wait();
       // the hook takes native from the PoolManager in beforeSwap, so the manager holds native reserves
@@ -214,7 +220,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       rc.money = { paid, sources, spread, jarFee, dust };
       return rc;
     };
-    return { fx, pool, registry, settlement, manager, router, live, hook, key, jar, seller, list, deposit, buy, priceAll, shortfallOf, zeroForOne, nativeKey, twoPool };
+    return { fx, pool, registry, settlement, manager, router, live, hook, key, jar, seller, list, deposit, buy, priceAll, shortfallOf, zeroForOne, nativeKey, twoPool, r0SpreadBps };
   }
 
   /** The fills of one swap, in execution order: pool fills (PoolBuy) and listing sales (ListingFilled). */
@@ -555,43 +561,69 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       assert.equal(errKey(closed), "ExactInputShortfall(0,0,6)", "STOP_CLOSED");
     });
 
-    it("spread rungs: each buy pays baseSpread + its rung's extraBps (first ceiling >= notional, open-ended top), spread = ceil(cost x bps / 10,000)", async () => {
-      const s = await stack();
+    const r0Pairs = (s) => [
+      { label: "wrapped quote", quote: s.fx.usdc.target, token: s.fx.token.target },
+      { label: "native quote", quote: ethers.ZeroAddress, token: s.fx.token.target },
+    ];
+    const r0Gate = (s) => assertR0HookSpreadInvariant({
+      market: s.fx.market,
+      hook: s.hook,
+      expectedHook: s.hook.target,
+      pairs: r0Pairs(s),
+      representativeNotionals: [1n, USD(50), USD(500), 10n ** 30n],
+      expectedSpreadBps: s.r0SpreadBps,
+    });
+    const pricedEvent = (receipt, s) => receipt.logs
+      .filter((log) => log.address.toLowerCase() === s.pool.target.toLowerCase())
+      .map((log) => { try { return s.pool.interface.parseLog(log); } catch { return null; } })
+      .find((event) => event && event.name === "PassiveFillPriced");
+
+    it("JUP-752 R0 gate accepts the configured common base/no-rung invariant and preserves direct/hook view-fill parity", async () => {
+      const s = await stack({ ethPools: true });
+      const gate = await r0Gate(s);
+      assert.equal(gate.commonSpreadBps, s.r0SpreadBps, "gate derives the accepted spread from hook configuration");
+      assert.equal(gate.pairCount, 2, "every active test pair was checked");
+      assert.equal(gate.rungQuoteCount, 1, "the shared quote asset has one empty rung schedule");
+
+      const [directOk, directRate] = await s.fx.market.connect(s.fx.signers.buyerEOA).previewRate(s.pool.target, s.fx.usdc.target);
+      const callData = s.fx.market.interface.encodeFunctionData("previewRate", [s.pool.target, s.fx.usdc.target]);
+      const hookRaw = await ethers.provider.call({ to: s.fx.market.target, from: s.hook.target, data: callData });
+      const [hookOk, hookRate] = s.fx.market.interface.decodeFunctionResult("previewRate", hookRaw);
+      assert.ok(directOk && hookOk, "direct and trusted-hook views are available");
+      assert.ok(directRate >= hookRate, "the hook rate never exceeds the direct zero-spread rate");
+
+      const directReceipt = await (await s.fx.market.connect(s.fx.signers.buyerEOA).buyFromPoolBounded(
+        s.pool.target, s.fx.usdc.target, TOK(1), "", s.fx.signers.buyerEOA.address, 0, 0, 0, GAS
+      )).wait();
+      const directPriced = pricedEvent(directReceipt, s);
+      assert.equal(directPriced.args.rate, directRate, "direct preview equals execution");
+      assert.equal(directPriced.args.laneSpreadBps, 0n, "direct caller uses spread zero");
+
+      const hookFill = await measuredBuy(s, { amountSpecified: TOK(1) });
+      const hookPriced = pricedEvent(hookFill.rc, s);
+      assert.equal(hookPriced.args.rate, hookRate, "trusted-hook preview equals execution");
+      assert.equal(hookPriced.args.laneSpreadBps, s.r0SpreadBps, "Market applies the fixed R0 hook spread");
+      assert.equal(hookFill.retained + hookFill.jar, ceilBps(hookFill.cost, s.r0SpreadBps), "hook charges the same configured spread");
+    });
+
+    it("JUP-752 R0 gate rejects pair, rung and Market drift without disabling post-R0 hook functionality", async () => {
+      const s = await stack({ ethPools: true });
       const [usdc, token] = [s.fx.usdc.target, s.fx.token.target];
-      await s.deposit(TOK(2_000)); // node 2: stock for the large buys
-      // setSizeRungs rejects anything but strictly ascending ceilings with non-decreasing extraBps
-      await assert.rejects(s.hook.setSizeRungs(usdc, [{ notionalCeiling: USD(500), extraBps: 7 }, { notionalCeiling: USD(50), extraBps: 9 }]),
-        (e) => s.hook.interface.parseError(revertData(e)).name === "RungScheduleInvalid");
-      const rungs = [{ notionalCeiling: USD(50), extraBps: 0 }, { notionalCeiling: USD(500), extraBps: 7 }, { notionalCeiling: USD(1_000), extraBps: 20 }];
-      await (await s.hook.setSizeRungs(usdc, rungs)).wait();
-      // base 16 (the fixture) + rung: exact input measures the committed input, exact output the cost
-      const cases = [
-        { label: "small exact input $50 (at the first ceiling: +0)", params: { amountSpecified: -USD(50) }, notional: USD(50), bps: 16,
-          cost: 49_920_127n, spread: 79_873n, got: 24_960_063_500_000_000_000n },
-        { label: "exact input $50 + 1 raw unit (one over: +7)", params: { amountSpecified: -(USD(50) + 1n) }, notional: USD(50) + 1n, bps: 23,
-          cost: 49_885_264n, spread: 114_737n, got: 24_942_632_000_000_000_000n },
-        { label: "large exact input $1,500 (above the top ceiling: top rung +20)", params: { amountSpecified: -USD(1_500) }, notional: USD(1_500), bps: 36,
-          cost: 1_494_619_370n, spread: 5_380_630n, got: 747_309_685_000_000_000_000n },
-        { label: "small exact output 10 tokens (cost $20: +0)", params: { amountSpecified: TOK(10) }, notional: USD(20), bps: 16,
-          cost: USD(20), spread: 32_000n, got: TOK(10) },
-        { label: "large exact output 300 tokens (cost $600: +20)", params: { amountSpecified: TOK(300) }, notional: USD(600), bps: 36,
-          cost: USD(600), spread: 2_160_000n, got: TOK(300) },
-      ];
-      for (const c of cases) {
-        assert.equal(await s.hook.spreadBpsFor(usdc, token, c.notional), BigInt(c.bps), `${c.label}: spreadBpsFor`);
-        const m = await measuredBuy(s, c.params);
-        const spread = m.retained + m.jar;
-        console.log(`      ${c.label}: ${c.bps} bps, cost ${m.cost}, spread ${spread}, tokens ${m.got}, paid ${m.paid}`);
-        assert.equal(m.cost, c.cost, `${c.label}: cost`);
-        assert.equal(spread, ceilBps(m.cost, c.bps), `${c.label}: spread = ceil(cost x bps / 10,000)`);
-        assert.equal(spread, c.spread, `${c.label}: spread (pinned)`);
-        assert.equal(m.got, c.got, `${c.label}: tokens delivered`);
-        assert.equal(m.jar, ceilBps(m.cost, 8), `${c.label}: jar fee unaffected by the rung`);
-        if (c.params.amountSpecified < 0n) {
-          assert.equal(m.paid, -c.params.amountSpecified, `${c.label}: exact input charges the committed input`);
-          assert.equal(m.dust, m.paid - m.cost - spread, `${c.label}: the rest is dust`);
-        } else assert.equal(m.paid, m.cost + spread, `${c.label}: exact output charges cost + spread`);
-      }
+      const expectGateFailure = async (fragment) => assert.rejects(r0Gate(s), (error) => String(error.message).includes(fragment));
+
+      let snapshot = await network.provider.send("evm_snapshot", []);
+      await (await s.hook.setBaseSpread(ethers.ZeroAddress, token, s.r0SpreadBps + 1n)).wait();
+      await expectGateFailure("differs from common base");
+      await network.provider.send("evm_revert", [snapshot]);
+
+      snapshot = await network.provider.send("evm_snapshot", []);
+      await (await s.hook.setSizeRungs(usdc, [{ notionalCeiling: USD(500), extraBps: 7 }])).wait();
+      assert.equal(await s.hook.spreadBpsFor(usdc, token, USD(500)), s.r0SpreadBps + 7n, "dynamic rungs remain valid hook functionality");
+      await expectGateFailure("non-empty size-rung schedule");
+      await network.provider.send("evm_revert", [snapshot]);
+
+      await (await s.fx.market.connect(s.fx.signers.timelock48).setRegistrarParams(ethers.ZeroAddress, 50, s.r0SpreadBps + 1n)).wait();
+      await expectGateFailure("Market hook spread");
     });
 
     it("PoolManager reserves: a ticket above the manager's quote balance reverts ManagerReservesExceeded; exactly the balance fills and the manager nets zero", async () => {
@@ -983,14 +1015,14 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       assert.equal(rows[rows.length - 1].got, full, "enough gas fills everything");
     });
 
-    it("review F2: 72 dust ticks in a spacing-10 venue raise the reads above 1M but cannot stop swaps", async () => {
+    it("JUP-752 Rev 4: 72 dust ticks do not reintroduce the retired depth walk and cannot stop swaps", async () => {
       const s = await stack({ dustTicks: 36 });
       const from = s.fx.signers.buyerEOA.address;
       const g = async (c, name, args) => (await ethers.provider.estimateGas({ from, to: c.target, data: c.interface.encodeFunctionData(name, args) })) - 21000n;
       const maxBuyGas = await g(s.fx.market, "maxBuy", [s.pool.target, s.fx.usdc.target]);
       const priceGas = await g(s.settlement, "price", [s.fx.token.target, s.fx.usdc.target]);
       const ev = await s.fx.market.evaluateVenue(s.pool.target);
-      assert.ok(maxBuyGas > 1_000_000n, `maxBuy costs ${maxBuyGas}: above the old fixed 1M read cap`);
+      assert.ok(maxBuyGas < 250_000n, `maxBuy costs ${maxBuyGas}: Rev 4 no longer walks depth for a bucket cap`);
       const a = await s.seller(TOK(60));
       await (await s.list(a, TOK(60))).wait();
       const rc = await s.buy({ amountSpecified: -(2_000n * 10n ** 6n) }, { buyAll: true });
