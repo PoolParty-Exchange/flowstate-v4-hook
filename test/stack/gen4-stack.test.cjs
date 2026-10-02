@@ -15,7 +15,7 @@ const S = require(path.resolve(process.cwd(), "test/unit/flowstate/signedHelpers
 const { deployListings } = require(path.resolve(process.cwd(), "deploy/lib/listings"));
 const { assertR0HookSpreadInvariant } = require(path.resolve(process.cwd(), "deploy/lib/jup752-r0-hook"));
 
-const PINNED = process.env.CONTRACTS_HEAD || "079011e24f73b54d0499230898bff777b73a99bb";
+const PINNED = process.env.CONTRACTS_HEAD || "d08858d3486f5aed9c9ba725662c9f31cb915994";
 const OUT = process.env.HOOK_OUT || path.resolve(__dirname, "../../out");
 const PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 const CREATE2 = "0x4e59b44847b379578588920ca78fbf26c0b4956c"; // the canonical deterministic deployer
