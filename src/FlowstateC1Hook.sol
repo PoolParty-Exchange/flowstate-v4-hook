@@ -188,8 +188,10 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///         A leg that still runs short is caught and the swap reverts (all-or-nothing).
     ///      Gen-5 (20 Oct 2026): 800k to 500k. Measured on a fork with a live 2,000 CASHCAT listing and an empty
     ///      deposit queue (native exact-in, the main door): a fill served by the listing used 1,038,778 gas and
-    ///      needed a limit of 1,251,472 (1.21x) at 500k; 600k gave 1.31x, 800k 1.51x. 500k stays at the top of the
-    ///      measured listing-leg range (335k to 542k), so a leg started at the floor does not run out of gas.
+    ///      needed a limit of 1,251,472 (1.21x) at 500k; 600k gave 1.31x, 800k 1.51x. 500k sits inside the measured
+    ///      listing-leg range (335k to 542k, attribution on), below its maximum, so a leg that is started with only the
+    ///      floor can still run out of gas on the largest listings; that leg is caught and the swap reverts atomically
+    ///      (no partial fill), so the floor trades availability at a tight gas limit for the routing ratio, nothing more.
     uint256 public constant GEN4_LISTING_LEG_MIN_GAS = 500_000;
     /// @notice Upper bound on the gas forwarded to one leg.
     uint256 public constant GEN4_MAX_LEG_GAS = 10_000_000;
