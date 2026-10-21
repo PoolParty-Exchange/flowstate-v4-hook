@@ -79,13 +79,13 @@ DEPOSIT = {
     "W6_attempt400k_leg250k_res100k": {"ATTEMPT": "400_000", "LEGBASE": "250_000", "RESERVE": "100_000"},
     "W7_attempt300k_leg250k_res100k": {"ATTEMPT": "300_000", "LEGBASE": "250_000", "RESERVE": "100_000"},
     "W8_attempt300k_leg300k_res100k_ret30k": {"ATTEMPT": "300_000", "LEGBASE": "300_000", "RESERVE": "100_000", "RETURN": "30_000"},
-    "W9_GEN5_attempt300k_leg250k_res100k_ret30k": {"ATTEMPT": "300_000", "LEGBASE": "250_000", "RESERVE": "100_000", "RETURN": "30_000"},
-    "W10_attempt250k_leg200k_res100k_ret30k": {"ATTEMPT": "250_000", "LEGBASE": "200_000", "RESERVE": "100_000", "RETURN": "30_000"},
+    "W9_attempt300k_leg250k_res100k_ret30k_20Oct": {"ATTEMPT": "300_000", "LEGBASE": "250_000", "RESERVE": "100_000", "RETURN": "30_000"},
+    "W10_GEN5_attempt250k_leg200k_res100k_ret30k": {"ATTEMPT": "250_000", "LEGBASE": "200_000", "RESERVE": "100_000", "RETURN": "30_000"},
     "W11_attempt200k_leg200k_res80k_ret20k": {"ATTEMPT": "200_000", "LEGBASE": "200_000", "RESERVE": "80_000", "RETURN": "20_000"},
     "W12_attempt400k_leg250k_res100k_ret60k": {"ATTEMPT": "400_000", "LEGBASE": "250_000", "RESERVE": "100_000", "RETURN": "60_000"},
 }
 # Listing-floor variants (X): the Gen-5 deposit constants with the listing floor swept.
-G5 = {"ATTEMPT": "300_000", "LEGBASE": "250_000", "RESERVE": "100_000", "RETURN": "30_000"}
+G5 = {"ATTEMPT": "250_000", "LEGBASE": "200_000", "RESERVE": "100_000", "RETURN": "30_000"}  # the 21 Oct deposit set; the 20 Oct listing rows were measured with 300k / 250k / 100k / 30k
 LISTING = {"W0_ref": {}}
 for k in ["800_000", "600_000", "500_000", "400_000", "350_000", "300_000"]:
     LISTING["X_list" + k.replace("_000", "k")] = dict(G5, LISTMIN=k)

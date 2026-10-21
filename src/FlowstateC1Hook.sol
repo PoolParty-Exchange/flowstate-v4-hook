@@ -148,7 +148,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///         (28 Sep 2026, block 74,626,053): the hook's own finalisation costs about 40k in every
     ///         gas-matrix case. 200k is five times that. Under all-or-nothing a short reserve can only
     ///         turn a fill into a revert, never a partial fill, so this sets the lowest gas limit that fills.
-    ///      Gen-5 (20 Oct 2026): 200k to 100k. Uniswap's router allowlist requires a gas limit under 130% of
+    ///      Gen-5 (20 to 21 Oct 2026): 200k to 100k. Uniswap's router allowlist requires a gas limit under 130% of
     ///      execution; the deployed Gen-4 needed 1.85x (estimateGas 1,427,945 against 768,570 used, live canary).
     ///      100k is 2.5x the measured 40k finalisation. Fork evidence: deployment-ledger/gen4_gas_limit_2026-10-20.
     uint256 public constant GEN4_FINALIZATION_GAS_RESERVE = 100_000;
@@ -158,11 +158,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///         maxBuy; the price is read once per swap) cost ~0.32M cold with one deposit
     ///         (test/stack/read-gas-probe.test.cjs), a smallest pool leg ~0.32M. An under-gassed swap
     ///         may still revert in a read; either way the swap reverts (ExactInputShortfall).
-    ///      Gen-5 (20 Oct 2026): 800k to 300k. The reads before the check (price, registry, queue, maxBuy) are
-    ///      already spent when it runs; 300k covers the smallest pool leg (live 225k including its oracle read)
+    ///      Gen-5 (20 to 21 Oct 2026): 800k to 250k. The reads before the check (price, registry, queue, maxBuy) are
+    ///      already spent when it runs; 250k covers the smallest pool leg (live 225k including its oracle read)
     ///      with the reserve and return allowance held separately. Together with the three other Gen-5 floors
-    ///      the required limit falls to 1.26x (aeWETH exact-in), 1.14x (native exact-in), 1.19x (native exact-out).
-    uint256 public constant GEN4_MIN_ATTEMPT_GAS = 300_000;
+    ///      the required limit measured 1.11x to 1.23x of execution across the three canary shapes and both
+    ///      pricing branches (fork, 21 Oct); the 300k first draft measured 1.25x to 1.31x because the CLEAR
+    ///      branch executes 50k to 70k cheaper than CATCH_UP while the required limit barely moves.
+    uint256 public constant GEN4_MIN_ATTEMPT_GAS = 250_000;
     /// @notice Pool leg planning, from EXECUTION gas (eth_estimateGas, before end-of-transaction
     ///         refunds) of the market's bounded buy on the pinned stack
     ///         (test/stack/exec-gas-probe.test.cjs): 326k base + 55.7k per node plain; 414k base +
@@ -173,10 +175,12 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///         base is the larger of this floor and what the market's own maxBuy cost in this
     ///         swap, since the buy re-runs that venue evaluation. A fully pinned node is only
     ///         stepped over. A leg that still runs out of gas is caught (see _buyGen4ExactInput).
-    ///      Gen-5 (20 Oct 2026): 450k to 250k. The 450k came from an estimateGas probe that counted 63/64
-    ///      retention; the live leg inside the swap is 225k including its warm oracle read. Lowering it only
-    ///      changes how many nodes a leg is planned for at a given gas budget; an under-gassed leg is still caught.
-    uint256 public constant GEN4_POOL_LEG_BASE_GAS = 250_000;
+    ///      Gen-5 (20 to 21 Oct 2026): 450k to 200k. The 450k came from an estimateGas probe that counted 63/64
+    ///      retention; the live leg inside the swap is 225k including its warm oracle read, so 200k sits below it:
+    ///      a leg planned with only the floor can run short on a cold oracle read, is caught, and the swap reverts
+    ///      atomically (availability at a tight gas limit, not safety). Lowering it only changes how many nodes a
+    ///      leg is planned for at a given gas budget.
+    uint256 public constant GEN4_POOL_LEG_BASE_GAS = 200_000;
     uint256 public constant GEN4_POOL_NODE_GAS = 65_000;
     uint256 public constant GEN4_POOL_NODE_GAS_RECYCLED = 125_000;
     uint256 public constant GEN4_POOL_NODE_GAS_ATTRIBUTED = 220_000;
@@ -196,7 +200,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     /// @notice Upper bound on the gas forwarded to one leg.
     uint256 public constant GEN4_MAX_LEG_GAS = 10_000_000;
     /// @dev What this frame keeps for itself after a leg returns, beyond the finalisation reserve.
-    ///      Gen-5 (20 Oct 2026): 60k to 30k; the frame's bookkeeping after a leg returns is a few thousand gas.
+    ///      Gen-5 (20 to 21 Oct 2026): 60k to 30k; the frame's bookkeeping after a leg returns is a few thousand gas.
     uint256 internal constant GEN4_LEG_RETURN_GAS = 30_000;
     /// @dev Caps on the queue and listing reads, whose cost is bounded by the 50-node window and
     ///      the registry's own walk bounds (measured cold: peek 90k, tokenQueueEnds 16k, queue 477k).

@@ -23,7 +23,7 @@ anvil --fork-url "$RH_RPC_URL" --fork-block-number 89964424 --chain-id 4663 --po
 python3 measure_variants.py --label canary2_aeweth_exactin --calldata inputs/canary2_aeweth_exactin_calldata.hex --value 0
 ```
 
-Repeat with the fork pinned at 89,963,046 and canary1_native_exactin_calldata.hex (value 500000000000000) for canary 1, and at 89,965,324 with the canary 3 calldata and value for canary 3. The reference row (W0_ref, live code untouched) must reproduce the live receipt's gasUsed within 0.1% (canary 2: fork 770,284 against live 768,570) before the other rows mean anything. Variant names map to the table rows: W9 is the Gen-5 set (300k / 250k / 100k / 30k).
+Repeat with the fork pinned at 89,963,046 and canary1_native_exactin_calldata.hex (value 500000000000000) for canary 1, and at 89,965,324 with the canary 3 calldata and value for canary 3. The reference row (W0_ref, live code untouched) must reproduce the live receipt's gasUsed within 0.1% (canary 2: fork 770,284 against live 768,570) before the other rows mean anything. Variant names map to the table rows: W10 is the Gen-5 set chosen on 21 Oct (250k / 200k / 100k / 30k); W9 is the 20 Oct draft (300k / 250k / 100k / 30k).
 
 ## 3. Listing-fill measurement
 

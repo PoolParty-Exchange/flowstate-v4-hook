@@ -65,6 +65,20 @@ Chosen: GEN4_LISTING_LEG_MIN_GAS 500k. It clears 1.30 with margin and sits insid
 
 Raw rows: variant_results_listing_native_exactin.json.
 
-Recommendation: 300k / 250k / 100k / 30k for the deposit path and 500k for the listing floor. These five values are the Gen-5 branch feat/gen5-gas-floors (clone at flowstate-workspace/flowstate-v4-hook-gen5). It clears 1.30 on every shape with the smallest departure from the measured floors (reserve 2.5x the 40k finalisation, leg base above the 225k live leg, attempt check above one cold read set of about 320k minus the reads already done before the check). The two tighter sets also pass and are kept here for the review.
+Recommendation as of 20 Oct: 300k / 250k / 100k / 30k for the deposit path and 500k for the listing floor. SUPERSEDED 21 Oct (see the section below): the deposit set is 250k / 200k / 100k / 30k. These five values are the Gen-5 branch feat/gen5-gas-floors (clone at flowstate-workspace/flowstate-v4-hook-gen5). It clears 1.30 on every shape with the smallest departure from the measured floors (reserve 2.5x the 40k finalisation, leg base above the 225k live leg, attempt check above one cold read set of about 320k minus the reads already done before the check). The two tighter sets also pass and are kept here for the review.
 
 Raw rows: variant_results.json (canary 2), variant_results_canary1_native_exactin.json, variant_results_canary3_native_exactout.json. Scripts and pinned inputs: docs/gen5-gas-evidence/ (README.md there gives the reproduction sequence from a clean checkout).
+
+## 21 Oct 2026: the pricing branch moves the ratio; deposit set tightened to 250k / 200k / 100k / 30k
+
+Re-running the Gen-5 fork rehearsal at a later block put the aeWETH exact-in canary at 1.313 (913,879 / 695,933) with the 300k / 250k / 100k / 30k set, against 1.272 the day before. The difference is the pricing branch: on 20 Oct the Rev 4 rule priced in CATCH_UP (spot under the averages), on 21 Oct in CLEAR (spot level with the averages, the normal flat-market state). CLEAR executes 50k to 70k cheaper while the hook's required limit barely moves, so the ratio rises. The live canaries of 16 Oct were all CATCH_UP, which is why the first measurements looked comfortable. Probe over both states and five constant sets (deployment-ledger/gen5_redeploy_2026-10-20/fork_rehearsal/ratio_probe/RATIO_PROBE_2026-10-21.md, scripts/probe_ratios.js):
+
+| constants (attempt / leg base / reserve / return) | CATCH_UP branch (pin 93,052,471): native in / aeWETH in / native out | CLEAR branch (pin 93,864,832) |
+|---|---|---|
+| deployed Gen-4 (800k / 450k / 200k / 60k) | 1.844 / 1.845 / 1.726 | 1.948 / 1.950 / 1.819 |
+| 20 Oct draft (300k / 250k / 100k / 30k) | 1.261 / 1.246 / 1.164 | 1.300 / 1.284 / 1.195 (1.313 on fresh pools in the full rehearsal) |
+| **chosen (250k / 200k / 100k / 30k)** | **1.192 / 1.177 / 1.113** | **1.226 / 1.210 / 1.124** |
+| 200k / 200k / 80k / 20k | 1.151 / 1.135 / 1.073 | 1.182 / 1.165 / 1.081 |
+| 400k / 250k / 100k / 60k | 1.303 / 1.288 / 1.204 | 1.344 / 1.329 / 1.238 |
+
+Chosen: 250k / 200k / 100k / 30k, about 0.07 of headroom to 1.30 in the worst measured state. What it costs: the leg base 200k is below the 225k live pool leg, so a swap sent with a gas limit just above the minimum can start a leg that runs short on a cold oracle read; the leg is caught and the swap reverts with no partial fill, exactly as with every other floor. The listing floor stays 500k (its 1.21 was measured with the 20 Oct deposit set; the tighter deposit set lowers the required limit further, so the listing ratio does not get worse; not re-measured on a listing fork on 21 Oct).
