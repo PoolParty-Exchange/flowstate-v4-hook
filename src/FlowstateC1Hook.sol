@@ -77,6 +77,7 @@ contract FlowstateC1Hook is Ownable2Step {
     error SweepDestinationNotSet();
     error EthSweepFailed();
     error ListingWiringMismatch(address registry, address settlement);
+    error OpenerWiringMismatch(address opener); // Gen-6: the opener must name this hook, this PoolManager and this wrapper
     error ListingMarketMismatch(address expected, address registryMarket, address settlementMarket);
     error CandidateInspectionFailed(uint8 source);
     error UnexpectedListingOutcome(uint8 outcome);
@@ -457,7 +458,14 @@ contract FlowstateC1Hook is Ownable2Step {
         }
         listingRegistry = IGen4ListingRegistry(_listingRegistry);
         listingSettlement = IGen4ListingSettlement(_listingSettlement);
+        // Gen-6 (Robin pass, 24 Oct 2026): the hook grants the opener an allowance on every market asset, so
+        // a code-bearing address is not enough: the opener must be bound to THIS hook, manager and wrapper
         if (_opener.code.length == 0) revert ZeroAddress();
+        if (
+            address(IFlowstatePoolOpener(_opener).hook()) != address(this)
+                || address(IFlowstatePoolOpener(_opener).poolManager()) != _poolManager
+                || address(IFlowstatePoolOpener(_opener).weth9()) != _weth9
+        ) revert OpenerWiringMismatch(_opener);
         opener = IFlowstatePoolOpener(_opener);
 
         Hooks.validateHookPermissions(

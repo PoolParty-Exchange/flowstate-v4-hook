@@ -725,6 +725,23 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(hook.poolNodeGas(address(recorder), address(quote)), hook.GEN4_POOL_NODE_GAS_RECYCLED());
     }
 
+    // Gen-6 (Robin pass, 24 Oct 2026): the opener the hook will approve must be bound to this hook, this
+    // manager and this wrapper; an opener deployed for another hook address is refused at construction
+    function test_ConstructorRefusesAnOpenerBoundToAnotherHook() public {
+        address openerAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        bytes memory args = abi.encode(
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
+        );
+        (address expected, bytes32 salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1HookHarness).creationCode, args);
+        FlowstatePoolOpener stray = new FlowstatePoolOpener(address(manager), address(0xD00D), address(weth)); // bound elsewhere
+        assertEq(address(stray), openerAddress);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.OpenerWiringMismatch.selector, openerAddress));
+        new FlowstateC1HookHarness{salt: salt}(
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
+        );
+        expected; // the mined address is never deployed in this test
+    }
+
     // Review F6: the settlement the hook approves must be the one the registry is bound to
     function test_ConstructorRefusesASettlementTheRegistryDoesNotName() public {
         registry.setSettlement(address(0xBAD));

@@ -483,8 +483,9 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
         assert.equal(j.fees[0].args.poolId, poolIdOf(J.key), `${label}: ProtocolFeePaid names the V4 pool`);
         assert.equal(j.fees[0].args.asset, J.fx.usdc.target, `${label}: paid in the quote asset`);
         assert.equal(j.jar, fee, `${label}: the jar received exactly the fee, in the same transaction`);
-        assert.equal(j.retained + j.jar, spread, `${label}: jar + kept margin = the whole spread`);
-        assert.equal(z.retained, spread, `${label}: the jar-free hook keeps the whole spread`);
+        // Gen-6: on a pool's first fill the beacon's dust comes out of the kept margin too
+        assert.equal(j.retained + j.jar + j.beacon, spread, `${label}: jar + kept margin + beacon = the whole spread`);
+        assert.equal(z.retained + z.beacon, spread, `${label}: the jar-free hook keeps the whole spread (less the beacon on a first fill)`);
         assert.equal(z.fees.length, 0, `${label}: no jar fee, no event`); assert.equal(z.jar, 0n);
         if (exactInput) assert.equal(j.paid, j.cost + spread + j.dust, `${label}: exact input charge = cost + spread + dust`);
         else assert.equal(j.paid, j.cost + spread, `${label}: exact output charge = cost + spread`);
@@ -496,7 +497,8 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       let [j, z] = await both({ amountSpecified: -USD(20) });
       check("pool-only exact input $20", j, z, true);
       assert.equal(j.cost, 19_968_051n); assert.equal(j.got, 9_984_025_500_000_000_000n);
-      assert.equal(j.jar, 15_975n); assert.equal(j.retained, 15_974n); assert.equal(j.dust, 0n);
+      assert.equal(j.jar, 15_975n); assert.equal(j.retained + j.beacon, 15_974n); assert.equal(j.dust, 0n);
+      assert.equal(j.beacon, 1n, "the first fill's beacon cost one wei of USDC at the fixture's price");
 
       // pool only, exact output 10 tokens: cost $20, spread 32,000, jar 16,000, charge 20,032,000
       [j, z] = await both({ amountSpecified: TOK(10) });
@@ -600,7 +602,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       for (const c of cases) {
         assert.equal(await s.hook.spreadBpsFor(usdc, token, c.notional), BigInt(c.bps), `${c.label}: spreadBpsFor`);
         const m = await measuredBuy(s, c.params);
-        const spread = m.retained + m.jar;
+        const spread = m.retained + m.jar + m.beacon; // Gen-6: a first fill's beacon dust is spread too
         console.log(`      ${c.label}: ${c.bps} bps, cost ${m.cost}, spread ${spread}, tokens ${m.got}, paid ${m.paid}`);
         assert.equal(m.cost, c.cost, `${c.label}: cost`);
         assert.equal(spread, ceilBps(m.cost, c.bps), `${c.label}: spread = ceil(cost x bps / 10,000)`);
@@ -630,12 +632,13 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       await expectReserves("exact input one raw unit above the reserve", -(USD(20) + 1n), USD(20) + 1n, USD(20));
       const m = await measuredBuy(s, { amountSpecified: -USD(20) }); // exactly the reserve
       assert.equal(m.got, 9_984_025_500_000_000_000n, "the full-reserve ticket fills");
-      assert.equal(await usdc.balanceOf(mgr), USD(20), "and the manager nets zero at the ceiling");
+      assert.equal(await usdc.balanceOf(mgr), USD(20) + 1n, "and the manager nets zero at the ceiling, plus the first fill's one-wei beacon (Gen-6)");
 
       // exact output: each leg's pre-funding is taken, then the spread, all before the router pays in,
       // so 10 tokens (cost $20, spread 32,000) needs the manager to hold 20,032,000
-      await expectReserves("exact output with the reserve covering only the cost", TOK(10), 32_000n, 0n);
-      await usdc.mint(mgr, 31_999n);
+      // (the manager still holds the first fill's one-wei beacon, Gen-6)
+      await expectReserves("exact output with the reserve covering only the cost", TOK(10), 32_000n, 1n);
+      await usdc.mint(mgr, 31_998n);
       await expectReserves("exact output one raw unit short", TOK(10), 32_000n, 31_999n);
       await usdc.mint(mgr, 1n);
       const o = await measuredBuy(s, { amountSpecified: TOK(10) });
