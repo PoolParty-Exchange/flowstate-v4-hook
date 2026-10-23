@@ -52,7 +52,7 @@ abstract contract NativeQuoteFixture is ForkTestBase {
             tickSpacing: 60,
             hooks: IHooks(address(hook))
         });
-        manager.initialize(nativeKey, _sqrtPriceForMockRate());
+        assertTrue(_slot0Price(nativeKey) != 0, "Gen-6: registerPair initialised the native pool itself");
 
         vm.deal(swapper, 100 ether);
         _expireRateCache();
@@ -102,14 +102,13 @@ contract NativeQuoteForkTest is NativeQuoteFixture {
     ///      pairs — loud at config time, never on the hot path.
     function test_Native_RegisterRevertsWithoutWeth9() public {
         (address standInRegistry, address standInSettlement) = ListingStandIn.deploy(address(market));
-        (address hookAddress, bytes32 salt) = HookMiner.find(
-            address(this),
-            HOOK_FLAGS,
-            type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0, standInRegistry, standInSettlement)
+        (address hookAddress, bytes32 salt, address openerAddress) = _planHook(
+            abi.encode(POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0, standInRegistry, standInSettlement),
+            POOL_MANAGER,
+            address(0)
         );
         FlowstateC1Hook bare = new FlowstateC1Hook{salt: salt}(
-            POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0, standInRegistry, standInSettlement
+            POOL_MANAGER, address(market), address(this), address(0), TOKEN_JAR, 0, standInRegistry, standInSettlement, openerAddress
         );
         assertEq(address(bare), hookAddress);
         vm.expectRevert(FlowstateC1Hook.NativeQuoteUnsupported.selector);

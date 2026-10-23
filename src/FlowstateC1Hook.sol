@@ -17,6 +17,7 @@ import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeE
 import {IFlowstateMarketMinimal} from "./interfaces/IFlowstateMarketMinimal.sol";
 import {IWETH9} from "./interfaces/IWETH9.sol";
 import {IGen4ListingRegistry, IGen4ListingSettlement, IGen4Pool} from "./interfaces/IGen4Inventory.sol";
+import {IFlowstatePoolOpener} from "./interfaces/IFlowstatePoolOpener.sol";
 import {Gen4Queue} from "./libraries/Gen4Queue.sol";
 import {Gen4Accounting} from "./libraries/Gen4Accounting.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -44,7 +45,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///
 ///      Address flags must be 0x28cc: BEFORE_INITIALIZE | BEFORE_ADD_LIQUIDITY |
 ///      BEFORE_SWAP | AFTER_SWAP | BEFORE_SWAP_RETURNS_DELTA | AFTER_SWAP_RETURNS_DELTA.
-contract FlowstateC1Hook is IHooks, Ownable2Step {
+contract FlowstateC1Hook is Ownable2Step {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
     using SafeCast for int256;
@@ -55,13 +56,12 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
 
     error NotPoolManager();
     error NotMarket();
-    error HookNotImplemented();
     error ZeroAddress();
     error PairNotRegistered();
     error LpFeeMustBeZero();
     error LiquidityNotAllowed();
     error SellDirectionNotSupported();
-    error NativeQuoteUnsupported(); // registerPair with a native quote on a chain with no weth9 configured
+    error NativeQuoteUnsupported(); // a native quote on a chain with no weth9 configured (Gen-6: the market may register native pairs)
     error MarketStateUnverifiable();
     error MarketPoolNotRecognized(address marketPool);
     error MarketInventoryMismatch(address marketPool, address expectedInventory, address actualInventory);
@@ -129,6 +129,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///         29 Sep 2026), and the settlement's immutable registry must match.
     IGen4ListingRegistry public immutable listingRegistry;
     IGen4ListingSettlement public immutable listingSettlement;
+
+    /// @notice Gen-6 (JUP-772, 24 Oct 2026): the hook's door opener. Registering a pair initialises its
+    ///         V4 pool through it, and a pool's first fill lights the visibility beacon through it, out
+    ///         of the hook's own spread on that fill. Immutable, code-bearing, the hook is its only
+    ///         paying caller. It exists as a separate contract only because the hook's runtime has no
+    ///         room left under EIP-170.
+    IFlowstatePoolOpener public immutable opener;
 
     // -------------------------------------------------------------------------
     // Constants
@@ -199,6 +206,9 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     uint256 public constant GEN4_LISTING_LEG_MIN_GAS = 500_000;
     /// @notice Upper bound on the gas forwarded to one leg.
     uint256 public constant GEN4_MAX_LEG_GAS = 10_000_000;
+    /// @dev Gas given to the opener for a pool's first-fill beacon (Gen-6), attempted only when at least
+    ///      this plus the finalisation reserve is left, so a tight swap skips the beacon instead of failing.
+    uint256 internal constant BEACON_GAS = 300_000;
     /// @dev What this frame keeps for itself after a leg returns, beyond the finalisation reserve.
     ///      Gen-5 (20 to 21 Oct 2026): 60k to 30k; the frame's bookkeeping after a leg returns is a few thousand gas.
     uint256 internal constant GEN4_LEG_RETURN_GAS = 30_000;
@@ -414,7 +424,8 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         address _tokenJar,
         uint16 _jarFeeBps,
         address _listingRegistry,
-        address _listingSettlement
+        address _listingSettlement,
+        address _opener
     ) Ownable(_owner) {
         if (_poolManager == address(0) || _market == address(0) || _tokenJar == address(0)) revert ZeroAddress();
         if (_market.code.length == 0) revert ZeroAddress();
@@ -446,9 +457,11 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         }
         listingRegistry = IGen4ListingRegistry(_listingRegistry);
         listingSettlement = IGen4ListingSettlement(_listingSettlement);
+        if (_opener.code.length == 0) revert ZeroAddress();
+        opener = IFlowstatePoolOpener(_opener);
 
         Hooks.validateHookPermissions(
-            this,
+            IHooks(address(this)),
             Hooks.Permissions({
                 beforeInitialize: true,
                 afterInitialize: false,
@@ -492,22 +505,32 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         _registerPair(quote, token, marketPool, baseSpreadBps);
     }
 
-    /// @notice Market-trusted auto-registration fired inside createPool (JUP-587;
-    ///         Wilko GO 24 Aug: deliberately narrow — no venue discovery, no oracle
-    ///         feed work, ERC-20 quotes only). IDEMPOTENT: an already-registered
-    ///         pair is left untouched, however it is tuned, so a market call can
-    ///         never clobber owner configuration. Spread = the configured market
-    ///         registration spread, floored at baseSpreadFloorBps so a later floor
-    ///         raise degrades to a wider spread instead of a createPool-time revert.
+    /// @notice Market-trusted auto-registration fired inside createPool (JUP-587; Wilko GO 24 Aug:
+    ///         no venue discovery, no oracle feed work). IDEMPOTENT: an already-registered pair is
+    ///         left untouched, however it is tuned, so a market call can never clobber owner
+    ///         configuration. Spread = the configured market registration spread, floored at
+    ///         baseSpreadFloorBps so a later floor raise degrades to a wider spread instead of a
+    ///         createPool-time revert.
+    ///         Gen-6 (JUP-772, Hamish 24 Oct 2026): the market registering the wrapper's pair also
+    ///         registers the token's native-ETH pair, so both ETH doors of a new token exist from the
+    ///         createPool transaction (one C1 pool, Design E), and each registration initialises its
+    ///         V4 pool (_registerPair). No Safe call and no operator transaction is left on the
+    ///         Uniswap side of a new token.
     function registerPairFromMarket(Currency quote, Currency token, address marketPool) external {
         if (msg.sender != address(market)) revert NotMarket();
-        if (quote.isAddressZero()) revert NativeQuoteUnsupported();
         if (marketPool == address(0)) revert ZeroAddress();
-        (Currency s0, Currency s1) = _sort(quote, token);
-        if (pairs[_pairKey(s0, s1)].registered) return;
         uint16 spread = marketRegistrationSpreadBps;
         uint16 floor = baseSpreadFloorBps;
         if (spread < floor) spread = floor;
+        _registerIfNew(quote, token, marketPool, spread);
+        if (Currency.unwrap(quote) == address(weth9) && address(weth9) != address(0)) {
+            _registerIfNew(Currency.wrap(address(0)), token, marketPool, spread);
+        }
+    }
+
+    function _registerIfNew(Currency quote, Currency token, address marketPool, uint16 spread) internal {
+        (Currency s0, Currency s1) = _sort(quote, token);
+        if (pairs[_pairKey(s0, s1)].registered) return;
         _registerPair(quote, token, marketPool, spread);
     }
 
@@ -533,8 +556,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         });
         IERC20(marketAsset).forceApprove(address(market), type(uint256).max);
         IERC20(marketAsset).forceApprove(address(listingSettlement), type(uint256).max);
+        IERC20(marketAsset).forceApprove(address(opener), type(uint256).max); // the beacon's dust (lightBeacon)
         emit PairRegistered(c0, c1, marketPool, quoteIsCurrency0);
         emit BaseSpreadUpdated(c0, c1, baseSpreadBps);
+        // Gen-6: the pair's V4 pool is initialised here, in the same transaction, by the opener (whose
+        // initialize call runs this hook's beforeInitialize, which records the pair as opened). Best
+        // effort: a refusal leaves the pool to the permissionless opener.open / PoolManager.initialize.
+        try opener.open(quote, token) {} catch {}
     }
 
     /// @notice Set the native-ETH V4 pool's share of a C1 pool's deposits (see nativeShareBps):
@@ -707,7 +735,8 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     }
 
     /// @notice Visibility beacon gate (JUP-516): admits exactly ONE liquidityDelta == 1
-    ///         add per pool, from any caller, then closes that pool forever. The
+    ///         add per pool, from any caller (Gen-6: the opener, on the pool's first fill, is the
+    ///         usual one; the seeder periphery and anyone else can still go first), then closes that pool forever. The
     ///         ModifyLiquidity event this permits is the measured key into GMGN's
     ///         routing index. Everything else about the original stray-LP protection
     ///         survives: no position of real size can ever be created (delta capped at
@@ -758,12 +787,28 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         // every spread setter). Paid before the margin is booked, in the asset the hook
         // is holding (the wrapper for a native quote), inside the swap itself.
         f.spreadAccrued = _payJar(key.toId(), input, f.costBase, f.spreadAccrued);
+        // Gen-6: a pool's first fill lights its visibility beacon out of the hook's own spread on this
+        // fill (after the jar); the buyer's price and amounts are already fixed above
+        if (!beaconSeeded[key.toId()]) f.spreadAccrued -= _lightBeacon(key, cfg.quoteIsCurrency0, f.spreadAccrued);
         Currency heldInput = input.isAddressZero() ? Currency.wrap(address(weth9)) : input;
         if (f.spreadAccrued != 0) accruedSpreadMargin[heldInput] += f.spreadAccrued;
         if (f.dustAccrued != 0) accruedDust[heldInput] += f.dustAccrued;
 
         emit BuyExecuted(key.toId(), quote, output, f.quoteIn, f.tokensOut, exactInput, f.spreadAccrued, f.dustAccrued);
         return (IHooks.beforeSwap.selector, f.hookDelta, 0);
+    }
+
+    /// @dev Gen-6 (JUP-772): light the pool's beacon through the opener, which takes at most `budget` of
+    ///      the asset the hook holds for this quote (the wrapper for a native quote; the opener unwraps
+    ///      what the pool owes in native), the hook's own spread and dust on this fill. Never blocks a
+    ///      fill: skipped when the budget is zero or the gas left would eat into the finalisation
+    ///      reserve, and a failed attempt is caught and leaves the pool for the next fill or the seeder
+    ///      periphery. Returns what was spent.
+    function _lightBeacon(PoolKey calldata key, bool payIsCurrency0, uint256 budget) internal returns (uint256 paid) {
+        if (budget == 0 || gasleft() < BEACON_GAS + GEN4_FINALIZATION_GAS_RESERVE) return 0;
+        try opener.lightBeacon{gas: BEACON_GAS}(key, payIsCurrency0, budget) returns (uint256 p) {
+            paid = p;
+        } catch {}
     }
 
     /// @dev JUP-621: pay the TokenJar its fee for this fill and return the spread the
@@ -1485,50 +1530,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     }
 
     // -------------------------------------------------------------------------
-    // Hook callbacks — not flagged, never called
+    // Hook callbacks that are not flagged (afterInitialize, after/before remove and add liquidity,
+    // donate) are not implemented. Gen-6 (JUP-772): the six reverting stubs the Gen-5 hook carried
+    // for them went for runtime size (EIP-170); the PoolManager never calls an unflagged callback,
+    // and a direct call reverts the same way, with no function to run. The permission bits are
+    // unchanged (0x28cc) and validated in the constructor.
     // -------------------------------------------------------------------------
 
-    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
-        revert HookNotImplemented();
-    }
-
-    function afterAddLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) external pure returns (bytes4, BalanceDelta) {
-        revert HookNotImplemented();
-    }
-
-    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external
-        pure
-        returns (bytes4)
-    {
-        revert HookNotImplemented();
-    }
-
-    function afterRemoveLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) external pure returns (bytes4, BalanceDelta) {
-        revert HookNotImplemented();
-    }
-
-    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
-        revert HookNotImplemented();
-    }
-
-    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
-        revert HookNotImplemented();
-    }
 
     // -------------------------------------------------------------------------
     // Internals

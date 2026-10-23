@@ -9,11 +9,15 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {Position} from "@uniswap/v4-core/src/libraries/Position.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {FlowstateC1Hook} from "../src/FlowstateC1Hook.sol";
+import {FlowstatePoolOpener} from "../src/FlowstatePoolOpener.sol";
 import {IGen4Pool} from "../src/interfaces/IGen4Inventory.sol";
 import {MockInventoryToken} from "./mocks/MockInventoryToken.sol";
 
@@ -282,8 +286,9 @@ contract FlowstateC1HookHarness is FlowstateC1Hook {
         address owner,
         address weth,
         address registry,
-        address settlement
-    ) FlowstateC1Hook(manager, market, owner, weth, address(0xBEEF), 0, registry, settlement) {}
+        address settlement,
+        address opener_
+    ) FlowstateC1Hook(manager, market, owner, weth, address(0xBEEF), 0, registry, settlement, opener_) {}
 
     /// @dev What beforeInitialize records when the pool of a registered pair is created.
     function openPair(address a, address b) external {
@@ -353,17 +358,28 @@ contract Gen4HookIntegrationTest is Test {
         market.approveAsset(address(quote));
         market.approveAsset(address(weth));
 
-        bytes memory args = abi.encode(
-            address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
-        );
-        (address expected, bytes32 salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1HookHarness).creationCode, args);
+        (address expected, bytes32 salt, address openerAddress) = _planHarness();
         hook = new FlowstateC1HookHarness{salt: salt}(
-            address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
         );
         assertEq(address(hook), expected);
         hook.registerPair(Currency.wrap(address(quote)), Currency.wrap(address(token)), address(pool), 0);
         quote.mint(address(manager), 1_000e18);
         vm.deal(address(manager), 1_000e18);
+    }
+
+    /// @dev Gen-6: the opener is deployed first at this contract's next CREATE address and the harness
+    ///      mined with it (see ForkTestBase._planHook). The mock manager has no initialize or
+    ///      modifyLiquidity, so every opener call the hook makes here fails and is caught: the suite
+    ///      exercises exactly that "never blocks" path, and the real-manager suite below the beacon.
+    function _planHarness() internal returns (address expected, bytes32 salt, address openerAddress) {
+        openerAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        bytes memory args = abi.encode(
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
+        );
+        (expected, salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1HookHarness).creationCode, args);
+        address deployed = address(new FlowstatePoolOpener(address(manager), expected, address(weth)));
+        assertEq(deployed, openerAddress, "opener address");
     }
 
     function test_DeadListingThenOlderPoolThenLiveListing() public {
@@ -712,13 +728,10 @@ contract Gen4HookIntegrationTest is Test {
     // Review F6: the settlement the hook approves must be the one the registry is bound to
     function test_ConstructorRefusesASettlementTheRegistryDoesNotName() public {
         registry.setSettlement(address(0xBAD));
-        bytes memory args = abi.encode(
-            address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
-        );
-        (, bytes32 salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1HookHarness).creationCode, args);
+        (, bytes32 salt, address openerAddress) = _planHarness();
         vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ListingWiringMismatch.selector, address(registry), address(settlement)));
         new FlowstateC1HookHarness{salt: salt}(
-            address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
         );
     }
 
@@ -1214,6 +1227,8 @@ contract Gen4HookIntegrationTest is Test {
 ///         PoolManager. This catches hook/caller delta mistakes that the direct
 ///         loop harness intentionally cannot model.
 contract Gen4PoolManagerIntegrationTest is Test {
+    using PoolIdLibrary for PoolKey;
+
     uint160 internal constant FLAGS = uint160((1 << 13) | (1 << 11) | (1 << 7) | (1 << 6) | (1 << 3) | (1 << 2));
 
     MockInventoryToken token;
@@ -1225,6 +1240,7 @@ contract Gen4PoolManagerIntegrationTest is Test {
     Gen4MockMarket market;
     PoolManager manager;
     FlowstateC1Hook hook;
+    FlowstatePoolOpener opener;
     PoolSwapTest router;
     PoolKey key;
     address swapper = address(0x5157);
@@ -1242,6 +1258,7 @@ contract Gen4PoolManagerIntegrationTest is Test {
         manager = new PoolManager(address(this));
         market.approveAsset(address(quote));
 
+        address openerAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         bytes memory args = abi.encode(
             address(manager),
             address(market),
@@ -1250,9 +1267,12 @@ contract Gen4PoolManagerIntegrationTest is Test {
             address(0xBEEF),
             uint16(0),
             address(registry),
-            address(settlement)
+            address(settlement),
+            openerAddress
         );
         (address expected, bytes32 salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1Hook).creationCode, args);
+        opener = new FlowstatePoolOpener(address(manager), expected, address(weth));
+        assertEq(address(opener), openerAddress, "opener address");
         hook = new FlowstateC1Hook{salt: salt}(
             address(manager),
             address(market),
@@ -1261,7 +1281,8 @@ contract Gen4PoolManagerIntegrationTest is Test {
             address(0xBEEF),
             0,
             address(registry),
-            address(settlement)
+            address(settlement),
+            openerAddress
         );
         assertEq(address(hook), expected);
         hook.registerPair(Currency.wrap(address(quote)), Currency.wrap(address(token)), address(inventoryPool), 0);
@@ -1270,13 +1291,105 @@ contract Gen4PoolManagerIntegrationTest is Test {
             ? (Currency.wrap(address(quote)), Currency.wrap(address(token)))
             : (Currency.wrap(address(token)), Currency.wrap(address(quote)));
         key = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
-        manager.initialize(key, uint160(1 << 96));
+        // Gen-6: registerPair initialised the pool itself (the mock pool has no anchor, so at 1:1)
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(IPoolManager(address(manager)), key.toId());
+        assertEq(sqrtPriceX96, uint160(1 << 96), "registration initialised the pool at 1:1");
         router = new PoolSwapTest(IPoolManager(address(manager)));
 
         quote.mint(address(manager), 100e18);
         quote.mint(swapper, 100e18);
         vm.prank(swapper);
         quote.approve(address(router), type(uint256).max);
+    }
+
+    // ---- Gen-6 (JUP-772): a pool's first fill lights its visibility beacon ----
+
+    event BeaconSeeded(PoolId indexed poolId, address indexed sender);
+
+    function _buyExactIn(PoolKey memory k, uint256 quoteIn, uint256 value) internal {
+        bool zeroForOne = Currency.unwrap(k.currency0) != address(token);
+        vm.prank(swapper);
+        router.swap{value: value}(
+            k,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(quoteIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+    }
+
+    function _beaconLiquidity(PoolKey memory k, bool payIsCurrency0) internal view returns (uint128) {
+        (int24 lower, int24 upper) = opener.computeBeaconRange(0, 60, payIsCurrency0); // 1:1 pools sit at tick 0
+        bytes32 positionId = Position.calculatePositionKey(address(opener), lower, upper, bytes32(0));
+        return StateLibrary.getPositionLiquidity(IPoolManager(address(manager)), k.toId(), positionId);
+    }
+
+    function test_Beacon_FirstFillLightsIt_PaidFromTheHooksSpread_SecondFillDoesNot() public {
+        inventoryPool.setNode(1, 10e18, 0);
+        token.mint(address(inventoryPool), 10e18);
+        hook.setBaseSpread(Currency.wrap(address(quote)), Currency.wrap(address(token)), 16);
+        bool quoteIsC0 = address(quote) < address(token);
+        assertFalse(hook.beaconSeeded(key.toId()), "unlit before the first fill");
+        uint256 managerBefore = quote.balanceOf(address(manager));
+        uint256 swapperBefore = quote.balanceOf(swapper);
+
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit BeaconSeeded(key.toId(), address(opener));
+        _buyExactIn(key, 1e18, 0);
+
+        assertTrue(hook.beaconSeeded(key.toId()), "lit by the first fill");
+        assertEq(_beaconLiquidity(key, quoteIsC0), 1, "one unit of liquidity, owned by the opener, on the quote side");
+        assertEq(swapperBefore - quote.balanceOf(swapper), 1e18, "the buyer paid exactly the swap's input");
+        // the dust (one wei of the quote at 1:1) came out of the hook's spread: the books equal the holdings,
+        // and the PoolManager is up by exactly the beacon
+        assertEq(quote.balanceOf(address(hook)), hook.accruedSpreadMargin(Currency.wrap(address(quote))) + hook.accruedDust(Currency.wrap(address(quote))), "books = holdings");
+        assertEq(quote.balanceOf(address(manager)), managerBefore + 1, "the manager holds the one-wei beacon and nothing else");
+        uint256 marginAfterFirst = hook.accruedSpreadMargin(Currency.wrap(address(quote)));
+        assertGt(marginAfterFirst, 0, "the spread still accrued");
+
+        // a second fill: no second beacon, the spread accrues in full
+        _buyExactIn(key, 1e18, 0);
+        assertEq(_beaconLiquidity(key, quoteIsC0), 1, "still one unit");
+        assertEq(quote.balanceOf(address(manager)), managerBefore + 1, "no further dust");
+        assertEq(hook.accruedSpreadMargin(Currency.wrap(address(quote))), marginAfterFirst * 2 + 1, "second fill's spread accrued whole (the first paid one wei)");
+    }
+
+    function test_Beacon_ZeroSpreadFillHasNoBudget_FillsAndStaysUnlit() public {
+        inventoryPool.setNode(1, 10e18, 0);
+        token.mint(address(inventoryPool), 10e18);
+        uint256 managerBefore = quote.balanceOf(address(manager));
+        _buyExactIn(key, 1e18, 0);
+        assertFalse(hook.beaconSeeded(key.toId()), "no spread, no beacon");
+        assertEq(token.balanceOf(swapper), 1e18, "the fill is whole");
+        assertEq(quote.balanceOf(address(manager)), managerBefore, "nothing extra in the manager");
+    }
+
+    function test_Beacon_NativePool_PaidByUnwrappingTheHooksWrapperSpread() public {
+        market.approveAsset(address(weth));
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(inventoryPool), 16);
+        PoolKey memory nativeKey =
+            PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(token)), fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
+        (uint160 seeded,,,) = StateLibrary.getSlot0(IPoolManager(address(manager)), nativeKey.toId());
+        assertEq(seeded, uint160(1 << 96), "registration initialised the native pool");
+        inventoryPool.setNode(1, 10e18, 0);
+        token.mint(address(inventoryPool), 10e18);
+        vm.deal(address(manager), 10 ether); // the hook takes native from the manager, as on Robinhood Chain
+        vm.deal(swapper, 10 ether);
+        uint256 managerBefore = address(manager).balance;
+
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit BeaconSeeded(nativeKey.toId(), address(opener));
+        _buyExactIn(nativeKey, 1e18, 1e18);
+
+        assertTrue(hook.beaconSeeded(nativeKey.toId()), "lit");
+        assertEq(_beaconLiquidity(nativeKey, true), 1, "one unit on the native side");
+        assertEq(address(manager).balance, managerBefore + 1, "one wei of native, unwrapped from the hook's wrapper spread");
+        assertEq(address(hook).balance, 0, "the hook holds no native");
+        assertEq(address(opener).balance, 0, "the opener holds nothing");
+        assertEq(weth.balanceOf(address(hook)), hook.accruedSpreadMargin(Currency.wrap(address(weth))) + hook.accruedDust(Currency.wrap(address(weth))), "books = holdings");
     }
 
     function test_ExactOutputSurplusPrefundSettlesHookDelta() public {
@@ -1351,7 +1464,9 @@ contract Gen4PoolManagerIntegrationTest is Test {
             : (Currency.wrap(address(token)), Currency.wrap(address(oppositeQuote)));
         PoolKey memory oppositeKey =
             PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
-        manager.initialize(oppositeKey, uint160(1 << 96));
+        // Gen-6: the registration above initialised this pool itself (at 1:1, the mock pool has no anchor)
+        (uint160 seeded,,,) = StateLibrary.getSlot0(IPoolManager(address(manager)), oppositeKey.toId());
+        assertEq(seeded, uint160(1 << 96), "registration initialised the opposite-ordering pool");
 
         inventoryPool.setNode(1, 1e18, 0);
         token.mint(address(inventoryPool), 1e18);

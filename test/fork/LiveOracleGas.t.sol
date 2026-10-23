@@ -66,14 +66,13 @@ contract LiveOracleGasForkTest is ForkTestBase {
         vm.stopPrank();
 
         (address standInRegistry, address standInSettlement) = ListingStandIn.deploy(address(market));
-        (address hookAddress, bytes32 salt) = HookMiner.find(
-            address(this),
-            HOOK_FLAGS,
-            type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, 0, standInRegistry, standInSettlement)
+        (address hookAddress, bytes32 salt, address openerAddress) = _planHook(
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, 0, standInRegistry, standInSettlement),
+            POOL_MANAGER,
+            AEWETH
         );
         hook = new FlowstateC1Hook{salt: salt}(
-            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, 0, standInRegistry, standInSettlement
+            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, 0, standInRegistry, standInSettlement, openerAddress
         );
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
         hook.registerPair(Currency.wrap(USDG), Currency.wrap(AEWETH), pool, 0);
@@ -83,7 +82,7 @@ contract LiveOracleGasForkTest is ForkTestBase {
             ? (Currency.wrap(USDG), Currency.wrap(AEWETH))
             : (Currency.wrap(AEWETH), Currency.wrap(USDG));
         poolKey = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
-        manager.initialize(poolKey, _sqrtPriceForLiveRate());
+        assertTrue(_slot0Price(poolKey) != 0, "Gen-6: registerPair initialised the pool itself");
 
         swapRouter = new PoolSwapTest(manager);
         lpRouter = new PoolModifyLiquidityTest(manager);

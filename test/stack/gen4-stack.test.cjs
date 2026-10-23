@@ -108,9 +108,14 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     // the hook at a CREATE2 address carrying its permission flags (as MineHookAddress does on chain)
     await network.provider.send("hardhat_setCode", [CREATE2, CREATE2_RUNTIME]);
     const jar = ethers.Wallet.createRandom().address;
+    const weth9 = opts.ethPools ? fx.usdc.target : ethers.ZeroAddress;
+    // Gen-6: the opener is deployed first, at admin's next CREATE address, and the hook is mined with it
+    // (the production order: deployer nonce for the opener, the CREATE2 factory for the hook)
+    const OP = artifact("FlowstatePoolOpener.sol", "FlowstatePoolOpener");
+    const openerAddr = ethers.getCreateAddress({ from: admin.address, nonce: await ethers.provider.getTransactionCount(admin.address) });
     const args = ethers.AbiCoder.defaultAbiCoder().encode(
-      ["address", "address", "address", "address", "address", "uint16", "address", "address"],
-      [manager.target, fx.market.target, admin.address, opts.ethPools ? fx.usdc.target : ethers.ZeroAddress, jar, opts.jarBps ?? 8, registry.target, settlement.target]);
+      ["address", "address", "address", "address", "address", "uint16", "address", "address", "address"],
+      [manager.target, fx.market.target, admin.address, weth9, jar, opts.jarBps ?? 8, registry.target, settlement.target, openerAddr]);
     const initCode = HK.bytecode + args.slice(2);
     const initHash = ethers.keccak256(initCode);
     let salt, hookAddr;
@@ -119,6 +124,8 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       hookAddr = ethers.getCreate2Address(CREATE2, salt, initHash);
       if ((BigInt(hookAddr) & 0x3fffn) === HOOK_FLAGS) break;
     }
+    const opener = await new ethers.ContractFactory(OP.abi, OP.bytecode, admin).deploy(manager.target, hookAddr, weth9);
+    assert.equal(opener.target, openerAddr, "opener at the predicted address");
     await (await admin.sendTransaction({ to: CREATE2, data: salt + initCode.slice(2), ...GAS })).wait();
     const hook = new ethers.Contract(hookAddr, HK.abi, admin);
     assert.notEqual(await ethers.provider.getCode(hookAddr), "0x", "hook deployed at the mined address");
@@ -126,7 +133,9 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
 
     const [c0, c1] = BigInt(fx.usdc.target) < BigInt(fx.token.target) ? [fx.usdc.target, fx.token.target] : [fx.token.target, fx.usdc.target];
     const key = { currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: hookAddr };
-    await (await manager.initialize(key, 1n << 96n)).wait();
+    // Gen-6: the registration initialised the pool itself, at the pool's anchor price for USDC
+    const slot0Of = async (k) => manager["extsload(bytes32)"](ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(["bytes32", "uint256"], [poolIdOf(k), 6n])));
+    assert.notEqual(BigInt(await slot0Of(key)) & ((1n << 160n) - 1n), 0n, "registerPair initialised the USDC pool");
     const zeroForOne = c0 === fx.usdc.target; // buying the token pays in USDC
 
     // The hook takes the buyer's input from the PoolManager inside beforeSwap, before the router
@@ -142,7 +151,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     if (opts.ethPools) {
       await (await hook.registerPair(ethers.ZeroAddress, fx.token.target, pool.target, 16)).wait();
       nativeKey = { currency0: ethers.ZeroAddress, currency1: fx.token.target, fee: 0, tickSpacing: 60, hooks: hookAddr };
-      await (await manager.initialize(nativeKey, 1n << 96n)).wait();
+      assert.notEqual(BigInt(await slot0Of(nativeKey)) & ((1n << 160n) - 1n), 0n, "registerPair initialised the native pool");
       // the hook takes native from the PoolManager in beforeSwap, so the manager holds native reserves
       await network.provider.send("hardhat_setBalance", [manager.target, "0x" + (10n ** 21n).toString(16)]);
       const TR = artifact("Gen4TwoPoolRouter.sol", "Gen4TwoPoolRouter");
@@ -192,6 +201,7 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       if (opts.buyAll) { sized = await priceAll(GAS); params = { ...params, amountSpecified: -sized.charged }; }
       const p = { zeroForOne, sqrtPriceLimitX96: zeroForOne ? MIN_SQRT : MAX_SQRT, ...params };
       const usdc0 = await fx.usdc.balanceOf(buyerEOA.address);
+      const mgr0 = await fx.usdc.balanceOf(manager.target);
       const tx = opts.buyAll || opts.live
         ? await live.connect(buyerEOA).swap(key, p, gas)
         : await router.connect(buyerEOA).swap(key, p, { takeClaims: false, settleUsingBurn: false }, opts.hookData ?? "0x", gas);
@@ -208,10 +218,15 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
           else if (a === hookAddr.toLowerCase()) { const e = hook.interface.parseLog(log); if (e && e.name === "BuyExecuted") { spread += e.args[6]; dust += e.args[7]; } if (e && e.name === "ProtocolFeePaid") jarFee += e.args[2]; }
         } catch {}
       }
-      assert.equal(paid, sources + spread + jarFee + dust, `paid ${paid} != sources ${sources} + spread ${spread} + jar ${jarFee} + dust ${dust}`);
+      // Gen-6: a pool's FIRST fill lights its visibility beacon out of the hook's spread; the PoolManager
+      // keeps that dust (about one wei), the event's spread is already net of it, so it is money out too
+      const beacon = (await fx.usdc.balanceOf(manager.target)) - mgr0;
+      const lit = rc.logs.some((l) => { if (l.address.toLowerCase() !== hookAddr.toLowerCase()) return false; try { return hook.interface.parseLog(l)?.name === "BeaconSeeded"; } catch { return false; } });
+      assert.equal(lit, beacon > 0n, lit ? "a lit beacon costs the manager some dust" : "no beacon, the manager nets zero");
+      assert.equal(paid, sources + spread + jarFee + dust + beacon, `paid ${paid} != sources ${sources} + spread ${spread} + jar ${jarFee} + dust ${dust} + beacon ${beacon}`);
       if (params.amountSpecified < 0n) assert.equal(paid, -params.amountSpecified, "exact input charges the whole slice, nothing handed back");
       if (sized) rc.sized = sized;
-      rc.money = { paid, sources, spread, jarFee, dust };
+      rc.money = { paid, sources, spread, jarFee, dust, beacon };
       return rc;
     };
     return { fx, pool, registry, settlement, manager, router, live, hook, key, jar, seller, list, deposit, buy, priceAll, shortfallOf, zeroForOne, nativeKey, twoPool };
@@ -291,10 +306,15 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       retained: buys[0].args.spreadAccrued, dust: buys[0].args.dustAccrued, srcs: fills(rc, s).map((x) => x.src + (x.id ? x.id : "")),
     };
     // the hook's books move by exactly what the swap reported, the manager nets zero on both currencies,
-    // and outside the swap the hook holds nothing but its booked margin and dust (scope §8 custody rule)
+    // and outside the swap the hook holds nothing but its booked margin and dust (scope §8 custody rule).
+    // Gen-6: a pool's FIRST fill lights its visibility beacon out of the hook's spread, so on that fill the
+    // manager keeps the one-wei dust and the reported spread is already net of it (BeaconSeeded in the receipt).
+    const beacons = ev.filter((e) => e.name === "BeaconSeeded");
     assert.equal(a.margin - b.margin, out.retained, "accruedSpreadMargin grew by the reported spread");
     assert.equal(a.dust - b.dust, out.dust, "accruedDust grew by the reported dust");
-    assert.equal(a.mgrUsdc, b.mgrUsdc, "PoolManager USDC nets zero");
+    assert.equal(a.mgrUsdc - b.mgrUsdc, rc.money.beacon, beacons.length ? "PoolManager keeps exactly the beacon's dust on the first fill" : "PoolManager USDC nets zero");
+    assert.equal(beacons.length > 0, rc.money.beacon > 0n, "beacon event and dust agree");
+    out.beacon = rc.money.beacon;
     assert.equal(a.mgrTok, b.mgrTok, "PoolManager token nets zero");
     assert.equal(await usdc.balanceOf(s.hook.target), a.margin + a.dust, "the hook holds exactly its margin + dust");
     assert.equal(await token.balanceOf(s.hook.target), 0n, "the hook holds no inventory token");
@@ -842,26 +862,36 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       const tokens0 = await s.fx.token.balanceOf(s.buyer.address);
       const margin0 = await s.hook.accruedSpreadMargin(s.fx.usdc.target);
       const jar0 = await s.fx.usdc.balanceOf(s.jar);
+      const mgrUsdc0 = await s.fx.usdc.balanceOf(s.manager.target), mgrEth0 = await ethers.provider.getBalance(s.manager.target);
       const rc = await (await s.twoPool.connect(s.buyer).swapAll(legs, { value: 10n ** 16n, ...GAS })).wait();
       assert.equal((await s.fx.token.balanceOf(s.buyer.address)) - tokens0, mainMax + secondMax, "both pools' quotes fill in one transaction");
-      const buys = [], fees = [];
+      // Gen-6: each pool's first fill lights its beacon out of the hook's spread: the native pool's dust
+      // reaches the manager as native (unwrapped by the opener), the "aeWETH" pool's as the wrapper
+      const beaconUsdc = (await s.fx.usdc.balanceOf(s.manager.target)) - mgrUsdc0;
+      const beaconEth = (await ethers.provider.getBalance(s.manager.target)) - mgrEth0;
+      const buys = [], fees = [], lit = new Set();
       for (const log of rc.logs) {
         if (log.address.toLowerCase() !== s.hook.target.toLowerCase()) continue;
         try {
           const e = s.hook.interface.parseLog(log);
-          if (e && e.name === "BuyExecuted") buys.push({ quoteIn: e.args[3], spread: e.args[6], dust: e.args[7] });
+          if (e && e.name === "BuyExecuted") buys.push({ poolId: e.args[0], native: e.args[1] === ethers.ZeroAddress, quoteIn: e.args[3], spread: e.args[6], dust: e.args[7] });
           if (e && e.name === "ProtocolFeePaid") fees.push(e.args[2]);
+          if (e && e.name === "BeaconSeeded") lit.add(e.args[0]);
         } catch {}
       }
       assert.equal(buys.length, 2, "one buy per pool");
       assert.equal(fees.length, 2, "one jar payment per pool");
-      // the event's spread is net of the jar fee (paid = sources + spread + jar + dust), so each pool's
-      // source cost is quoteIn - spread - jar - dust; the pair's 16 bps covers spread and jar together
+      assert.equal(lit.size, 2, "both pools' beacons lit on their first fill");
+      assert.ok(beaconUsdc > 0n && beaconEth > 0n, "the manager keeps each pool's dust in that pool's currency");
+      // the event's spread is net of the jar fee and the beacon (paid = sources + spread + jar + dust + beacon),
+      // so each pool's source cost is quoteIn - spread - jar - dust - beacon; the pair's 16 bps covers spread,
+      // jar and beacon together
       for (let i = 0; i < 2; i++) {
-        const cost = buys[i].quoteIn - buys[i].spread - fees[i] - buys[i].dust;
+        const beacon = lit.has(buys[i].poolId) ? (buys[i].native ? beaconEth : beaconUsdc) : 0n;
+        const cost = buys[i].quoteIn - buys[i].spread - fees[i] - buys[i].dust - beacon;
         assert.ok(buys[i].spread > 0n, "each pool keeps a spread");
         assert.equal(fees[i], (cost * 8n + 9_999n) / 10_000n, "each pool pays the jar ceil(cost x 8 / 10,000)");
-        assert.equal(buys[i].spread + fees[i], (cost * 16n + 9_999n) / 10_000n, "spread plus jar fee is the pair's 16 bps of cost");
+        assert.equal(buys[i].spread + fees[i] + beacon, (cost * 16n + 9_999n) / 10_000n, "spread plus jar fee plus beacon is the pair's 16 bps of cost");
       }
       assert.equal((await s.fx.usdc.balanceOf(s.jar)) - jar0, fees[0] + fees[1], "the jar received both fees");
       assert.equal((await s.hook.accruedSpreadMargin(s.fx.usdc.target)) - margin0, buys[0].spread + buys[1].spread, "the hook books both spreads (net of the jar fees)");
