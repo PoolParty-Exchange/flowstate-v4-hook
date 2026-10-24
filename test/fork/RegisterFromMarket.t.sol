@@ -67,16 +67,21 @@ contract RegisterFromMarketTest is ForkTestBase {
 
     // -- registration behaviour ----------------------------------------------
 
+    /// @dev Gen-6, one ETH door: the market's aeWETH registration opens the NATIVE pair (market asset = the wrapper).
     function test_registersFreshPairWithConfiguredSpread() public {
+        bytes32 nativeKey = _key(address(0), address(token));
         assertFalse(_pairRegistered(aewethKey), "fixture: aeWETH pair must start unregistered");
+        assertFalse(_pairRegistered(nativeKey), "fixture: native pair must start unregistered");
         market.setQuoteAsset(AEWETH, true);
 
         vm.prank(address(market));
         hook.registerPairFromMarket(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool);
 
-        assertTrue(_pairRegistered(aewethKey), "not registered");
-        assertEq(_pairSpread(aewethKey), hook.marketRegistrationSpreadBps(), "spread != configured default");
-        assertEq(_pairPool(aewethKey), pool, "wrong market pool");
+        assertTrue(_pairRegistered(nativeKey), "native pair not registered");
+        assertFalse(_pairRegistered(aewethKey), "no aeWETH-keyed pair: one ETH door");
+        assertEq(_pairSpread(nativeKey), hook.marketRegistrationSpreadBps(), "spread != configured default");
+        assertEq(_pairPool(nativeKey), pool, "wrong market pool");
+        assertEq(_pairMarketAsset(nativeKey), AEWETH, "settles in the wrapper");
     }
 
     function test_defaultSpreadIsSixteenBps() public view {
@@ -187,7 +192,7 @@ contract RegisterFromMarketTest is ForkTestBase {
 
         vm.prank(address(market));
         hook.registerPairFromMarket(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool);
-        assertEq(_pairSpread(aewethKey), 40);
+        assertEq(_pairSpread(_key(address(0), address(token))), 40); // the native pair the wrapper registration opens
     }
 
     function test_setMarketRegistrationSpread_ownerOnly() public {
@@ -213,7 +218,7 @@ contract RegisterFromMarketTest is ForkTestBase {
 
         vm.prank(address(market));
         hook.registerPairFromMarket(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool);
-        assertEq(_pairSpread(aewethKey), 50, "floor not applied");
+        assertEq(_pairSpread(_key(address(0), address(token))), 50, "floor not applied"); // the native pair
     }
 
     function test_marketCreatePoolAutoRegistrationStillSucceedsWithValidation() public {
