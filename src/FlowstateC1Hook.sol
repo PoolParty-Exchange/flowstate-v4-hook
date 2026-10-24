@@ -550,8 +550,8 @@ contract FlowstateC1Hook is Ownable2Step {
         emit PairRegistered(c0, c1, marketPool, quoteIsCurrency0);
         emit BaseSpreadUpdated(c0, c1, baseSpreadBps);
         // Gen-6: the pair's V4 pool is initialised here, in the same transaction, by the opener (whose
-        // initialize call runs this hook's beforeInitialize, which records the pair as opened). Best
-        // effort: a refusal leaves the pool to the permissionless opener.open / PoolManager.initialize.
+        // initialize call runs this hook's beforeInitialize gate). Best effort: a refusal leaves the pool
+        // to the permissionless opener.open / PoolManager.initialize.
         try opener.open(quote, token) {} catch {}
     }
 
