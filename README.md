@@ -48,8 +48,10 @@ send), and the beacon was a separate call. Gen-6:
   Gen-6 21,158 after Design E's removal (3,418 under EIP-170). The PoolManager never calls an
   unflagged callback; the permission bits are unchanged (0x28cc).
 
-The fill path's pricing and legs are Gen-5's. Not in Gen-6: JUP-768 (one venue evaluation per fill)
-needs a market upgrade.
+The fill path's pricing and legs are Gen-5's; the five gas floors are retuned from a fork probe
+(attempt 120k, leg base 120k, reserve 60k, return 20k, listing 400k) because Gen-6 fills are about
+100k cheaper and the limit-to-used ratio Uniswap judges rose above 1.30 under Gen-5's floors. Not in
+Gen-6: JUP-768 (one venue evaluation per fill) needs a market upgrade.
 
 ## Layout
 
