@@ -822,25 +822,23 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
     });
   });
 
-  describe("design E on the stack: native-ETH and aeWETH pools selling one C1 pool (Daniel, 30 Sep)", () => {
-    // The real market, pool, venue, listing registry and settlement, the real PoolManager, the hook's
-    // real 16 bps spread and 8 bps jar fee. Queue: the seed (100) and a deposit (100), then a listing
-    // of 60, then ten deposits of 100 behind it. Native is the main pool (the 80% default); the
-    // "aeWETH" pool (the wrapped fixture token) is the second pool and never sells listings.
+  describe("one ETH door on the stack (Gen-6, Hamish 24 Oct 2026): every door free", () => {
+    // The market path no longer creates an aeWETH-keyed pool (its wrapper registration opens the native pair), so a
+    // token has one ETH door. Both ETH pools are registered here by the OWNER to show what "free" means and what a
+    // same-currency double registration would cost: each pool quotes the whole stock, and a route that promises it
+    // twice reverts as a whole with nothing moved. Queue: the seed (100) and a deposit (100), a listing of 60, ten
+    // deposits of 100 behind it.
     async function ethStack() {
       const s = await stack({ ethPools: true });
-      // a $20 inventory floor, so K (one floor in tokens) is real: 10 tokens at the fixture's rate
-      await (await s.fx.market.connect(s.fx.signers.admin).setInventoryFloor(s.fx.usdc.target, 20n * 10n ** 6n)).wait();
-      await s.deposit(TOK(100)); // node 2
+      await s.deposit(TOK(100));
       const w = await s.seller(TOK(60));
-      await (await s.list(w, TOK(60))).wait(); // listing 1, queued after nodes 1 and 2
-      for (let i = 0; i < 10; i++) await s.deposit(TOK(100)); // nodes 3..12, behind the listing
+      await (await s.list(w, TOK(60))).wait();
+      for (let i = 0; i < 10; i++) await s.deposit(TOK(100));
       const buyer = s.fx.signers.buyerEOA;
       const leg = (native, amountSpecified) => {
         const zeroForOne = native ? true : s.zeroForOne;
         return { key: native ? s.nativeKey : s.key, params: { zeroForOne, amountSpecified, sqrtPriceLimitX96: zeroForOne ? MIN_SQRT : MAX_SQRT } };
       };
-      // each pool's own quote: what an oversized exact input on it alone would fill
       const probe = async (native) => {
         try { await s.twoPool.connect(buyer).swapAll.staticCall([leg(native, -(10n ** 12n))], GAS); assert.fail("an oversized probe must revert"); }
         catch (e) { if (e.code === "ERR_ASSERTION") throw e; return s.shortfallOf(e).filled; }
@@ -848,104 +846,29 @@ describe(`JUP-698 gate 1: Gen-4 hook on the pinned stack (PoolParty_Contracts ${
       return { ...s, buyer, leg, probe };
     }
 
-    async function bothPoolsInOneTransaction(order) {
+    it("each ETH pool quotes the whole stock (deposits plus the listing), and the native pool alone sells all of it", async () => {
       const s = await ethStack();
       const deposits = await s.pool.reachable();
-      const mainMax = await s.probe(true), secondMax = await s.probe(false);
-      const [, rate] = await s.fx.market.previewRate(s.pool.target, s.fx.usdc.target);
-      const floor = await s.fx.market.inventoryFloor(s.fx.usdc.target);
-      const K = (floor * 10n ** 18n + rate - 1n) / rate;
-      const shareable = deposits - K, second = (shareable * 2_000n) / 10_000n - K;
-      assert.ok(K > 0n, "the floor makes K real");
-      assert.equal(secondMax, second, "the second pool's quote is its share of (deposits - K), less K");
-      assert.equal(mainMax, shareable - second + TOK(60), "the main pool's quote is the rest of the deposits plus the listing");
-      const legs = order === "native first"
-        ? [s.leg(true, mainMax), s.leg(false, secondMax)]
-        : [s.leg(false, secondMax), s.leg(true, mainMax)];
+      const nativeMax = await s.probe(true), wrappedMax = await s.probe(false);
+      assert.equal(nativeMax, deposits + TOK(60), "the native door: every deposit plus the listing, no share");
+      assert.equal(wrappedMax, deposits + TOK(60), "the wrapper door, if the owner registers one, quotes the same whole stock");
       const tokens0 = await s.fx.token.balanceOf(s.buyer.address);
-      const margin0 = await s.hook.accruedSpreadMargin(s.fx.usdc.target);
-      const jar0 = await s.fx.usdc.balanceOf(s.jar);
-      const mgrUsdc0 = await s.fx.usdc.balanceOf(s.manager.target), mgrEth0 = await ethers.provider.getBalance(s.manager.target);
-      const rc = await (await s.twoPool.connect(s.buyer).swapAll(legs, { value: 10n ** 16n, ...GAS })).wait();
-      assert.equal((await s.fx.token.balanceOf(s.buyer.address)) - tokens0, mainMax + secondMax, "both pools' quotes fill in one transaction");
-      // Gen-6: each pool's first fill lights its beacon out of the hook's spread: the native pool's dust
-      // reaches the manager as native (unwrapped by the opener), the "aeWETH" pool's as the wrapper
-      const beaconUsdc = (await s.fx.usdc.balanceOf(s.manager.target)) - mgrUsdc0;
-      const beaconEth = (await ethers.provider.getBalance(s.manager.target)) - mgrEth0;
-      const buys = [], fees = [], lit = new Set();
-      for (const log of rc.logs) {
-        if (log.address.toLowerCase() !== s.hook.target.toLowerCase()) continue;
-        try {
-          const e = s.hook.interface.parseLog(log);
-          if (e && e.name === "BuyExecuted") buys.push({ poolId: e.args[0], native: e.args[1] === ethers.ZeroAddress, quoteIn: e.args[3], spread: e.args[6], dust: e.args[7] });
-          if (e && e.name === "ProtocolFeePaid") fees.push(e.args[2]);
-          if (e && e.name === "BeaconSeeded") lit.add(e.args[0]);
-        } catch {}
-      }
-      assert.equal(buys.length, 2, "one buy per pool");
-      assert.equal(fees.length, 2, "one jar payment per pool");
-      assert.equal(lit.size, 2, "both pools' beacons lit on their first fill");
-      assert.ok(beaconUsdc > 0n && beaconEth > 0n, "the manager keeps each pool's dust in that pool's currency");
-      // the event's spread is net of the jar fee and the beacon (paid = sources + spread + jar + dust + beacon),
-      // so each pool's source cost is quoteIn - spread - jar - dust - beacon; the pair's 16 bps covers spread,
-      // jar and beacon together
-      for (let i = 0; i < 2; i++) {
-        const beacon = lit.has(buys[i].poolId) ? (buys[i].native ? beaconEth : beaconUsdc) : 0n;
-        const cost = buys[i].quoteIn - buys[i].spread - fees[i] - buys[i].dust - beacon;
-        assert.ok(buys[i].spread > 0n, "each pool keeps a spread");
-        assert.equal(fees[i], (cost * 8n + 9_999n) / 10_000n, "each pool pays the jar ceil(cost x 8 / 10,000)");
-        assert.equal(buys[i].spread + fees[i] + beacon, (cost * 16n + 9_999n) / 10_000n, "spread plus jar fee plus beacon is the pair's 16 bps of cost");
-      }
-      assert.equal((await s.fx.usdc.balanceOf(s.jar)) - jar0, fees[0] + fees[1], "the jar received both fees");
-      assert.equal((await s.hook.accruedSpreadMargin(s.fx.usdc.target)) - margin0, buys[0].spread + buys[1].spread, "the hook books both spreads (net of the jar fees)");
+      const rc = await (await s.twoPool.connect(s.buyer).swapAll([s.leg(true, nativeMax)], { value: 10n ** 16n, ...GAS })).wait();
+      assert.equal((await s.fx.token.balanceOf(s.buyer.address)) - tokens0, nativeMax, "the native door sold everything in one swap");
+      assert.equal(await s.pool.reachable(), 0n, "no deposits left");
+      assert.equal((await s.registry.listing(1n)).remaining, 0n, "the listing sold");
       assert.equal(await ethers.provider.getBalance(s.hook.target), 0n, "no native left on the hook");
-      const listing = await s.registry.listing(1n);
-      console.log(`      ${order}: main ${mainMax}, second ${secondMax}, gas ${rc.gasUsed}; deposits left ${await s.pool.reachable()}, listing remaining ${listing.remaining}`);
-      assert.equal(await s.pool.reachable(), K, "exactly K stays in the pool");
-      return { mainMax, secondMax, left: await s.pool.reachable(), listingRemaining: listing.remaining };
-    }
-
-    it("both pools' quotes fill in one transaction in either order, with the real spread and jar fee, and sell the same stock", async () => {
-      const a = await bothPoolsInOneTransaction("native first");
-      const b = await bothPoolsInOneTransaction("aeWETH first");
-      assert.equal(b.mainMax, a.mainMax);
-      assert.equal(b.secondMax, a.secondMax);
-      assert.equal(b.left, a.left, "the same deposits sold in either order");
-      assert.equal(b.listingRemaining, a.listingRemaining, "the same listing stock sold in either order");
-      assert.equal(a.listingRemaining, 0n, "the main pool sold the listing");
+      console.log(`      native door sold ${nativeMax} tokens in one swap, gas ${rc.gasUsed}`);
     });
 
-    // The Robin pass 65 case on the real registry and settlement: 200 of deposits sit ahead of the
-    // listing. A main slice of 150 is quoted as 150 of those deposits, listing untouched. When the
-    // aeWETH pool runs first and buys the deposits ahead of the listing, the main pool must still sell
-    // deposits (from further back), not jump to the listing: the same stock as with native first.
-    it("a smaller main slice sells what its own quote sold, whichever pool runs first", async () => {
-      const outcome = async (order) => {
-        const s = await ethStack();
-        const secondMax = await s.probe(false);
-        const legs = order === "native first"
-          ? [s.leg(true, TOK(150)), s.leg(false, secondMax)]
-          : [s.leg(false, secondMax), s.leg(true, TOK(150))];
-        const deposits0 = await s.pool.reachable();
-        await (await s.twoPool.connect(s.buyer).swapAll(legs, { value: 10n ** 16n, ...GAS })).wait();
-        const listing = await s.registry.listing(1n);
-        return { sold: deposits0 - (await s.pool.reachable()), listingRemaining: listing.remaining, secondMax };
-      };
-      const a = await outcome("native first"), b = await outcome("aeWETH first");
-      console.log(`      main 150 + second ${a.secondMax}: deposits sold ${a.sold} / ${b.sold}, listing remaining ${a.listingRemaining} / ${b.listingRemaining}`);
-      assert.equal(a.listingRemaining, TOK(60), "native first: the main slice sells deposits ahead of the listing");
-      assert.equal(b.listingRemaining, TOK(60), "aeWETH first: the main slice still sells deposits, not the listing");
-      assert.equal(b.sold, a.sold, "the same deposits sold in either order");
-      assert.equal(a.sold, TOK(150) + a.secondMax);
-    });
-
-    it("an aeWETH slice above its budget reverts the whole transaction and nothing moves", async () => {
+    it("a route that promises the same stock through two ETH pools reverts as a whole and nothing moves", async () => {
       const s = await ethStack();
-      const mainMax = await s.probe(true), secondMax = await s.probe(false);
-      const tokens0 = await s.fx.token.balanceOf(s.buyer.address), left0 = await s.pool.reachable();
-      await assert.rejects(s.twoPool.connect(s.buyer).swapAll([s.leg(true, mainMax), s.leg(false, secondMax + TOK(1))], { value: 10n ** 16n, ...GAS }));
-      assert.equal(await s.fx.token.balanceOf(s.buyer.address), tokens0);
-      assert.equal(await s.pool.reachable(), left0);
+      const nativeMax = await s.probe(true);
+      const tokens0 = await s.fx.token.balanceOf(s.buyer.address), deposits0 = await s.pool.reachable();
+      await assert.rejects(s.twoPool.connect(s.buyer).swapAll([s.leg(true, nativeMax), s.leg(false, TOK(1))], { value: 10n ** 16n, ...GAS }), "the second leg finds no stock and the whole route reverts");
+      assert.equal(await s.fx.token.balanceOf(s.buyer.address), tokens0, "nothing delivered");
+      assert.equal(await s.pool.reachable(), deposits0, "nothing sold");
+      assert.equal((await s.registry.listing(1n)).remaining, TOK(60), "listing untouched");
     });
   });
 

@@ -112,35 +112,37 @@ contract RegisterFromMarketTest is ForkTestBase {
         assertTrue(_slot0Price(_keyOf(address(0), address(token))) != 0, "the native pool is initialised");
     }
 
-    /// @dev The market registers the wrapper's pair (an approved ERC-20); the hook brings the token's
-    ///      native-ETH pair with it, at the same spread, and both V4 pools exist afterwards.
-    function test_wrapperPairFromMarketBringsItsNativeSibling_BothPoolsInitialised() public {
+    /// @dev ONE ETH door (Hamish, 24 Oct 2026): the market registers the wrapper's pair (an approved ERC-20)
+    ///      and the hook opens the token's NATIVE-ETH pair instead, settling in the wrapper; no aeWETH-keyed
+    ///      pool is created. Routers wrap and unwrap at the edges (Uniswap and Kyber, measured).
+    function test_wrapperPairFromMarketOpensTheNativeDoorOnly() public {
         market.setQuoteAsset(AEWETH, true);
         bytes32 nativeKey = _key(address(0), address(token));
         assertFalse(_pairRegistered(aewethKey));
         assertFalse(_pairRegistered(nativeKey));
         vm.prank(address(market));
         hook.registerPairFromMarket(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool);
-        assertTrue(_pairRegistered(aewethKey), "aeWETH pair");
-        assertTrue(_pairRegistered(nativeKey), "native sibling");
-        assertEq(_pairSpread(nativeKey), _pairSpread(aewethKey), "same spread");
-        assertEq(_pairPool(nativeKey), pool, "same C1 pool");
-        assertTrue(_slot0Price(_keyOf(AEWETH, address(token))) != 0, "aeWETH pool initialised");
+        assertTrue(_pairRegistered(nativeKey), "native pair registered");
+        assertFalse(_pairRegistered(aewethKey), "no aeWETH-keyed pair: one ETH door");
+        assertEq(_pairMarketAsset(nativeKey), AEWETH, "settles in the wrapper");
+        assertEq(_pairPool(nativeKey), pool);
         assertTrue(_slot0Price(_keyOf(address(0), address(token))) != 0, "native pool initialised");
-        // the sibling is idempotent too: a second market call changes nothing
+        assertEq(_slot0Price(_keyOf(AEWETH, address(token))), 0, "no aeWETH pool exists");
+        // idempotent: a second market call changes nothing
         vm.prank(address(market));
         hook.registerPairFromMarket(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool);
         assertEq(_pairSpread(nativeKey), hook.marketRegistrationSpreadBps());
+        assertFalse(_pairRegistered(aewethKey));
     }
 
-    /// @dev An owner-tuned native pair is never clobbered by the sibling registration.
-    function test_nativeSiblingNeverClobbersAnOwnerRegisteredNativePair() public {
+    /// @dev An owner-tuned native pair is never clobbered by the market's wrapper registration.
+    function test_marketWrapperRegistrationNeverClobbersAnOwnerRegisteredNativePair() public {
         market.setQuoteAsset(AEWETH, true);
         hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), pool, 7);
         vm.prank(address(market));
         hook.registerPairFromMarket(Currency.wrap(AEWETH), Currency.wrap(address(token)), pool);
         assertEq(_pairSpread(_key(address(0), address(token))), 7, "owner spread kept");
-        assertEq(_pairSpread(aewethKey), hook.marketRegistrationSpreadBps(), "aeWETH pair registered by the market");
+        assertFalse(_pairRegistered(aewethKey), "still no aeWETH-keyed pair");
     }
 
     /// @dev The opener is permissionless and idempotent, and refuses nothing it should accept: an
@@ -238,7 +240,8 @@ contract RegisterFromMarketTest is ForkTestBase {
     }
 
     /// @dev The whole Uniswap side of a new token from ONE createPool, with no FlowState key anywhere:
-    ///      three pairs (USDG, aeWETH, native ETH), three initialised V4 pools, all ready.
+    ///      two doors (USDG and native ETH, the aeWETH approval mapping to the native pair), two initialised
+    ///      V4 pools, both ready, and no aeWETH-keyed pool.
     function test_createPoolOpensEveryDoor_NoOperator() public {
         vm.prank(address(stack.tl48));
         market.setTrustedHook(address(hook));
@@ -257,10 +260,12 @@ contract RegisterFromMarketTest is ForkTestBase {
         address newPool = market.createPool(address(newToken), 100e18, 0, floors);
         g -= gasleft();
         vm.stopPrank();
-        console2.log("createPool gas with three hook pairs and three pool inits:", g);
+        console2.log("createPool gas with two hook pairs and two pool inits:", g);
 
-        address[3] memory quotes = [USDG, AEWETH, address(0)];
-        for (uint256 i; i < 3; ++i) {
+        assertFalse(_pairRegistered(_key(AEWETH, address(newToken))), "no aeWETH-keyed pair: one ETH door");
+        assertEq(_slot0Price(_keyOf(AEWETH, address(newToken))), 0, "no aeWETH pool");
+        address[2] memory quotes = [USDG, address(0)];
+        for (uint256 i; i < 2; ++i) {
             bytes32 k = _key(quotes[i], address(newToken));
             assertTrue(_pairRegistered(k), "pair registered");
             assertEq(_pairPool(k), newPool, "bound to the new C1 pool");

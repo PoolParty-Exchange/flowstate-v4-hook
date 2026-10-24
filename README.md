@@ -19,9 +19,14 @@ FlowState pool was permissionless but its Uniswap side was not: the market auto-
 pairs for ERC-20 quotes only, nothing initialised the v4 pool keys (every live init was a deployer
 send), and the beacon was a separate call. Gen-6:
 
-- `registerPairFromMarket` accepts a native-ETH quote, and the market registering the wrapper's pair
-  registers the token's native sibling at the same spread (idempotent; an owner-tuned native pair is
-  never touched). One `createPool` gives a token its USDG, aeWETH and native-ETH doors.
+- **One ETH door per token** (Hamish, 24 Oct 2026). `registerPairFromMarket` accepts a native-ETH
+  quote, and the market registering the wrapper's pair opens the token's NATIVE pair instead
+  (settling in the wrapper; idempotent; an owner-tuned native pair is never touched). No
+  aeWETH-keyed pool is created: Uniswap's and Kyber's routers wrap and unwrap aeWETH for the buyer
+  themselves (measured 23 and 24 Oct 2026). One `createPool` gives a token two doors, native ETH and
+  USDG, both free. Design E's two-ETH-door share (29 Sep 2026: `setNativeShare`, the 80/20 default,
+  the transient ledger) is deleted; a route that promises the same stock through doors of different
+  currencies reverts as a whole, as accepted for the USDG door on 23 Oct.
 - Every pair registration (owner path and market path) initialises the pair's v4 pool through the
   **opener** (`src/FlowstatePoolOpener.sol`), at the C1 pool's anchor price for the market asset
   (1:1 when unseeded; cosmetic, the hook prices every swap). The hook's `beforeInitialize` runs and
@@ -39,12 +44,12 @@ send), and the beacon was a separate call. Gen-6:
   `EXPECTED_HOOK=<mined>`, then `script/DeployHook.s.sol`. `InitPoolAndProbe.s.sol` is no longer a
   deploy step (registration initialises); it remains a probe.
 - The six never-called IHooks stubs (afterInitialize, afterAddLiquidity, beforeRemoveLiquidity,
-  afterRemoveLiquidity, beforeDonate, afterDonate) are gone for runtime size: Gen-5 24,040 bytes,
-  Gen-6 24,166 (410 under EIP-170). The PoolManager never calls an unflagged callback; the permission
-  bits are unchanged (0x28cc).
+  afterRemoveLiquidity, beforeDonate, afterDonate) are gone for runtime size. Gen-5 24,040 bytes;
+  Gen-6 21,158 after Design E's removal (3,418 under EIP-170). The PoolManager never calls an
+  unflagged callback; the permission bits are unchanged (0x28cc).
 
 The fill path's pricing and legs are Gen-5's. Not in Gen-6: JUP-768 (one venue evaluation per fill)
-needs a market upgrade; the USDG door stays free and the native share default stays 8,000 bps.
+needs a market upgrade.
 
 ## Layout
 
@@ -498,6 +503,6 @@ Phase 2 and the ops runbook.
 | beacon seeder gen-2 (4 Sep 2026, hook #11) | `0xb84b5d11f5be1a08b4a8439aa31f3ebd84a2e8a0` | consent-floor deposit ABI (`seedAndDeposit` takes the depositor's signed `AnchorFloor[]`) |
 | gen-4 (13 Oct 2026, JUP-698/JUP-727) | `0x3f7C2bEA8cA39E7fd1E07B63294544369ef268cC` | mixed pool/listing lane, Design E two ETH doors; retired by Gen-5 (pairs unregistered 21 Oct) |
 | gen-5 (21 Oct 2026, PR 19) | `0x44Ca381B2264d0F0173F817d42ab2a8489f968cC` | **live trusted hook** (switch 21 Oct): Gen-4 with the gas floors 250k / 200k / 100k / 30k / 500k; live limit-to-used 1.234 / 1.242 / 1.158; eight pairs (CASHCAT, HOODRAT, TENDIES, V4 x native, aeWETH) |
-| gen-6 (JUP-772, in review) | not deployed | native pairs from the market, pool init at registration, beacon on the first fill, opener contract; identity mined after the Gen-6 listing contracts deploy |
+| gen-6 (JUP-772, in review) | not deployed | one ETH door per token (Design E retired), native pairs from the market, pool init at registration, beacon on the first fill, opener contract; identity mined after the Gen-6 listing contracts deploy |
 
 Market `0x8eFb662F738D0f5d9f146803FD02A36c6B67e60d`, PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951`, vendored contracts pin: see `test/real/poolparty/.vendored-from`.
