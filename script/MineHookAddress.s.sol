@@ -37,8 +37,11 @@ contract MineHookAddress is Script {
         uint16 jarFeeBps = uint16(vm.envUint("JAR_FEE_BPS"));
         address listingRegistry = vm.envAddress("LISTING_REGISTRY");
         address listingSettlement = vm.envAddress("LISTING_SETTLEMENT");
+        // Gen-6: the opener's address, predicted from the deployer's nonce (DeployOpener.s.sol runs at
+        // that nonce AFTER this mining, carrying the address printed here)
+        address opener = vm.envAddress("OPENER");
         bytes memory constructorArgs =
-            abi.encode(poolManager, market, owner, weth9, tokenJar, jarFeeBps, listingRegistry, listingSettlement);
+            abi.encode(poolManager, market, owner, weth9, tokenJar, jarFeeBps, listingRegistry, listingSettlement, opener);
 
         (address hookAddress, bytes32 salt) =
             HookMiner.find(CREATE2_DEPLOYER, flags, type(FlowstateC1Hook).creationCode, constructorArgs);
@@ -48,6 +51,7 @@ contract MineHookAddress is Script {
         console2.log("constructor: market", market);
         console2.log("constructor: owner", owner);
         console2.log("constructor: weth9", weth9);
+        console2.log("constructor: opener", opener);
         console2.log("mined hook address:", hookAddress);
         console2.log("salt:");
         console2.logBytes32(salt);

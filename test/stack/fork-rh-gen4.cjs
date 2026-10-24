@@ -87,13 +87,18 @@ async function main() {
   ok(`listings ${registry.target} / ${settlement.target}; supplier registry ${supplier.target} on; CASHCAT/WETH venue registered, lane open, rate ${rate}`);
 
   // ── the hook: live PoolManager, aeWETH as the native wrapper, the live TokenJar ────────────────
-  const HK = artifact("FlowstateC1Hook.sol", "FlowstateC1Hook"), PM = artifact("PoolManager.sol", "PoolManager");
-  const args = coder.encode(["address", "address", "address", "address", "address", "uint16", "address", "address"],
-    [POOL_MANAGER, book.market, book.admin, WETH, TOKEN_JAR, 8, registry.target, settlement.target]);
+  const HK = artifact("FlowstateC1Hook.sol", "FlowstateC1Hook"), PM = artifact("PoolManager.sol", "PoolManager"), OP = artifact("FlowstatePoolOpener.sol", "FlowstatePoolOpener");
+  // Gen-6: the opener goes first, at the deployer's next CREATE address (a fresh throwaway: nonce 0), and the
+  // hook is mined with it; the opener carries the mined hook address (the production order)
+  const deployer = await throwaway();
+  const openerAddr = ethers.getCreateAddress({ from: deployer.address, nonce: 0 });
+  const args = coder.encode(["address", "address", "address", "address", "address", "uint16", "address", "address", "address"],
+    [POOL_MANAGER, book.market, book.admin, WETH, TOKEN_JAR, 8, registry.target, settlement.target, openerAddr]);
   const initCode = HK.bytecode + args.slice(2), initHash = ethers.keccak256(initCode);
   let salt, hookAddr;
   for (let i = 0n; ; i++) { salt = ethers.zeroPadValue(ethers.toBeHex(i), 32); hookAddr = ethers.getCreate2Address(CREATE2, salt, initHash); if ((BigInt(hookAddr) & 0x3fffn) === HOOK_FLAGS && (await ethers.provider.getCode(hookAddr)) === "0x") break; }
-  const deployer = await throwaway();
+  const opener = await new ethers.ContractFactory(OP.abi, OP.bytecode, deployer).deploy(POOL_MANAGER, hookAddr, WETH);
+  if (opener.target.toLowerCase() !== openerAddr.toLowerCase()) fail(`opener at ${opener.target}, predicted ${openerAddr}`);
   await (await deployer.sendTransaction({ to: CREATE2, data: salt + initCode.slice(2), gasLimit: 29_000_000 })).wait();
   if ((await ethers.provider.getCode(hookAddr)) === "0x") fail("hook not deployed");
   const hook = new ethers.Contract(hookAddr, HK.abi, admin);
@@ -104,12 +109,14 @@ async function main() {
   await (await hook.setSweepDestination(sweepTo)).wait();
   const keyOf = (a, b) => { const [c0, c1] = sortKey(a, b); return { currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: hookAddr }; };
   const cashKey = keyOf(WETH, CASHCAT), nativeKey = { currency0: ethers.ZeroAddress, currency1: CASHCAT, fee: 0, tickSpacing: 60, hooks: hookAddr };
-  await (await manager.initialize(cashKey, 1n << 96n, G)).wait();
-  await (await manager.initialize(nativeKey, 1n << 96n, G)).wait();
+  // Gen-6: registerPair initialised both pools itself (at the pool's aeWETH anchor); nothing to send here
+  const poolIdOf = (k) => ethers.keccak256(coder.encode(["address", "address", "uint24", "int24", "address"], [k.currency0, k.currency1, k.fee, k.tickSpacing, k.hooks]));
+  const slot0Of = async (k) => BigInt(await manager["extsload(bytes32)"](ethers.keccak256(coder.encode(["bytes32", "uint256"], [poolIdOf(k), 6n])))) & ((1n << 160n) - 1n);
+  if ((await slot0Of(cashKey)) === 0n || (await slot0Of(nativeKey)) === 0n) fail("Gen-6: registerPair did not initialise both pools");
   // two-door shares (28 Sep 2026): while both ETH pairs are registered each sells only its share of the stock.
   // Sections 1-9 size one pair to the WHOLE stock, so the native-ETH pair is registered only for [4] and [10].
   await (await hook.unregisterPair(ethers.ZeroAddress, CASHCAT)).wait();
-  ok(`hook ${hookAddr} (flags 0x28cc) via CREATE2; pairs CASHCAT/aeWETH and CASHCAT/ETH registered and initialised on the live PoolManager (CASHCAT/ETH unregistered outside [4] and [10])`);
+  ok(`hook ${hookAddr} (flags 0x28cc) via CREATE2, opener ${opener.target}; pairs CASHCAT/aeWETH and CASHCAT/ETH registered and self-initialised on the live PoolManager (CASHCAT/ETH unregistered outside [4] and [10])`);
 
   // ── Universal Router encoding (the live router's V4Router; struct shape detected by simulation) ─
   let withMinHop = true;
@@ -292,7 +299,7 @@ async function main() {
     await (await hook.registerPair(WETH, ROBINCAT, rPoolAddr, 16)).wait();
     const rKey = keyOf(WETH, ROBINCAT);
     if (BigInt(rKey.currency0) !== BigInt(WETH)) fail("expected WETH as currency0 for ROBINCAT");
-    await (await manager.initialize(rKey, 1n << 96n, G)).wait();
+    if ((await slot0Of(rKey)) === 0n) fail("Gen-6: registerPair did not initialise the ROBINCAT pool");
     const rB = await robin.balanceOf(buyer.address);
     const rIn = (minR * 5n * rRate) / 10n ** 18n; // more than the seed: reaches into the listing
     const call5 = await urCall(buyer, rKey, WETH, ROBINCAT, "in", rIn, 1n);

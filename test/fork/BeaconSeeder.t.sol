@@ -140,7 +140,7 @@ contract BeaconSeederForkTest is ForkTestBase {
             : (Currency.wrap(address(token)), Currency.wrap(AEWETH));
         PoolKey memory key2 =
             PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
-        manager.initialize(key2, _sqrtPriceForMockRate());
+        assertTrue(_slot0Price(key2) != 0, "Gen-6: registerPair initialised the second pool itself");
 
         vm.startPrank(depositor);
         seeder.seed(poolKey, address(token));

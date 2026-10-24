@@ -59,25 +59,23 @@ contract TokenJarFeeForkTest is ForkTestBase {
     /// wiring is valid (stand-ins), so each revert is the guard under test and nothing else.
     function test_Constructor_Guards() public {
         (address standInRegistry, address standInSettlement) = ListingStandIn.deploy(address(market));
-        (, bytes32 salt) = HookMiner.find(
-            address(this),
-            HOOK_FLAGS,
-            type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, address(0), JAR_FEE_BPS, standInRegistry, standInSettlement)
+        (, bytes32 salt, address opener1) = _planHook(
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, address(0), JAR_FEE_BPS, standInRegistry, standInSettlement),
+            POOL_MANAGER,
+            AEWETH
         );
         vm.expectRevert(FlowstateC1Hook.ZeroAddress.selector);
         new FlowstateC1Hook{salt: salt}(
-            POOL_MANAGER, address(market), address(this), AEWETH, address(0), JAR_FEE_BPS, standInRegistry, standInSettlement
+            POOL_MANAGER, address(market), address(this), AEWETH, address(0), JAR_FEE_BPS, standInRegistry, standInSettlement, opener1
         );
-        (, bytes32 salt2) = HookMiner.find(
-            address(this),
-            HOOK_FLAGS,
-            type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17), standInRegistry, standInSettlement)
+        (, bytes32 salt2, address opener2) = _planHook(
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17), standInRegistry, standInSettlement),
+            POOL_MANAGER,
+            AEWETH
         );
         vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.SpreadOutOfRange.selector, 16, 17, hook.MAX_SPREAD_BPS()));
         new FlowstateC1Hook{salt: salt2}(
-            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17), standInRegistry, standInSettlement
+            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, uint16(17), standInRegistry, standInSettlement, opener2
         );
     }
 }

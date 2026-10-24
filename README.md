@@ -11,8 +11,52 @@ transient unlock balances and sweepable spread margin.
 **Phase status:** Phase 0 complete, Phase 1 complete (slice 1 = the market entry-point
 pair, slice 2 = fee rungs + sweep, slice 3 = real-market wiring, this document).
 
+## Gen-6 (JUP-772, 24 Oct 2026): the Uniswap side of a new token needs no operator
+
+Hamish's ruling: "the calls should be built into the user actions", in the contracts, not in the
+frontend or a script (Fomo's listing bot never touches the frontend). Until Gen-6 a new token's
+FlowState pool was permissionless but its Uniswap side was not: the market auto-registered hook
+pairs for ERC-20 quotes only, nothing initialised the v4 pool keys (every live init was a deployer
+send), and the beacon was a separate call. Gen-6:
+
+- **One ETH door per token** (Hamish, 24 Oct 2026). `registerPairFromMarket` accepts a native-ETH
+  quote, and the market registering the wrapper's pair opens the token's NATIVE pair instead
+  (settling in the wrapper; idempotent; an owner-tuned native pair is never touched). No
+  aeWETH-keyed pool is created: Uniswap's and Kyber's routers wrap and unwrap aeWETH for the buyer
+  themselves (measured 23 and 24 Oct 2026). One `createPool` gives a token two doors, native ETH and
+  USDG, both free. Design E's two-ETH-door share (29 Sep 2026: `setNativeShare`, the 80/20 default,
+  the transient ledger) is deleted; a route that promises the same stock through doors of different
+  currencies reverts as a whole, as accepted for the USDG door on 23 Oct.
+- Every pair registration (owner path and market path) initialises the pair's v4 pool through the
+  **opener** (`src/FlowstatePoolOpener.sol`), at the C1 pool's anchor price for the market asset
+  (1:1 when unseeded; cosmetic, the hook prices every swap). The hook's `beforeInitialize` runs and
+  records the pair opened. Best effort: a refusal leaves the pool to the permissionless `opener.open`.
+- A pool's **first fill lights its visibility beacon** (JUP-516) out of the hook's own spread on that
+  fill, after the jar: the opener places the one-unit position on the quote side of the tick, pulls
+  exactly what the PoolManager charges (about one wei) from the hook's allowance, unwraps it for a
+  native pool, settles. Skipped when the spread is zero or the gas left would eat into the
+  finalisation reserve (`BEACON_GAS` 300k + reserve 100k); a failed attempt is caught and never
+  blocks a fill. The seeder periphery keeps working for anyone who wants a beacon before a fill.
+- The opener is the hook's ninth constructor argument (immutable, code-bearing). It is deployed
+  BEFORE the hook with a plain CREATE from the deployer, at the address its nonce gives, so the hook's
+  mined CREATE2 address can carry it and it can carry the hook's address: predict the opener address,
+  mine the hook with `OPENER=<predicted>`, `script/DeployOpener.s.sol` at that nonce with
+  `EXPECTED_HOOK=<mined>`, then `script/DeployHook.s.sol`. `InitPoolAndProbe.s.sol` is no longer a
+  deploy step (registration initialises); it remains a probe.
+- The six never-called IHooks stubs (afterInitialize, afterAddLiquidity, beforeRemoveLiquidity,
+  afterRemoveLiquidity, beforeDonate, afterDonate) are gone for runtime size. Gen-5 24,040 bytes;
+  Gen-6 21,158 after Design E's removal (3,418 under EIP-170). The PoolManager never calls an
+  unflagged callback; the permission bits are unchanged (0x28cc).
+
+The fill path's pricing and legs are Gen-5's; the five gas floors are retuned from a fork probe
+(attempt 120k, leg base 120k, reserve 60k, return 20k, listing 400k) because Gen-6 fills are about
+100k cheaper and the limit-to-used ratio Uniswap judges rose above 1.30 under Gen-5's floors. Not in
+Gen-6: JUP-768 (one venue evaluation per fill) needs a market upgrade.
+
 ## Layout
 
+- `src/FlowstatePoolOpener.sol` — Gen-6: the hook's door opener (pool initialisation at
+  registration, the beacon on a pool's first fill); see the Gen-6 section above.
 - `src/FlowstateC1Hook.sol` — the hook. Flags 0x28cc (BEFORE_INITIALIZE,
   BEFORE_ADD_LIQUIDITY, BEFORE_SWAP, AFTER_SWAP, BEFORE_SWAP_RETURNS_DELTA,
   AFTER_SWAP_RETURNS_DELTA). beforeInitialize gates pool creation on an admin pair
@@ -459,5 +503,8 @@ Phase 2 and the ops runbook.
 | gen-2 (1 Sep 2026, JUP-587) | `0x01ac4111a885c28079C16Ac7804062B15F94e8cc` | trusted-hook auto-registration; no pairs, no fills |
 | gen-3 (4 Sep 2026, JUP-621) | `0x1C74A4CA5cfD8C550E54be091aBda476Acffa8CC` | **live trusted hook.** Immutable TokenJar fee: 8 bps of the realised cost of every fill to `0x2aC03e14Cfe755426DaAEe0a4994184Ce81482F8` (Uniswap TokenJar, Robinhood Chain), carved from the 16 bps spread. Sourcify exact match. Pairs: CASHCAT/aeWETH, CASHCAT/USDG, HOODRAT/aeWETH, HOODRAT/USDG (spread 16 bps, floor 16) |
 | beacon seeder gen-2 (4 Sep 2026, hook #11) | `0xb84b5d11f5be1a08b4a8439aa31f3ebd84a2e8a0` | consent-floor deposit ABI (`seedAndDeposit` takes the depositor's signed `AnchorFloor[]`) |
+| gen-4 (13 Oct 2026, JUP-698/JUP-727) | `0x3f7C2bEA8cA39E7fd1E07B63294544369ef268cC` | mixed pool/listing lane, Design E two ETH doors; retired by Gen-5 (pairs unregistered 21 Oct) |
+| gen-5 (21 Oct 2026, PR 19) | `0x44Ca381B2264d0F0173F817d42ab2a8489f968cC` | **live trusted hook** (switch 21 Oct): Gen-4 with the gas floors 250k / 200k / 100k / 30k / 500k; live limit-to-used 1.234 / 1.242 / 1.158; eight pairs (CASHCAT, HOODRAT, TENDIES, V4 x native, aeWETH) |
+| gen-6 (JUP-772, in review) | not deployed | one ETH door per token (Design E retired), native pairs from the market, pool init at registration, beacon on the first fill, opener contract; identity mined after the Gen-6 listing contracts deploy |
 
 Market `0x8eFb662F738D0f5d9f146803FD02A36c6B67e60d`, PoolManager `0x8366a39CC670B4001A1121B8F6A443A643e40951`, vendored contracts pin: see `test/real/poolparty/.vendored-from`.

@@ -47,13 +47,16 @@ contract DeployHook is Script {
         uint16 jarFeeBps = uint16(vm.envUint("JAR_FEE_BPS"));
         address listingRegistry = vm.envAddress("LISTING_REGISTRY");
         address listingSettlement = vm.envAddress("LISTING_SETTLEMENT");
+        address opener = vm.envAddress("OPENER"); // Gen-6: deployed first (DeployOpener.s.sol), code-bearing
+        require(opener.code.length != 0, "opener not deployed");
         FlowstateC1Hook hook = new FlowstateC1Hook{salt: salt}(
-            poolManager, market, owner, weth9, tokenJar, jarFeeBps, listingRegistry, listingSettlement
+            poolManager, market, owner, weth9, tokenJar, jarFeeBps, listingRegistry, listingSettlement, opener
         );
         require(address(hook) == expected, "deployed address != mined address");
 
         // quote = aeWETH (the wrapper; native-quoted V4 pools reach the same
-        // C1 pool through it), token = the inventory token.
+        // C1 pool through it), token = the inventory token. Gen-6: the registration
+        // initialises the pair's V4 pool itself (the opener), no InitPoolAndProbe step.
         hook.registerPair(Currency.wrap(weth9), Currency.wrap(pairToken), marketPool, baseSpreadBps);
         hook.setResellerCode(resellerCode);
 
