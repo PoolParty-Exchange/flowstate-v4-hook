@@ -224,6 +224,8 @@ contract FlowstateC1Hook is Ownable2Step {
     /// @dev Gas given to the opener for a pool's first-fill beacon (Gen-6), attempted only when at least
     ///      this plus the finalisation reserve is left, so a tight swap skips the beacon instead of failing.
     uint256 internal constant BEACON_GAS = 300_000;
+    /// @dev two approvals around the beacon attempt (grant this fill's spread, then zero it)
+    uint256 internal constant BEACON_APPROVAL_GAS = 30_000;
     /// @dev What this frame keeps for itself after a leg returns, beyond the finalisation reserve.
     ///      Gen-5 (20 to 21 Oct 2026): 60k to 30k; the frame's bookkeeping after a leg returns is a few thousand gas.
     ///      Gen-6 (24 Oct 2026): 30k to 20k.
@@ -562,7 +564,7 @@ contract FlowstateC1Hook is Ownable2Step {
         });
         IERC20(marketAsset).forceApprove(address(market), type(uint256).max);
         IERC20(marketAsset).forceApprove(address(listingSettlement), type(uint256).max);
-        IERC20(marketAsset).forceApprove(address(opener), type(uint256).max); // the beacon's dust (lightBeacon)
+        // no standing allowance for the opener: _lightBeacon grants exactly one fill's spread, once
         emit PairRegistered(c0, c1, marketPool, quoteIsCurrency0);
         emit BaseSpreadUpdated(c0, c1, baseSpreadBps);
         // Gen-6: the pair's V4 pool is initialised here, in the same transaction, by the opener (whose
@@ -801,11 +803,19 @@ contract FlowstateC1Hook is Ownable2Step {
     ///      fill: skipped when the budget is zero or the gas left would eat into the finalisation
     ///      reserve, and a failed attempt is caught and leaves the pool for the next fill or the seeder
     ///      periphery. Returns what was spent.
+    /// @dev The opener holds NO standing allowance (Hamish, 26 Oct 2026). The hook grants it this
+    ///      fill's spread immediately before the attempt and takes the grant back immediately after,
+    ///      success or not, so the most the opener can ever pull is one fill's spread, once per pool.
+    ///      Both approvals run outside the gas-capped call; BEACON_APPROVAL_GAS covers them in the gate.
     function _lightBeacon(PoolKey calldata key, bool payIsCurrency0, uint256 budget) internal returns (uint256 paid) {
-        if (budget == 0 || gasleft() < BEACON_GAS + GEN4_FINALIZATION_GAS_RESERVE) return 0;
+        if (budget == 0 || gasleft() < BEACON_GAS + BEACON_APPROVAL_GAS + GEN4_FINALIZATION_GAS_RESERVE) return 0;
+        Currency pay = payIsCurrency0 ? key.currency0 : key.currency1;
+        IERC20 held = IERC20(pay.isAddressZero() ? address(weth9) : Currency.unwrap(pay));
+        held.forceApprove(address(opener), budget);
         try opener.lightBeacon{gas: BEACON_GAS}(key, payIsCurrency0, budget) returns (uint256 p) {
             paid = p;
         } catch {}
+        held.forceApprove(address(opener), 0);
     }
 
     /// @dev JUP-621: pay the TokenJar its fee for this fill and return the spread the

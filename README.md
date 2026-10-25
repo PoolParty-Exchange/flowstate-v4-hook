@@ -33,7 +33,8 @@ send), and the beacon was a separate call. Gen-6:
   records the pair opened. Best effort: a refusal leaves the pool to the permissionless `opener.open`.
 - A pool's **first fill lights its visibility beacon** (JUP-516) out of the hook's own spread on that
   fill, after the jar: the opener places the one-unit position on the quote side of the tick, pulls
-  exactly what the PoolManager charges (about one wei) from the hook's allowance, unwraps it for a
+  exactly what the PoolManager charges (about one wei) from a per-fill allowance the hook grants just
+  before the attempt and zeroes just after (no standing opener allowance, 26 Oct 2026), unwraps it for a
   native pool, settles. Skipped when the spread is zero or the gas left would eat into the
   finalisation reserve (`BEACON_GAS` 300k + reserve 100k); a failed attempt is caught and never
   blocks a fill. The seeder periphery keeps working for anyone who wants a beacon before a fill.

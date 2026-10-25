@@ -904,6 +904,7 @@ contract Gen4PoolManagerIntegrationTest is Test {
         hook.setBaseSpread(Currency.wrap(address(quote)), Currency.wrap(address(token)), 16);
         bool quoteIsC0 = address(quote) < address(token);
         assertFalse(hook.beaconSeeded(key.toId()), "unlit before the first fill");
+        assertEq(quote.allowance(address(hook), address(opener)), 0, "no standing allowance to the opener after registration");
         uint256 managerBefore = quote.balanceOf(address(manager));
         uint256 swapperBefore = quote.balanceOf(swapper);
 
@@ -918,6 +919,7 @@ contract Gen4PoolManagerIntegrationTest is Test {
         // and the PoolManager is up by exactly the beacon
         assertEq(quote.balanceOf(address(hook)), hook.accruedSpreadMargin(Currency.wrap(address(quote))) + hook.accruedDust(Currency.wrap(address(quote))), "books = holdings");
         assertEq(quote.balanceOf(address(manager)), managerBefore + 1, "the manager holds the one-wei beacon and nothing else");
+        assertEq(quote.allowance(address(hook), address(opener)), 0, "the fill's grant to the opener is back to zero in the same transaction");
         uint256 marginAfterFirst = hook.accruedSpreadMargin(Currency.wrap(address(quote)));
         assertGt(marginAfterFirst, 0, "the spread still accrued");
 
@@ -961,6 +963,19 @@ contract Gen4PoolManagerIntegrationTest is Test {
         assertEq(address(hook).balance, 0, "the hook holds no native");
         assertEq(address(opener).balance, 0, "the opener holds nothing");
         assertEq(weth.balanceOf(address(hook)), hook.accruedSpreadMargin(Currency.wrap(address(weth))) + hook.accruedDust(Currency.wrap(address(weth))), "books = holdings");
+        assertEq(weth.allowance(address(hook), address(opener)), 0, "no wrapper allowance left to the opener");
+    }
+
+    function test_Beacon_OpenerNeverHoldsAStandingAllowance_MarketAndSettlementStillDo() public {
+        // the two unlimited allowances the hook has always granted stay; the opener's is gone
+        assertEq(quote.allowance(address(hook), address(market)), type(uint256).max, "market allowance unchanged");
+        assertEq(quote.allowance(address(hook), address(settlement)), type(uint256).max, "settlement allowance unchanged");
+        assertEq(quote.allowance(address(hook), address(opener)), 0, "opener: none at registration");
+        // a zero-spread fill never grants anything either
+        inventoryPool.setNode(1, 10e18, 0);
+        token.mint(address(inventoryPool), 10e18);
+        _buyExactIn(key, 1e18, 0);
+        assertEq(quote.allowance(address(hook), address(opener)), 0, "opener: none after an unlit fill");
     }
 
     function test_ExactOutputSurplusPrefundSettlesHookDelta() public {

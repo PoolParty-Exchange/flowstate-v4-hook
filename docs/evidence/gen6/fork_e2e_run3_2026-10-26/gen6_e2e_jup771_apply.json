@@ -1,0 +1,21 @@
+{
+ "libraries": {
+  "FlowstateSignedLane": "0x14aE7e4d03c2Bd7803A7A927fBA1cbfd1A5eEc73",
+  "FlowstatePassiveLane": "0x7DEe60F4164a1327b2dA84Af19bF0aA236D0a600",
+  "FlowstateBuyBack": "0x94285c5d56C98D046C43f1B5516CDa8807a6d986",
+  "FlowstateRegistrar": "0x973060d2B5948d684735825f25e59592B41EDf8E",
+  "FlowstatePoolLifecycle": "0x735c504EE5EE30033eD693977BC775157aC4a3Cf",
+  "FlowstateMarketAdmin": "0x99daF511135BCa292278545aA2DE83BF90d1A2eD",
+  "FlowstatePoolSignedLane": "0x86C3495a158D53149Ddc2396f8B543a33A3f8B68",
+  "FlowstatePoolExits": "0x8FcB7FCAB9F9868Bbf05E52175157B4E894f1E22",
+  "FlowstatePoolPriceRule": "0x848A89c4F603761C1012C02bf211b4aAA8585D28",
+  "FlowstatePoolPassiveFill": "0x2b2afDF8E529097238EAA0DFDBbDE35535bB7204"
+ },
+ "marketImpl": "0xdE2fb1C8d668de51b3e43BBb3E7dfe5319c7e2fF",
+ "poolImpl": "0xc283ac50e1590D297D01587b10754fCd0C3407e0",
+ "implBefore": "0x077Ec02DBb862Dd1Da3abaE8f87EAae77943e0bC",
+ "implAfter": "0xdE2fb1C8d668de51b3e43BBb3E7dfe5319c7e2fF",
+ "poolBefore": "0x1f201e8ea410d832863Fb8A768bE6ddF0C3D4a20",
+ "poolAfter": "0xc283ac50e1590D297D01587b10754fCd0C3407e0",
+ "block": 97912582
+}
