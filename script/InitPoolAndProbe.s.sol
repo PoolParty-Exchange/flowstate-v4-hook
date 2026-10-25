@@ -13,6 +13,10 @@ import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
+/// LEGACY (Gen-6, 25 Oct 2026): builds an aeWETH-keyed PoolKey. Gen-6 pools are
+/// NATIVE-keyed (one ETH door per token) and are initialised by the opener at
+/// registration, so this script must not be run against a Gen-6 hook; it stays only
+/// as a probe for pre-Gen-6 aeWETH pools.
 /// Phase 5 step 1: initialize the live V4 pool for a registered hook pair and
 /// prove the full path with one dust buy through a freshly deployed
 /// PoolSwapTest router. The initialization moment starts the routing

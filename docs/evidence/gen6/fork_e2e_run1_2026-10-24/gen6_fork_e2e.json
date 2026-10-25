@@ -1,0 +1,454 @@
+{
+ "startedAt": "2026-10-24T03:06:57.342Z",
+ "steps": {
+  "fork": {
+   "block": 96443002,
+   "market": "0x8eFb662F738D0f5d9f146803FD02A36c6B67e60d",
+   "cashPool": "0x1c8Fe931c9be6583d9a2E5C05712a0F6d1e4faeD",
+   "trustedHookBefore": "0x44Ca381B2264d0F0173F817d42ab2a8489f968cC"
+  },
+  "listings": {
+   "registry": "0x095482474B01216Bd7A3103EdB19998A69cBd1f0",
+   "settlement": "0x06856F8Fa6cdDE79ca8aad530dE70c03AdB4fbD6",
+   "conversionForUSDG": {
+    "ok": true,
+    "reason": 0,
+    "factor": "2384119262"
+   }
+  },
+  "hook": {
+   "hook": "0x089F1D8563a8Bc535b4e7218e7A4DfC5826E68CC",
+   "salt": "0x00000000000000000000000000000000000000000000000000000000000094ed",
+   "opener": "0xb96Deb62083f58a6C5Fd5A3b447CBFc42377e664",
+   "deployGas": "4730820",
+   "runtimeBytes": 21158
+  },
+  "safeA": [
+   {
+    "pair": "CASHCAT/native",
+    "pool": "0x1c8Fe931c9be6583d9a2E5C05712a0F6d1e4faeD",
+    "gas": "251616",
+    "poolId": "0xd01b67e4245ce617aa1da2376f8baff67e2d7434264e7371db35530cf06e19ae",
+    "sqrtPriceX96": "11857733162722136970267105106782",
+    "initialised": true,
+    "ready": true
+   },
+   {
+    "pair": "CASHCAT/USDG",
+    "pool": "0x1c8Fe931c9be6583d9a2E5C05712a0F6d1e4faeD",
+    "gas": "261661",
+    "poolId": "0xa24fb7d29b4c3cb1d8ee3294a75436af660cdcfe9fc3577edcb9cc365639a9d9",
+    "sqrtPriceX96": "26025938869944844851700",
+    "initialised": true,
+    "ready": true
+   },
+   {
+    "pair": "HOODRAT/native",
+    "pool": "0xAb5E9976Dff12d03905831816179E27c1ceA155B",
+    "gas": "192016",
+    "poolId": "0x6f16f476a56bc3937856ad7044cb3f919d1a5840a8f03133209b42d1aa10e968",
+    "sqrtPriceX96": "75443384542453027632248699366544",
+    "initialised": true,
+    "ready": true
+   },
+   {
+    "pair": "HOODRAT/USDG",
+    "pool": "0xAb5E9976Dff12d03905831816179E27c1ceA155B",
+    "gas": "201981",
+    "poolId": "0x947ce0fbc64914e5077c8e8f49f33f9dfdfc0e800c2cbc82236f3659734c8696",
+    "sqrtPriceX96": "1543731259559557102035986015787336033",
+    "initialised": true,
+    "ready": true
+   },
+   {
+    "pair": "TENDIES/native",
+    "pool": "0xa48513f462600D7E1D832DCAb90D596a30810E07",
+    "gas": "191884",
+    "poolId": "0xcd9d9d7914d51b96dc258bdc32bea81197eb56c3ab1a078b33f037af14b772a3",
+    "sqrtPriceX96": "33344388764575406837514630472229",
+    "initialised": true,
+    "ready": true
+   },
+   {
+    "pair": "TENDIES/USDG",
+    "pool": "0xa48513f462600D7E1D832DCAb90D596a30810E07",
+    "gas": "202025",
+    "poolId": "0xcdc38f616543168556ccd42ba078ad96dc21402f09c9fdb168e9f279d5ea348c",
+    "sqrtPriceX96": "9456404777838068737838",
+    "initialised": true,
+    "ready": true
+   },
+   {
+    "pair": "V4/native",
+    "pool": "0x75FC9Bc27FDCd0a762C4bb338B36C7f833481A55",
+    "gas": "191948",
+    "poolId": "0x753435a57bf7df1c401b20ea6a4e003f9df7b33ba834fa0d1f6660cb55df92a6",
+    "sqrtPriceX96": "73361640820097599696103248054355",
+    "initialised": true,
+    "ready": true
+   },
+   {
+    "pair": "V4/USDG",
+    "pool": "0x75FC9Bc27FDCd0a762C4bb338B36C7f833481A55",
+    "gas": "201949",
+    "poolId": "0xda1f14fc8d1e8f1a33501aaad989112f68e624e422dac14ef150e301895533a3",
+    "sqrtPriceX96": "1485905375713382772256811960677415394",
+    "initialised": true,
+    "ready": true
+   }
+  ],
+  "switch": {
+   "trustedHook": "0x089F1D8563a8Bc535b4e7218e7A4DfC5826E68CC",
+   "gen5PairsRetired": 8
+  },
+  "canaries": {
+   "r1": {
+    "label": "native exact-in 0.0005 ETH, FIRST fill (beacon)",
+    "gasUsed": "812788",
+    "estimate": "812824",
+    "ratio": 1,
+    "got": "12345805880600011954",
+    "spread": "399361022363",
+    "jar": "399361022365",
+    "dust": "0",
+    "beacons": 1,
+    "hookEthAfter": "0",
+    "openerEthAfter": "0"
+   },
+   "r2": {
+    "label": "native exact-in 0.0005 ETH, SECOND fill",
+    "gasUsed": "585515",
+    "estimate": "774826",
+    "ratio": 1.323,
+    "got": "12345805880600011954",
+    "spread": "399361022364",
+    "jar": "399361022365",
+    "dust": "0",
+    "beacons": 0,
+    "hookEthAfter": "0",
+    "openerEthAfter": "0"
+   },
+   "r3": {
+    "label": "USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG)",
+    "gasUsed": "972872",
+    "estimate": "972908",
+    "ratio": 1,
+    "got": "12427989045870417626",
+    "spread": "957",
+    "jar": "959",
+    "dust": "0",
+    "beacons": 1,
+    "hookEthAfter": "0",
+    "openerEthAfter": "0"
+   },
+   "r4": {
+    "label": "native exact-out 5 CASHCAT (+SWEEP of the unused value)",
+    "gasUsed": "613450",
+    "estimate": "732708",
+    "ratio": 1.194,
+    "got": "5000000000000000000",
+    "spread": "161739551969",
+    "jar": "161739551969",
+    "dust": "0",
+    "beacons": 0,
+    "hookEthAfter": "0",
+    "openerEthAfter": "0"
+   },
+   "r5": {
+    "label": "aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door",
+    "gasUsed": "617078",
+    "estimate": "840699",
+    "ratio": 1.362,
+    "got": "12345805880600011954",
+    "spread": "399361022364",
+    "jar": "399361022365",
+    "dust": "0",
+    "beacons": 0,
+    "hookEthAfter": "0",
+    "openerEthAfter": "0"
+   }
+  },
+  "split": {
+   "stock": "1917829491344549359100",
+   "over": {
+    "legTokU": "1150697694806729615460",
+    "legTokW": "1150697694806729615460",
+    "estimateError": "Error: VM Exception while processing transaction: reverted with an unrecognized custom error (return data: 0x90bfb86500000000000000000000000",
+    "status": 0,
+    "gas": null,
+    "unchanged": true
+   },
+   "within": {
+    "leg": "767131796537819743640",
+    "status": 1,
+    "gas": "1194473"
+   }
+  },
+  "newToken": {
+   "token": "0xded852De9fe9bA9b6f27f39e8e81CF851A5C79cc",
+   "pool": "0xD635d899d4358E1c00A89Eec275668cE09110ED8",
+   "createPoolGas": "1809781",
+   "floors": [
+    {
+     "asset": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+     "minRate": "938"
+    },
+    {
+     "asset": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
+     "minRate": "393922831338"
+    }
+   ]
+  }
+ },
+ "canaries": [
+  {
+   "label": "native exact-in 0.0005 ETH, FIRST fill (beacon)",
+   "gasUsed": "812788",
+   "estimate": "812824",
+   "ratio": 1,
+   "got": "12345805880600011954",
+   "spread": "399361022363",
+   "jar": "399361022365",
+   "dust": "0",
+   "beacons": 1,
+   "hookEthAfter": "0",
+   "openerEthAfter": "0"
+  },
+  {
+   "label": "native exact-in 0.0005 ETH, SECOND fill",
+   "gasUsed": "585515",
+   "estimate": "774826",
+   "ratio": 1.323,
+   "got": "12345805880600011954",
+   "spread": "399361022364",
+   "jar": "399361022365",
+   "dust": "0",
+   "beacons": 0,
+   "hookEthAfter": "0",
+   "openerEthAfter": "0"
+  },
+  {
+   "label": "USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG)",
+   "gasUsed": "972872",
+   "estimate": "972908",
+   "ratio": 1,
+   "got": "12427989045870417626",
+   "spread": "957",
+   "jar": "959",
+   "dust": "0",
+   "beacons": 1,
+   "hookEthAfter": "0",
+   "openerEthAfter": "0"
+  },
+  {
+   "label": "native exact-out 5 CASHCAT (+SWEEP of the unused value)",
+   "gasUsed": "613450",
+   "estimate": "732708",
+   "ratio": 1.194,
+   "got": "5000000000000000000",
+   "spread": "161739551969",
+   "jar": "161739551969",
+   "dust": "0",
+   "beacons": 0,
+   "hookEthAfter": "0",
+   "openerEthAfter": "0"
+  },
+  {
+   "label": "aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door",
+   "gasUsed": "617078",
+   "estimate": "840699",
+   "ratio": 1.362,
+   "got": "12345805880600011954",
+   "spread": "399361022364",
+   "jar": "399361022365",
+   "dust": "0",
+   "beacons": 0,
+   "hookEthAfter": "0",
+   "openerEthAfter": "0"
+  }
+ ],
+ "checks": [
+  {
+   "name": "[1] Gen-6 listing registry and settlement deployed and bound to each other and the market",
+   "pass": true,
+   "detail": "0x095482474B01216Bd7A3103EdB19998A69cBd1f0 / 0x06856F8Fa6cdDE79ca8aad530dE70c03AdB4fbD6"
+  },
+  {
+   "name": "[1] CASHCAT prices in USDG through the conversion leg (JUP-770 live on the fork)",
+   "pass": true,
+   "detail": "reason 0 factor 2384119262"
+  },
+  {
+   "name": "[2] opener deployed at the predicted CREATE address, bound to the mined hook",
+   "pass": true,
+   "detail": "0xb96Deb62083f58a6C5Fd5A3b447CBFc42377e664"
+  },
+  {
+   "name": "[2] Gen-6 hook at the mined CREATE2 address (flags 0x28cc), owner = the Safe, opener wired",
+   "pass": true,
+   "detail": "0x089F1D8563a8Bc535b4e7218e7A4DfC5826E68CC deploy gas 4730820"
+  },
+  {
+   "name": "[3] eight pairs registered by the Safe, eight pools initialised by the registrations (no init sends), all ready",
+   "pass": true,
+   "detail": "CASHCAT/native 251616, CASHCAT/USDG 261661, HOODRAT/native 192016, HOODRAT/USDG 201981, TENDIES/native 191884, TENDIES/USDG 202025, V4/native 191948, V4/USDG 201949"
+  },
+  {
+   "name": "[3] no aeWETH-keyed pool for CASHCAT (one ETH door)",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[3] no aeWETH-keyed pool for HOODRAT (one ETH door)",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[3] no aeWETH-keyed pool for TENDIES (one ETH door)",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[3] no aeWETH-keyed pool for V4 (one ETH door)",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[4] market.trustedHook = Gen-6",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[4] Gen-5 pairs retired by the Safe (expected eight)",
+   "pass": true,
+   "detail": "8"
+  },
+  {
+   "name": "[5] native exact-in 0.0005 ETH, FIRST fill (beacon): filled",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native exact-in 0.0005 ETH, FIRST fill (beacon): limit-to-used ratio under 1.30",
+   "pass": true,
+   "detail": "1"
+  },
+  {
+   "name": "[5] native exact-in 0.0005 ETH, FIRST fill (beacon): beacon lit on this first fill",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native exact-in 0.0005 ETH, FIRST fill (beacon): hook and opener hold no native",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native pool beacon: one unit of liquidity owned by the opener on the quote side",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native exact-in 0.0005 ETH, SECOND fill: filled",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native exact-in 0.0005 ETH, SECOND fill: limit-to-used ratio under 1.30",
+   "pass": false,
+   "detail": "1.323"
+  },
+  {
+   "name": "[5] native exact-in 0.0005 ETH, SECOND fill: beacon not lit again",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native exact-in 0.0005 ETH, SECOND fill: hook and opener hold no native",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): filled",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): limit-to-used ratio under 1.30",
+   "pass": true,
+   "detail": "1"
+  },
+  {
+   "name": "[5] USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): beacon lit on this first fill",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): hook and opener hold no native",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native exact-out 5 CASHCAT (+SWEEP of the unused value): filled",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native exact-out 5 CASHCAT (+SWEEP of the unused value): limit-to-used ratio under 1.30",
+   "pass": true,
+   "detail": "1.194"
+  },
+  {
+   "name": "[5] native exact-out 5 CASHCAT (+SWEEP of the unused value): beacon not lit again",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] native exact-out 5 CASHCAT (+SWEEP of the unused value): hook and opener hold no native",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: filled",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: limit-to-used ratio under 1.30",
+   "pass": false,
+   "detail": "1.362"
+  },
+  {
+   "name": "[5] aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: beacon not lit again",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[5] aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: hook and opener hold no native",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "name": "[6] a USDG + ETH split route that promises 120% of the stock reverts as a whole (estimate refused, transaction status 0)",
+   "pass": true,
+   "detail": "estimate: Error: VM Exception while processing transaction: reverted with an unrecognized custom error (return data: 0x90bfb86500000000000000000000000; status 0; gas null"
+  },
+  {
+   "name": "[6] after the failed split nothing moved but gas",
+   "pass": true,
+   "detail": "tokens 0, usdg 0, pool 0"
+  },
+  {
+   "name": "[6] the same split inside the stock fills both doors in one transaction",
+   "pass": true,
+   "detail": "gas 1194473"
+  },
+  {
+   "name": "[7] createPool(ROBINCAT) opened the native and USDG doors by itself: two pairs ready, two pools initialised, no aeWETH-keyed pool, no operator call",
+   "pass": true,
+   "detail": "createPool gas 1809781"
+  }
+ ],
+ "failed": true,
+ "finishedAt": "2026-10-24T03:11:27.895Z"
+}

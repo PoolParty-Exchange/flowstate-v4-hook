@@ -2,7 +2,6 @@
 pragma solidity ^0.8.26;
 
 import {Script, console2} from "forge-std/Script.sol";
-import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {FlowstateC1Hook} from "../src/FlowstateC1Hook.sol";
 
 /// Phase 4 step 2: deterministic deploy + configuration.
@@ -14,18 +13,23 @@ import {FlowstateC1Hook} from "../src/FlowstateC1Hook.sol";
 /// configuration happens.
 ///
 ///   SALT=0x.. EXPECTED_HOOK=0x.. V4_POOL_MANAGER=0x.. FS_MARKET=0x.. \
-///   HOOK_OWNER=0x.. AEWETH=0x.. PAIR_TOKEN=0x.. MARKET_POOL=0x.. \
-///   RESELLER_CODE=v4hook BASE_SPREAD_BPS=30 \
+///   HOOK_OWNER=0x.. AEWETH=0x.. TOKEN_JAR=0x.. JAR_FEE_BPS=8 \
+///   LISTING_REGISTRY=0x.. LISTING_SETTLEMENT=0x.. OPENER=0x.. \
 ///   forge script script/DeployHook.s.sol --rpc-url $RH_RPC_URL --broadcast
+///
+/// Gen-6 (25 Oct 2026, Wilko's review of PR 20): this script DEPLOYS ONLY. It no
+/// longer registers a pair or sets the reseller code: both are onlyOwner, the owner
+/// is the Safe, and the deployer is not the owner. Pair registration is Safe A of the
+/// deploy package (native + USDG quotes, never aeWETH: one ETH door per token) and
+/// each registration initialises its V4 pool through the opener. The reseller code
+/// is a Safe step too.
 ///
 /// Ops order (staging rehearsal = production runbook):
 ///   1. Register the reseller code on the MARKET first
-///      (deploy/manage-reseller.js in PoolParty_Contracts), so hook buys
-///      attribute from the first fill.
-///   2. Run this script: deploys the hook, registers the (aeWETH, token)
-///      pair against its C1 market pool, sets the reseller code.
-///   3. Initialize the V4 pool with this hook in the PoolKey (Phase 5
-///      script, next step) and observe routing.
+///      (deploy/manage-reseller.js in PoolParty_Contracts).
+///   2. DeployOpener.s.sol at the predicted nonce, then this script.
+///   3. Safe A: registerPair(native, token) and registerPair(USDG, token) per token;
+///      Safe B: setResellerCode; Safe C: market.setTrustedHook.
 contract DeployHook is Script {
     function run() external {
         bytes32 salt = vm.envBytes32("SALT");
@@ -34,11 +38,6 @@ contract DeployHook is Script {
         address market = vm.envAddress("FS_MARKET");
         address owner = vm.envAddress("HOOK_OWNER");
         address weth9 = vm.envAddress("AEWETH");
-        address pairToken = vm.envAddress("PAIR_TOKEN");
-        address marketPool = vm.envAddress("MARKET_POOL");
-        string memory resellerCode = vm.envString("RESELLER_CODE");
-        uint16 baseSpreadBps = uint16(vm.envUint("BASE_SPREAD_BPS"));
-
         vm.startBroadcast();
 
         // JUP-621: immutable TokenJar fee (Uniswap allowlist criterion). Both values are
@@ -53,17 +52,12 @@ contract DeployHook is Script {
             poolManager, market, owner, weth9, tokenJar, jarFeeBps, listingRegistry, listingSettlement, opener
         );
         require(address(hook) == expected, "deployed address != mined address");
-
-        // quote = aeWETH (the wrapper; native-quoted V4 pools reach the same
-        // C1 pool through it), token = the inventory token. Gen-6: the registration
-        // initialises the pair's V4 pool itself (the opener), no InitPoolAndProbe step.
-        hook.registerPair(Currency.wrap(weth9), Currency.wrap(pairToken), marketPool, baseSpreadBps);
-        hook.setResellerCode(resellerCode);
+        require(hook.owner() == owner, "owner mismatch");
 
         vm.stopBroadcast();
 
         console2.log("hook deployed:", address(hook));
-        console2.log("pair registered: quote aeWETH, token", pairToken, "-> market pool", marketPool);
-        console2.log("reseller code set:", resellerCode);
+        console2.log("owner (Safe):", owner);
+        console2.log("next: Safe A registerPair(native|USDG, token) per token (no aeWETH), Safe B setResellerCode, Safe C setTrustedHook");
     }
 }

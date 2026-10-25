@@ -1,0 +1,164 @@
+◇ injected env (0) from .env // tip: ⌘ enable debugging { debug: true }
+
+🔎 [VERIFICATION] The following files are being included:
+==================================================================
+   📄 FlowAccumulatorBase.sol
+   📄 FlowBridgeCollector.sol
+   📄 FlowBuyback.sol
+   📄 FlowstateDepositWrapper.sol
+   📄 FlowstateMarket.sol
+   📄 FlowstatePool.sol
+   📄 FlowstateSupplierRegistry.sol
+   📄 TimelockedBeaconController.sol
+   📄 IFlowAdapters.sol
+   📄 IFlowstateBuyFunder.sol
+   📄 IFlowstateC1Hook.sol
+   📄 IFlowstateMarketErrors.sol
+   📄 IFlowstateMarketLibrarySurface.sol
+   📄 IFlowstatePool.sol
+   📄 IFlowstatePoolErrors.sol
+   📄 IFlowstatePoolLibrarySurface.sol
+   📄 IFlowstateRegistrarView.sol
+   📄 IFlowstateSignedLane.sol
+   📄 IFlowstateSupplierRegistry.sol
+   📄 IInitializableBeaconProxy.sol
+   📄 IOracle.sol
+   📄 IOwnedPoolContract.sol
+   📄 IPartyX.sol
+   📄 IPoolParty.sol
+   📄 IPoolPartyContract.sol
+   📄 IPoolPartyEvents.sol
+   📄 IPoolPartyStaking.sol
+   📄 IPublicPoolContract.sol
+   📄 IResellerRewards.sol
+   📄 IShadowRouter.sol
+   📄 IUniswapV3FactoryMinimal.sol
+   📄 IUniswapV3PoolMinimal.sol
+   📄 IUpgradeableBeacon.sol
+   📄 BokkyPooBahsDateTimeLibrary.sol
+   📄 FlowstateBuyBack.sol
+   📄 FlowstateEvents.sol
+   📄 FlowstateFeeSplit.sol
+   📄 FlowstateMarketAdmin.sol
+   📄 FlowstateMarketCore.sol
+   📄 FlowstateMarketStorage.sol
+   📄 FlowstatePassiveLane.sol
+   📄 FlowstatePoolCore.sol
+   📄 FlowstatePoolExits.sol
+   📄 FlowstatePoolLifecycle.sol
+   📄 FlowstatePoolPassiveFill.sol
+   📄 FlowstatePoolPriceRule.sol
+   📄 FlowstatePoolSignedLane.sol
+   📄 FlowstatePoolStorage.sol
+   📄 FlowstateQuoteLib.sol
+   📄 FlowstateRegistrar.sol
+   📄 FlowstateSignedLane.sol
+   📄 FlowstateStructs.sol
+   📄 FlowstateVenueMath.sol
+   📄 Mul512Compare.sol
+   📄 PoolPartyEvents.sol
+   📄 PoolPartyLogic.sol
+   📄 PoolPartyStructs.sol
+   📄 PriceOracleAddresses.sol
+   📄 RouterAddresses.sol
+   📄 SupportedAssetsManager.sol
+   📄 UpdatePoolPartyStruct.sol
+   📄 TickMath.sol
+   📄 C1ListingRegistry.sol
+   📄 C1ListingSettlement.sol
+   📄 IListingDeps.sol
+   📄 FlowstateSlimOracle.sol
+   📄 ownedPool.sol
+   📄 InitializableBeaconProxy.sol
+   📄 publicPool.sol
+   📄 resellerCommunityRewards.sol
+   📄 resellerCommunityRewardsL2.sol
+   📄 PoolPartySwap.sol
+   📄 PoolPartyStaking.sol
+   📄 PoolPartyFrenlyBridge.sol
+   📄 IFrenlyFactory.sol
+   📄 IPoolPartyContract.sol
+   📄 IPoolPartyMain.sol
+   📄 ChainlinkPriceFeedRegistry.sol
+   📄 PriceCalculations.sol
+   📄 AdversarialERC20s.sol
+   📄 BuildBHarnessMocks.sol
+   📄 FeeSplitHarness.sol
+   📄 FlowM4Mocks.sol
+   📄 FlowstateBatchCaller.sol
+   📄 FlowstateExactPairMocks.sol
+   📄 FlowstateMarketHarness.sol
+   📄 FlowstateV2Mocks.sol
+   📄 ListingMocks.sol
+   📄 MarketLayoutProbe.sol
+   📄 MockArbSys.sol
+   📄 MockC1Hook.sol
+   📄 MockChainlinkOracle.sol
+   📄 MockERC20.sol
+   📄 MockFeeOnTransferERC20.sol
+   📄 MockGasSensitiveOracle.sol
+   📄 MockLayerZeroEndpoint.sol
+   📄 MockPartyX.sol
+   📄 MockPoolPartyMain.sol
+   📄 MockSpotOracle.sol
+   📄 MockStaking.sol
+   📄 MockStargateRouter.sol
+   📄 MockSupplierRegistry.sol
+   📄 MockUniswapRouter.sol
+   📄 MockV3FactoryMinimal.sol
+   📄 MockV3VenueRing.sol
+   📄 OracleGasProbe.sol
+   📄 PoolLayoutProbe.sol
+   📄 QuoterExecutionProver.sol
+   📄 SellSideProbe.sol
+   📄 SignedLaneMocks.sol
+   📄 SlimOracleMocks.sol
+   📄 TestBokkyPooBahsDateTime.sol
+   📄 TestChainlinkPriceFeedRegistry.sol
+   📄 TestPriceCalculations.sol
+   📄 TestPriceOracleAddresses.sol
+   📄 TestRouterAddresses.sol
+   📄 TestSupportedAssetsManager.sol
+   📄 VenueMathProbe.sol
+   📄 FlowstateMarketBaseline3485d51.sol
+   📄 FlowstateMarketBaseline40aeb85.sol
+   📄 FlowstatePoolBaseline3485d51.sol
+   📄 FlowstatePoolBaseline40aeb85.sol
+   📄 FlowstatePoolLive3485d51.sol
+   📄 IFlowstatePoolBaseline3485d51.sol
+   📄 IFlowstatePoolBaseline40aeb85.sol
+==================================================================
+
+◇ injected env (0) from .env // tip: ⌘ multiple files { path: ['.env.local', '.env'] }
+seller permit2 allowance to the settlement: 1461501637330902918203684832716283019655932542975/1795406603/0 settlement 0x06856F8Fa6cdDE79ca8aad530dE70c03AdB4fbD6 registry.settlement() 0x06856F8Fa6cdDE79ca8aad530dE70c03AdB4fbD6 now 1792814643
+deposits executable 383.56589826890987182 CASHCAT; listing state 1 id 1 available 1200.0; rate 40434887992181 wei/token
+
+== V0_250_200_100_30_500: {"attempt":"250000","legBase":"200000","reserve":"100000","listing":"500000"} (runtime 21158 bytes, baseline = deployed: true)
+   native exact-in 0.0005 ETH: used 664209, estimate 845227, ratio 1.273, got 12.345805880600011954, fills at the estimate true
+   native exact-out 5 CASHCAT + SWEEP: used 692144, estimate 803037, ratio 1.16, got 5.0, fills at the estimate true
+   USDG exact-in 1.2 USDG: used 797417, estimate 908817, ratio 1.14, got 12.427989045870417626, fills at the estimate true
+   aeWETH payer, router unwraps into the native door: used 693272, estimate 908613, ratio 1.311, got 12.345805880600011954, fills at the estimate true
+   native exact-in crossing all deposits into the listing (0.016318141893967283 ETH): used 1019876, estimate 1426321, ratio 1.399, got 402.921224310013838629, fills at the estimate true
+
+== V1_200_200_80_20_500: {"attempt":"200000","legBase":"200000","reserve":"80000","listing":"500000"} (runtime 21134 bytes)
+   native exact-in 0.0005 ETH: used 664209, estimate 813442, ratio 1.225, got 12.345805880600011954, fills at the estimate true
+   native exact-out 5 CASHCAT + SWEEP: used 692144, estimate 770591, ratio 1.113, got 5.0, fills at the estimate true
+   USDG exact-in 1.2 USDG: used 797417, estimate 876887, ratio 1.1, got 12.427989045870417626, fills at the estimate true
+   aeWETH payer, router unwraps into the native door: used 693272, estimate 876114, ratio 1.264, got 12.345805880600011954, fills at the estimate true
+   native exact-in crossing all deposits into the listing (0.016318141893967283 ETH): used 1019876, estimate 1394448, ratio 1.367, got 402.921224310013838629, fills at the estimate true
+
+== V2_150_150_80_20_500: {"attempt":"150000","legBase":"150000","reserve":"80000","listing":"500000"} (runtime 21134 bytes)
+   native exact-in 0.0005 ETH: used 664209, estimate 760249, ratio 1.145, got 12.345805880600011954, fills at the estimate true
+   native exact-out 5 CASHCAT + SWEEP: used 692144, estimate 740849, ratio 1.07, got 5.0, fills at the estimate true
+   USDG exact-in 1.2 USDG: used 797417, estimate 861312, ratio 1.08, got 12.427989045870417626, fills at the estimate true
+   aeWETH payer, router unwraps into the native door: used 693272, estimate 823303, ratio 1.188, got 12.345805880600011954, fills at the estimate true
+   native exact-in crossing all deposits into the listing (0.016318141893967283 ETH): used 1019876, estimate 1394448, ratio 1.367, got 402.921224310013838629, fills at the estimate true
+
+== V3_120_120_60_20_400: {"attempt":"120000","legBase":"120000","reserve":"60000","listing":"400000"} (runtime 21133 bytes)
+   native exact-in 0.0005 ETH: used 664209, estimate 721329, ratio 1.086, got 12.345805880600011954, fills at the estimate true
+   native exact-out 5 CASHCAT + SWEEP: used 692144, estimate 733414, ratio 1.06, got 5.0, fills at the estimate true
+   USDG exact-in 1.2 USDG: used 797417, estimate 850409, ratio 1.066, got 12.427989045870417626, fills at the estimate true
+   aeWETH payer, router unwraps into the native door: used 693272, estimate 784034, ratio 1.131, got 12.345805880600011954, fills at the estimate true
+   native exact-in crossing all deposits into the listing (0.016318141893967283 ETH): used 1019876, estimate 1266955, ratio 1.242, got 402.921224310013838629, fills at the estimate true
+
+written /private/tmp/claude-502/-Users-hamishludbrook-Documents-flowstate-workspace/b12b2a1c-6282-4ef8-b2ca-4444284e6e2f/scratchpad/gen6_e2e/gen6_ratio_probe.json

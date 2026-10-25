@@ -10,6 +10,9 @@ import {FlowstateBeaconSeeder} from "../src/FlowstateBeaconSeeder.sol";
 import {FlowstateC1Hook} from "../src/FlowstateC1Hook.sol";
 import {IWETH9} from "../src/interfaces/IWETH9.sol";
 
+/// LEGACY (Gen-6, 25 Oct 2026): builds an aeWETH-keyed PoolKey. Gen-6 pools are
+/// NATIVE-keyed and light their own beacon on the first fill; do not run this against
+/// a Gen-6 hook. Kept for pre-Gen-6 aeWETH pools and the seeder periphery.
 /// Lights a pool's visibility beacon: the single permitted liquidityDelta == 1
 /// dust add (JUP-519). The BROADCASTER pays the dust (a few wei of PAY_TOKEN)
 /// and the gas — never protocol capital; on staging the ops wallet acts as the

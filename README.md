@@ -41,8 +41,10 @@ send), and the beacon was a separate call. Gen-6:
   BEFORE the hook with a plain CREATE from the deployer, at the address its nonce gives, so the hook's
   mined CREATE2 address can carry it and it can carry the hook's address: predict the opener address,
   mine the hook with `OPENER=<predicted>`, `script/DeployOpener.s.sol` at that nonce with
-  `EXPECTED_HOOK=<mined>`, then `script/DeployHook.s.sol`. `InitPoolAndProbe.s.sol` is no longer a
-  deploy step (registration initialises); it remains a probe.
+  `EXPECTED_HOOK=<mined>`, then `script/DeployHook.s.sol`. `DeployHook.s.sol` deploys only (no
+  registration, no reseller code: both are Safe steps, and no aeWETH pair is ever registered).
+  `InitPoolAndProbe.s.sol` and `SeedBeacon.s.sol` are flagged LEGACY: they build aeWETH-keyed
+  pools and must not be run against a Gen-6 hook.
 - The six never-called IHooks stubs (afterInitialize, afterAddLiquidity, beforeRemoveLiquidity,
   afterRemoveLiquidity, beforeDonate, afterDonate) are gone for runtime size. Gen-5 24,040 bytes;
   Gen-6 21,158 after Design E's removal (3,418 under EIP-170). The PoolManager never calls an

@@ -1,0 +1,163 @@
+◇ injected env (0) from .env // tip: ◈ secrets for agents [www.dotenvx.com]
+
+🔎 [VERIFICATION] The following files are being included:
+==================================================================
+   📄 FlowAccumulatorBase.sol
+   📄 FlowBridgeCollector.sol
+   📄 FlowBuyback.sol
+   📄 FlowstateDepositWrapper.sol
+   📄 FlowstateMarket.sol
+   📄 FlowstatePool.sol
+   📄 FlowstateSupplierRegistry.sol
+   📄 TimelockedBeaconController.sol
+   📄 IFlowAdapters.sol
+   📄 IFlowstateBuyFunder.sol
+   📄 IFlowstateC1Hook.sol
+   📄 IFlowstateMarketErrors.sol
+   📄 IFlowstateMarketLibrarySurface.sol
+   📄 IFlowstatePool.sol
+   📄 IFlowstatePoolErrors.sol
+   📄 IFlowstatePoolLibrarySurface.sol
+   📄 IFlowstateRegistrarView.sol
+   📄 IFlowstateSignedLane.sol
+   📄 IFlowstateSupplierRegistry.sol
+   📄 IInitializableBeaconProxy.sol
+   📄 IOracle.sol
+   📄 IOwnedPoolContract.sol
+   📄 IPartyX.sol
+   📄 IPoolParty.sol
+   📄 IPoolPartyContract.sol
+   📄 IPoolPartyEvents.sol
+   📄 IPoolPartyStaking.sol
+   📄 IPublicPoolContract.sol
+   📄 IResellerRewards.sol
+   📄 IShadowRouter.sol
+   📄 IUniswapV3FactoryMinimal.sol
+   📄 IUniswapV3PoolMinimal.sol
+   📄 IUpgradeableBeacon.sol
+   📄 BokkyPooBahsDateTimeLibrary.sol
+   📄 FlowstateBuyBack.sol
+   📄 FlowstateEvents.sol
+   📄 FlowstateFeeSplit.sol
+   📄 FlowstateMarketAdmin.sol
+   📄 FlowstateMarketCore.sol
+   📄 FlowstateMarketStorage.sol
+   📄 FlowstatePassiveLane.sol
+   📄 FlowstatePoolCore.sol
+   📄 FlowstatePoolExits.sol
+   📄 FlowstatePoolLifecycle.sol
+   📄 FlowstatePoolPassiveFill.sol
+   📄 FlowstatePoolPriceRule.sol
+   📄 FlowstatePoolSignedLane.sol
+   📄 FlowstatePoolStorage.sol
+   📄 FlowstateQuoteLib.sol
+   📄 FlowstateRegistrar.sol
+   📄 FlowstateSignedLane.sol
+   📄 FlowstateStructs.sol
+   📄 FlowstateVenueMath.sol
+   📄 Mul512Compare.sol
+   📄 PoolPartyEvents.sol
+   📄 PoolPartyLogic.sol
+   📄 PoolPartyStructs.sol
+   📄 PriceOracleAddresses.sol
+   📄 RouterAddresses.sol
+   📄 SupportedAssetsManager.sol
+   📄 UpdatePoolPartyStruct.sol
+   📄 TickMath.sol
+   📄 C1ListingRegistry.sol
+   📄 C1ListingSettlement.sol
+   📄 IListingDeps.sol
+   📄 FlowstateSlimOracle.sol
+   📄 ownedPool.sol
+   📄 InitializableBeaconProxy.sol
+   📄 publicPool.sol
+   📄 resellerCommunityRewards.sol
+   📄 resellerCommunityRewardsL2.sol
+   📄 PoolPartySwap.sol
+   📄 PoolPartyStaking.sol
+   📄 PoolPartyFrenlyBridge.sol
+   📄 IFrenlyFactory.sol
+   📄 IPoolPartyContract.sol
+   📄 IPoolPartyMain.sol
+   📄 ChainlinkPriceFeedRegistry.sol
+   📄 PriceCalculations.sol
+   📄 AdversarialERC20s.sol
+   📄 BuildBHarnessMocks.sol
+   📄 FeeSplitHarness.sol
+   📄 FlowM4Mocks.sol
+   📄 FlowstateBatchCaller.sol
+   📄 FlowstateExactPairMocks.sol
+   📄 FlowstateMarketHarness.sol
+   📄 FlowstateV2Mocks.sol
+   📄 ListingMocks.sol
+   📄 MarketLayoutProbe.sol
+   📄 MockArbSys.sol
+   📄 MockC1Hook.sol
+   📄 MockChainlinkOracle.sol
+   📄 MockERC20.sol
+   📄 MockFeeOnTransferERC20.sol
+   📄 MockGasSensitiveOracle.sol
+   📄 MockLayerZeroEndpoint.sol
+   📄 MockPartyX.sol
+   📄 MockPoolPartyMain.sol
+   📄 MockSpotOracle.sol
+   📄 MockStaking.sol
+   📄 MockStargateRouter.sol
+   📄 MockSupplierRegistry.sol
+   📄 MockUniswapRouter.sol
+   📄 MockV3FactoryMinimal.sol
+   📄 MockV3VenueRing.sol
+   📄 OracleGasProbe.sol
+   📄 PoolLayoutProbe.sol
+   📄 QuoterExecutionProver.sol
+   📄 SellSideProbe.sol
+   📄 SignedLaneMocks.sol
+   📄 SlimOracleMocks.sol
+   📄 TestBokkyPooBahsDateTime.sol
+   📄 TestChainlinkPriceFeedRegistry.sol
+   📄 TestPriceCalculations.sol
+   📄 TestPriceOracleAddresses.sol
+   📄 TestRouterAddresses.sol
+   📄 TestSupportedAssetsManager.sol
+   📄 VenueMathProbe.sol
+   📄 FlowstateMarketBaseline3485d51.sol
+   📄 FlowstateMarketBaseline40aeb85.sol
+   📄 FlowstatePoolBaseline3485d51.sol
+   📄 FlowstatePoolBaseline40aeb85.sol
+   📄 FlowstatePoolLive3485d51.sol
+   📄 IFlowstatePoolBaseline3485d51.sol
+   📄 IFlowstatePoolBaseline40aeb85.sol
+==================================================================
+
+◇ injected env (0) from .env // tip: ⌘ suppress logs { quiet: true }
+   manifest jup-771: FlowstateSignedLane 10422 bytes
+   manifest jup-771: FlowstatePassiveLane 6538 bytes
+   manifest jup-771: FlowstateBuyBack 2934 bytes
+   manifest jup-771: FlowstateRegistrar 19030 bytes
+   manifest jup-771: FlowstatePoolLifecycle 7690 bytes, links FlowstateRegistrar
+   manifest jup-771: FlowstateMarketAdmin 7661 bytes
+   manifest jup-771: FlowstatePoolSignedLane 9482 bytes
+   manifest jup-771: FlowstatePoolExits 3908 bytes
+   manifest jup-771: FlowstatePoolPriceRule 9443 bytes
+   manifest jup-771: FlowstatePoolPassiveFill 6149 bytes
+   manifest jup-771: FlowstatePool 23910 bytes, links FlowstatePoolExits, FlowstatePoolPassiveFill, FlowstatePoolPriceRule, FlowstatePoolSignedLane
+   manifest jup-771: FlowstateMarket 23431 bytes, links FlowstateBuyBack, FlowstateMarketAdmin, FlowstatePassiveLane, FlowstatePoolLifecycle, FlowstateRegistrar, FlowstateSignedLane
+   manifest jup-771: FlowstateSupplierRegistry 7504 bytes
+   manifest jup-771: FlowstateDepositWrapper 2238 bytes
+   manifest jup-771: C1ListingRegistry 23216 bytes
+   manifest jup-771: C1ListingSettlement 24446 bytes
+   library FlowstateSignedLane at 0x14aE7e4d03c2Bd7803A7A927fBA1cbfd1A5eEc73
+   library FlowstatePassiveLane at 0x7DEe60F4164a1327b2dA84Af19bF0aA236D0a600
+   library FlowstateBuyBack at 0x94285c5d56C98D046C43f1B5516CDa8807a6d986
+   library FlowstateRegistrar at 0x973060d2B5948d684735825f25e59592B41EDf8E
+   library FlowstatePoolLifecycle at 0x735c504EE5EE30033eD693977BC775157aC4a3Cf
+   library FlowstateMarketAdmin at 0x99daF511135BCa292278545aA2DE83BF90d1A2eD
+   library FlowstatePoolSignedLane at 0x86C3495a158D53149Ddc2396f8B543a33A3f8B68
+   library FlowstatePoolExits at 0x8FcB7FCAB9F9868Bbf05E52175157B4E894f1E22
+   library FlowstatePoolPriceRule at 0x848A89c4F603761C1012C02bf211b4aAA8585D28
+   library FlowstatePoolPassiveFill at 0x2b2afDF8E529097238EAA0DFDBbDE35535bB7204
+   FlowstatePool implementation 0xc283ac50e1590D297D01587b10754fCd0C3407e0: exact runtime and embedded libraries match the manifest
+   FlowstateMarket implementation 0xdE2fb1C8d668de51b3e43BBb3E7dfe5319c7e2fF: exact runtime and embedded libraries match the manifest
+   market impl 0x077Ec02DBb862Dd1Da3abaE8f87EAae77943e0bC -> 0xdE2fb1C8d668de51b3e43BBb3E7dfe5319c7e2fF; pool impl 0x1f201e8ea410d832863Fb8A768bE6ddF0C3D4a20 -> 0xc283ac50e1590D297D01587b10754fCd0C3407e0; executeBatch gas 87452
+   CASHCAT pool: laneForceClosed false, passiveOpen true, poolPaused true
+JUP-771 APPLIED ON THE FORK
