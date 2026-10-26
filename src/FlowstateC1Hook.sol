@@ -17,6 +17,7 @@ import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeE
 import {IFlowstateMarketMinimal} from "./interfaces/IFlowstateMarketMinimal.sol";
 import {IWETH9} from "./interfaces/IWETH9.sol";
 import {IGen4ListingRegistry, IGen4ListingSettlement, IGen4Pool} from "./interfaces/IGen4Inventory.sol";
+import {IFlowstatePoolOpener} from "./interfaces/IFlowstatePoolOpener.sol";
 import {Gen4Queue} from "./libraries/Gen4Queue.sol";
 import {Gen4Accounting} from "./libraries/Gen4Accounting.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
@@ -44,7 +45,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///
 ///      Address flags must be 0x28cc: BEFORE_INITIALIZE | BEFORE_ADD_LIQUIDITY |
 ///      BEFORE_SWAP | AFTER_SWAP | BEFORE_SWAP_RETURNS_DELTA | AFTER_SWAP_RETURNS_DELTA.
-contract FlowstateC1Hook is IHooks, Ownable2Step {
+contract FlowstateC1Hook is Ownable2Step {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
     using SafeCast for int256;
@@ -55,13 +56,12 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
 
     error NotPoolManager();
     error NotMarket();
-    error HookNotImplemented();
     error ZeroAddress();
     error PairNotRegistered();
     error LpFeeMustBeZero();
     error LiquidityNotAllowed();
     error SellDirectionNotSupported();
-    error NativeQuoteUnsupported(); // registerPair with a native quote on a chain with no weth9 configured
+    error NativeQuoteUnsupported(); // a native quote on a chain with no weth9 configured (Gen-6: the market may register native pairs)
     error MarketStateUnverifiable();
     error MarketPoolNotRecognized(address marketPool);
     error MarketInventoryMismatch(address marketPool, address expectedInventory, address actualInventory);
@@ -77,6 +77,7 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     error SweepDestinationNotSet();
     error EthSweepFailed();
     error ListingWiringMismatch(address registry, address settlement);
+    error OpenerWiringMismatch(address opener); // Gen-6: the opener must name this hook, this PoolManager and this wrapper
     error ListingMarketMismatch(address expected, address registryMarket, address settlementMarket);
     error CandidateInspectionFailed(uint8 source);
     error UnexpectedListingOutcome(uint8 outcome);
@@ -89,7 +90,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///      STOP_*. Nothing is ever handed back, so nothing can be left in a router.
     error ExactInputShortfall(uint256 filled, uint256 wanted, uint8 reason);
     error TickSpacingNotCanonical(int24 tickSpacing);
-    error InvalidShare(uint16 bps);
 
     // -------------------------------------------------------------------------
     // Immutable wiring
@@ -130,6 +130,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     IGen4ListingRegistry public immutable listingRegistry;
     IGen4ListingSettlement public immutable listingSettlement;
 
+    /// @notice Gen-6 (JUP-772, 24 Oct 2026): the hook's door opener. Registering a pair initialises its
+    ///         V4 pool through it, and a pool's first fill lights the visibility beacon through it, out
+    ///         of the hook's own spread on that fill. Immutable, code-bearing, the hook is its only
+    ///         paying caller. It exists as a separate contract only because the hook's runtime has no
+    ///         room left under EIP-170.
+    IFlowstatePoolOpener public immutable opener;
+
     // -------------------------------------------------------------------------
     // Constants
     // -------------------------------------------------------------------------
@@ -151,7 +158,12 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///      Gen-5 (20 to 21 Oct 2026): 200k to 100k. Uniswap's router allowlist requires a gas limit under 130% of
     ///      execution; the deployed Gen-4 needed 1.85x (estimateGas 1,427,945 against 768,570 used, live canary).
     ///      100k is 2.5x the measured 40k finalisation. Fork evidence: deployment-ledger/gen4_gas_limit_2026-10-20.
-    uint256 public constant GEN4_FINALIZATION_GAS_RESERVE = 100_000;
+    ///      Gen-6 (24 Oct 2026, Hamish's call after the fork probe): 100k to 60k, 1.5x the measured 40k finalisation.
+    ///      Gen-6 fills cost about 100k less than Gen-5's (Design E's work is gone) while these gates set the required
+    ///      limit, so the limit-to-used ratio rose to 1.32 to 1.40 on the fork under the Gen-5 set; the chosen set measured
+    ///      1.09 / 1.06 / 1.07 / 1.13 / 1.24 on native in, native out, USDG in, an aeWETH payer unwrapped by the router,
+    ///      and a deposits-plus-listing fill (deployment-ledger GEN6_IMPACT_2026-10-24.md, section 7).
+    uint256 public constant GEN4_FINALIZATION_GAS_RESERVE = 60_000;
     /// @notice Below reserve + this before an attempt, the walk stops and the swap reverts (exact
     ///         input and exact output alike; nothing is ever handed back). A courtesy stop sized from measurement, not a
     ///         guarantee: on the pinned stack the per-attempt reads (peek, tokenQueueEnds, queue,
@@ -164,7 +176,10 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///      the required limit measured 1.11x to 1.23x of execution across the three canary shapes and both
     ///      pricing branches (fork, 21 Oct); the 300k first draft measured 1.25x to 1.31x because the CLEAR
     ///      branch executes 50k to 70k cheaper than CATCH_UP while the required limit barely moves.
-    uint256 public constant GEN4_MIN_ATTEMPT_GAS = 250_000;
+    ///      Gen-6 (24 Oct 2026): 250k to 120k; the gate before an attempt is now reserve + 120k = 180k against the roughly
+    ///      150k the pre-attempt reads cost on the fork. Still a courtesy stop: an under-gassed leg is caught and the swap
+    ///      reverts, all or nothing.
+    uint256 public constant GEN4_MIN_ATTEMPT_GAS = 120_000;
     /// @notice Pool leg planning, from EXECUTION gas (eth_estimateGas, before end-of-transaction
     ///         refunds) of the market's bounded buy on the pinned stack
     ///         (test/stack/exec-gas-probe.test.cjs): 326k base + 55.7k per node plain; 414k base +
@@ -180,7 +195,10 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///      a leg planned with only the floor can run short on a cold oracle read, is caught, and the swap reverts
     ///      atomically (availability at a tight gas limit, not safety). Lowering it only changes how many nodes a
     ///      leg is planned for at a given gas budget.
-    uint256 public constant GEN4_POOL_LEG_BASE_GAS = 200_000;
+    ///      Gen-6 (24 Oct 2026): 200k to 120k. The planning base is the larger of this floor and what the market's maxBuy
+    ///      cost in the same swap, so the floor binds only when that read was cheaper than a leg; a leg that then runs
+    ///      short is caught and the swap reverts atomically.
+    uint256 public constant GEN4_POOL_LEG_BASE_GAS = 120_000;
     uint256 public constant GEN4_POOL_NODE_GAS = 65_000;
     uint256 public constant GEN4_POOL_NODE_GAS_RECYCLED = 125_000;
     uint256 public constant GEN4_POOL_NODE_GAS_ATTRIBUTED = 220_000;
@@ -196,12 +214,22 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///      listing-leg range (335k to 542k, attribution on), below its maximum, so a leg that is started with only the
     ///      floor can still run out of gas on the largest listings; that leg is caught and the swap reverts atomically
     ///      (no partial fill), so the floor trades availability at a tight gas limit for the routing ratio, nothing more.
-    uint256 public constant GEN4_LISTING_LEG_MIN_GAS = 500_000;
+    ///      Gen-6 (24 Oct 2026): 500k to 400k. This floor alone decides the deposits-plus-listing shape: 500k pinned it at
+    ///      1.37 whatever the other four did, 400k brought it to 1.24. 400k sits inside the measured listing-leg range
+    ///      (335k to 542k, attribution on), so the largest listing legs can start under-gassed; such a leg is caught and
+    ///      the swap reverts atomically (availability at a tight limit, never a partial fill).
+    uint256 public constant GEN4_LISTING_LEG_MIN_GAS = 400_000;
     /// @notice Upper bound on the gas forwarded to one leg.
     uint256 public constant GEN4_MAX_LEG_GAS = 10_000_000;
+    /// @dev Gas given to the opener for a pool's first-fill beacon (Gen-6), attempted only when at least
+    ///      this plus the finalisation reserve is left, so a tight swap skips the beacon instead of failing.
+    uint256 internal constant BEACON_GAS = 300_000;
+    /// @dev two approvals around the beacon attempt (grant this fill's spread, then zero it)
+    uint256 internal constant BEACON_APPROVAL_GAS = 30_000;
     /// @dev What this frame keeps for itself after a leg returns, beyond the finalisation reserve.
     ///      Gen-5 (20 to 21 Oct 2026): 60k to 30k; the frame's bookkeeping after a leg returns is a few thousand gas.
-    uint256 internal constant GEN4_LEG_RETURN_GAS = 30_000;
+    ///      Gen-6 (24 Oct 2026): 30k to 20k.
+    uint256 internal constant GEN4_LEG_RETURN_GAS = 20_000;
     /// @dev Caps on the queue and listing reads, whose cost is bounded by the 50-node window and
     ///      the registry's own walk bounds (measured cold: peek 90k, tokenQueueEnds 16k, queue 477k).
     ///      maxBuy and price are not held to this cap: they run the venue evaluation, whose cost grows
@@ -219,14 +247,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     /// @notice The one tick spacing a pool of a registered pair may use (every live gen-3 door): one
     ///         V4 pool per pair, so no route can count the same stock twice (WSR F5 pass, 27 Sep 2026).
     int24 public constant CANONICAL_TICK_SPACING = 60;
-    /// @notice Native-ETH share of a C1 pool's deposits while both ETH V4 pools of a token are open,
-    ///         until the owner sets one (nativeShareBps). Design E (29 Sep 2026): see _doorRole.
-    uint16 public constant DEFAULT_NATIVE_SHARE_BPS = 8_000;
-    uint8 internal constant DOOR_FREE = 0; // not one of two open ETH pools: sells everything, uncapped
-    uint8 internal constant DOOR_MAIN = 1; // sells every listing, uncapped, plus the main share of deposits
-    uint8 internal constant DOOR_SECOND = 2; // sells only its share of deposits, never listings
-    uint256 internal constant NOTE_QUEUE_TAG = 8; // first transient tag of the noted queue (_noteQueue)
-    uint256 internal constant CREDIT_TAG = 1 << 64; // plus a listing position: the main door's credit used there
     uint256 internal constant GEN4_QUEUE_READ_GAS_LIMIT = 1_000_000;
 
     uint8 internal constant LISTING_EMPTY = 0;
@@ -352,16 +372,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     ///         UniswapX executor margins sweep to today).
     address public sweepDestination;
 
-    /// @notice Per C1 pool: the native-ETH V4 pool's share of deposits while both ETH V4 pools of the
-    ///         token are open (0 = DEFAULT_NATIVE_SHARE_BPS). At 5,000 or more the native pool is the
-    ///         main door; below 5,000 the aeWETH pool is. 10,000 = native only: the aeWETH pool sells
-    ///         nothing. Listings are always sold through the main door alone (_doorRole).
-    mapping(address marketPool => uint16 bps) public nativeShareBps;
-
-    /// @dev Pairs whose V4 pool has been initialised on this hook (set in beforeInitialize; a V4 pool
-    ///      cannot be un-initialised, so this survives unregisterPair). A sibling counts only once open.
-    mapping(bytes32 pairKey => bool) internal _pairOpened;
-
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
@@ -385,7 +395,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         uint256 dustAccrued
     );
     event BeaconSeeded(PoolId indexed poolId, address indexed sender);
-    event NativeShareSet(address indexed marketPool, uint16 bps);
     event BaseSpreadUpdated(Currency indexed currency0, Currency indexed currency1, uint16 baseSpreadBps);
     event BaseSpreadFloorUpdated(uint16 previous, uint16 current);
     event MarketRegistrationSpreadUpdated(uint16 previous, uint16 current);
@@ -414,7 +423,8 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         address _tokenJar,
         uint16 _jarFeeBps,
         address _listingRegistry,
-        address _listingSettlement
+        address _listingSettlement,
+        address _opener
     ) Ownable(_owner) {
         if (_poolManager == address(0) || _market == address(0) || _tokenJar == address(0)) revert ZeroAddress();
         if (_market.code.length == 0) revert ZeroAddress();
@@ -446,9 +456,18 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         }
         listingRegistry = IGen4ListingRegistry(_listingRegistry);
         listingSettlement = IGen4ListingSettlement(_listingSettlement);
+        // Gen-6 (Robin pass, 24 Oct 2026): the hook grants the opener an allowance on every market asset, so
+        // a code-bearing address is not enough: the opener must be bound to THIS hook, manager and wrapper
+        if (_opener.code.length == 0) revert ZeroAddress();
+        if (
+            address(IFlowstatePoolOpener(_opener).hook()) != address(this)
+                || address(IFlowstatePoolOpener(_opener).poolManager()) != _poolManager
+                || address(IFlowstatePoolOpener(_opener).weth9()) != _weth9
+        ) revert OpenerWiringMismatch(_opener);
+        opener = IFlowstatePoolOpener(_opener);
 
         Hooks.validateHookPermissions(
-            this,
+            IHooks(address(this)),
             Hooks.Permissions({
                 beforeInitialize: true,
                 afterInitialize: false,
@@ -492,22 +511,34 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         _registerPair(quote, token, marketPool, baseSpreadBps);
     }
 
-    /// @notice Market-trusted auto-registration fired inside createPool (JUP-587;
-    ///         Wilko GO 24 Aug: deliberately narrow — no venue discovery, no oracle
-    ///         feed work, ERC-20 quotes only). IDEMPOTENT: an already-registered
-    ///         pair is left untouched, however it is tuned, so a market call can
-    ///         never clobber owner configuration. Spread = the configured market
-    ///         registration spread, floored at baseSpreadFloorBps so a later floor
-    ///         raise degrades to a wider spread instead of a createPool-time revert.
+    /// @notice Market-trusted auto-registration fired inside createPool (JUP-587; Wilko GO 24 Aug:
+    ///         no venue discovery, no oracle feed work). IDEMPOTENT: an already-registered pair is
+    ///         left untouched, however it is tuned, so a market call can never clobber owner
+    ///         configuration. Spread = the configured market registration spread, floored at
+    ///         baseSpreadFloorBps so a later floor raise degrades to a wider spread instead of a
+    ///         createPool-time revert.
+    ///         Gen-6 (JUP-772, Hamish 24 Oct 2026): ONE ETH door per token. The market registering the
+    ///         wrapper's pair opens the token's NATIVE-ETH pair instead (the market asset stays the
+    ///         wrapper): routers wrap and unwrap at the edges themselves (Uniswap and Kyber measured 23
+    ///         and 24 Oct 2026), and one ETH pool means no route can split an ETH buy across two doors.
+    ///         Each registration initialises its V4 pool (_registerPair). No Safe call and no operator
+    ///         transaction is left on the Uniswap side of a new token.
     function registerPairFromMarket(Currency quote, Currency token, address marketPool) external {
         if (msg.sender != address(market)) revert NotMarket();
-        if (quote.isAddressZero()) revert NativeQuoteUnsupported();
         if (marketPool == address(0)) revert ZeroAddress();
-        (Currency s0, Currency s1) = _sort(quote, token);
-        if (pairs[_pairKey(s0, s1)].registered) return;
         uint16 spread = marketRegistrationSpreadBps;
         uint16 floor = baseSpreadFloorBps;
         if (spread < floor) spread = floor;
+        if (Currency.unwrap(quote) == address(weth9) && address(weth9) != address(0)) {
+            _registerIfNew(Currency.wrap(address(0)), token, marketPool, spread);
+            return;
+        }
+        _registerIfNew(quote, token, marketPool, spread);
+    }
+
+    function _registerIfNew(Currency quote, Currency token, address marketPool, uint16 spread) internal {
+        (Currency s0, Currency s1) = _sort(quote, token);
+        if (pairs[_pairKey(s0, s1)].registered) return;
         _registerPair(quote, token, marketPool, spread);
     }
 
@@ -533,16 +564,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         });
         IERC20(marketAsset).forceApprove(address(market), type(uint256).max);
         IERC20(marketAsset).forceApprove(address(listingSettlement), type(uint256).max);
+        // no standing allowance for the opener: _lightBeacon grants exactly one fill's spread, once
         emit PairRegistered(c0, c1, marketPool, quoteIsCurrency0);
         emit BaseSpreadUpdated(c0, c1, baseSpreadBps);
-    }
-
-    /// @notice Set the native-ETH V4 pool's share of a C1 pool's deposits (see nativeShareBps):
-    ///         0 restores the default, 10,000 = native only, below 5,000 makes aeWETH the main door.
-    function setNativeShare(address marketPool, uint16 bps) external onlyOwner {
-        if (bps > BPS_DENOMINATOR) revert InvalidShare(bps);
-        nativeShareBps[marketPool] = bps;
-        emit NativeShareSet(marketPool, bps);
+        // Gen-6: the pair's V4 pool is initialised here, in the same transaction, by the opener (whose
+        // initialize call runs this hook's beforeInitialize gate). Best effort: a refusal leaves the pool
+        // to the permissionless opener.open / PoolManager.initialize.
+        try opener.open(quote, token) {} catch {}
     }
 
     function unregisterPair(Currency currencyA, Currency currencyB) external onlyOwner {
@@ -697,17 +725,17 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     // Hook callbacks — implemented
     // -------------------------------------------------------------------------
 
-    function beforeInitialize(address, PoolKey calldata key, uint160) external onlyPoolManager returns (bytes4) {
+    function beforeInitialize(address, PoolKey calldata key, uint160) external view onlyPoolManager returns (bytes4) {
         if (key.fee != 0) revert LpFeeMustBeZero();
         if (key.tickSpacing != CANONICAL_TICK_SPACING) revert TickSpacingNotCanonical(key.tickSpacing);
         bytes32 k = _pairKey(key.currency0, key.currency1);
         _requirePairReady(pairs[k], key.currency0, key.currency1);
-        _pairOpened[k] = true;
         return IHooks.beforeInitialize.selector;
     }
 
     /// @notice Visibility beacon gate (JUP-516): admits exactly ONE liquidityDelta == 1
-    ///         add per pool, from any caller, then closes that pool forever. The
+    ///         add per pool, from any caller (Gen-6: the opener, on the pool's first fill, is the
+    ///         usual one; the seeder periphery and anyone else can still go first), then closes that pool forever. The
     ///         ModifyLiquidity event this permits is the measured key into GMGN's
     ///         routing index. Everything else about the original stray-LP protection
     ///         survives: no position of real size can ever be created (delta capped at
@@ -758,12 +786,36 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         // every spread setter). Paid before the margin is booked, in the asset the hook
         // is holding (the wrapper for a native quote), inside the swap itself.
         f.spreadAccrued = _payJar(key.toId(), input, f.costBase, f.spreadAccrued);
+        // Gen-6: a pool's first fill lights its visibility beacon out of the hook's own spread on this
+        // fill (after the jar); the buyer's price and amounts are already fixed above
+        if (!beaconSeeded[key.toId()]) f.spreadAccrued -= _lightBeacon(key, cfg.quoteIsCurrency0, f.spreadAccrued);
         Currency heldInput = input.isAddressZero() ? Currency.wrap(address(weth9)) : input;
         if (f.spreadAccrued != 0) accruedSpreadMargin[heldInput] += f.spreadAccrued;
         if (f.dustAccrued != 0) accruedDust[heldInput] += f.dustAccrued;
 
         emit BuyExecuted(key.toId(), quote, output, f.quoteIn, f.tokensOut, exactInput, f.spreadAccrued, f.dustAccrued);
         return (IHooks.beforeSwap.selector, f.hookDelta, 0);
+    }
+
+    /// @dev Gen-6 (JUP-772): light the pool's beacon through the opener, which takes at most `budget` of
+    ///      the asset the hook holds for this quote (the wrapper for a native quote; the opener unwraps
+    ///      what the pool owes in native), the hook's own spread and dust on this fill. Never blocks a
+    ///      fill: skipped when the budget is zero or the gas left would eat into the finalisation
+    ///      reserve, and a failed attempt is caught and leaves the pool for the next fill or the seeder
+    ///      periphery. Returns what was spent.
+    /// @dev The opener holds NO standing allowance (Hamish, 26 Oct 2026). The hook grants it this
+    ///      fill's spread immediately before the attempt and takes the grant back immediately after,
+    ///      success or not, so the most the opener can ever pull is one fill's spread, once per pool.
+    ///      Both approvals run outside the gas-capped call; BEACON_APPROVAL_GAS covers them in the gate.
+    function _lightBeacon(PoolKey calldata key, bool payIsCurrency0, uint256 budget) internal returns (uint256 paid) {
+        if (budget == 0 || gasleft() < BEACON_GAS + BEACON_APPROVAL_GAS + GEN4_FINALIZATION_GAS_RESERVE) return 0;
+        Currency pay = payIsCurrency0 ? key.currency0 : key.currency1;
+        IERC20 held = IERC20(pay.isAddressZero() ? address(weth9) : Currency.unwrap(pay));
+        held.forceApprove(address(opener), budget);
+        try opener.lightBeacon{gas: BEACON_GAS}(key, payIsCurrency0, budget) returns (uint256 p) {
+            paid = p;
+        } catch {}
+        held.forceApprove(address(opener), 0);
     }
 
     /// @dev JUP-621: pay the TokenJar its fee for this fill and return the spread the
@@ -817,7 +869,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         uint256 retired;
         uint8 stop;
         uint256 nodeGas = _poolNodeGas(cfg);
-        (uint8 role, uint256 secondBps) = _doorRole(cfg, input, output);
 
         while (true) {
             uint256 remainingBudget = budget - (totals.poolQuote + totals.listingQuote);
@@ -830,15 +881,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
                 stop = STOP_GAS;
                 break;
             }
-            // the second door of two open ETH pools never sells listings, so it never reads them
-            ListingCandidate memory listing;
-            if (role != DOOR_SECOND) listing = _inspectListing(token);
+            ListingCandidate memory listing = _inspectListing(token);
             PoolCandidate memory pool = _inspectPool(cfg, listing);
             if (pool.readFailed) {
                 stop = STOP_READ;
                 break;
             }
-            (uint256 poolCap, Gen4Queue.Source source) = _plan(cfg, input, role, secondBps, listing, pool, priceRate);
+            (uint256 poolCap, Gen4Queue.Source source) = _plan(listing, pool);
             if (source == Gen4Queue.Source.None) {
                 stop = STOP_STOCK;
                 break;
@@ -864,9 +913,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
                 }
                 if (sized < poolCap) poolCap = sized;
                 uint256 amount = _affordable(poolCap, remainingBudget, priceRate);
-                // recorded before the leg, so a swap nested inside it sees it; corrected after
-                _recordShareSale(cfg, input, amount, 0);
-                _useCredit(cfg, listing, pool, amount, 0);
                 // A leg that reverts or runs out of gas is rolled back inside the market; the walk
                 // stops and the final check reverts the swap. Gas is re-read at the call (Robin pass 57).
                 try market.buyFromPoolBounded{gas: _legGas()}(
@@ -879,8 +925,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
                     0,
                     0
                 ) returns (uint256 poolTokens, uint256 poolQuote) {
-                    _recordShareSale(cfg, input, poolTokens, amount);
-                    _useCredit(cfg, listing, pool, poolTokens, amount);
                     if (poolTokens == 0) {
                         stop = STOP_STOCK;
                         break;
@@ -965,17 +1009,15 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         uint256 nodeGas = _poolNodeGas(cfg);
         (bool priceRead, uint8 priceWhy, uint256 priceRate) = _readPrice(token, cfg.marketAsset);
         if (!priceRead) revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
-        (uint8 role, uint256 secondBps) = _doorRole(cfg, input, output);
 
         // a closed swap route (priceWhy != 0) sells nothing: the shortfall check below reverts
         while (priceWhy == 0 && Gen4Accounting.remainingOutput(totals, target) != 0 && attempts < GEN4_MAX_ATTEMPTS) {
             uint256 requiredGas = GEN4_FINALIZATION_GAS_RESERVE + GEN4_MIN_ATTEMPT_GAS;
             if (gasleft() < requiredGas) revert Gen4InsufficientGas(gasleft(), requiredGas);
-            ListingCandidate memory listing;
-            if (role != DOOR_SECOND) listing = _inspectListing(token);
+            ListingCandidate memory listing = _inspectListing(token);
             PoolCandidate memory pool = _inspectPool(cfg, listing);
             if (pool.readFailed) revert CandidateInspectionFailed(uint8(Gen4Queue.Source.Pool));
-            (uint256 poolCap, Gen4Queue.Source source) = _plan(cfg, input, role, secondBps, listing, pool, priceRate);
+            (uint256 poolCap, Gen4Queue.Source source) = _plan(listing, pool);
             if (source == Gen4Queue.Source.None) break;
 
             // a dead listing is retired, not sold: it counts against its own cap, not the steps
@@ -993,10 +1035,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
                 if (sized < poolCap) poolCap = sized;
                 uint256 amount = poolCap < remaining ? poolCap : remaining;
                 uint256 poolPrefund = _quoteFor(amount, priceRate);
-                // recorded before any external call (the pre-funding included), so a swap nested in
-                // either sees it; corrected after (Robin pass 68)
-                _recordShareSale(cfg, input, amount, 0);
-                _useCredit(cfg, listing, pool, amount, 0);
                 _prefundInput(input, poolPrefund);
                 try market.buyFromPoolBounded{gas: _legGas()}(
                     cfg.marketPool,
@@ -1009,8 +1047,6 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
                     0
                 ) returns (uint256 poolTokens, uint256 poolQuote) {
                     if (poolQuote > poolPrefund || poolTokens == 0) revert Gen4FillShortfall(poolTokens, amount);
-                    _recordShareSale(cfg, input, poolTokens, amount);
-                    _useCredit(cfg, listing, pool, poolTokens, amount);
                     if (poolPrefund > poolQuote) _returnPrefund(input, poolPrefund - poolQuote);
                     Gen4Accounting.recordPool(totals, poolTokens, poolQuote);
                 } catch {
@@ -1197,244 +1233,25 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
         }
     }
 
-    /// @dev Design E (29 Sep 2026). A token can have two ETH V4 pools on this hook, native-ETH and
-    ///      aeWETH, both selling one C1 pool at one price, and aggregators quote each on its own. While
-    ///      BOTH are open (registered, initialised, spread at or above the floor), one is the main door:
-    ///      it sells every listing, uncapped, plus the main share of deposits. The other, the second
-    ///      door, sells only its share of deposits and never touches listings. So the two doors never
-    ///      both promise the same listed tokens, and only deposits are split (_poolRoom). Any other pool
-    ///      is DOOR_FREE: uncapped, as before, and so are two ETH pools registered to different C1 pools.
-    ///      Once a swap finds both open, the share is fixed for the rest of the transaction (transient
-    ///      tag 4), so an owner call between two swaps (spread floor, unregistering, setNativeShare)
-    ///      cannot swap roles or lift a cap part-way (Robin pass 65).
-    function _doorRole(PairConfig memory cfg, Currency quote, Currency token)
+    /// @dev The next source and how much a pool leg may take (both walks): the pool's deposits up to the
+    ///      listing's position in the queue (all of them when there is no listing), capped by what the
+    ///      market says is executable. Gen-6 (Hamish, 24 Oct 2026): ONE Uniswap door per currency per
+    ///      token, every door free. Design E's two-ETH-door share (29 Sep 2026) is retired with its
+    ///      transient ledger: the market's aeWETH registration maps to the native pair, so no token gets
+    ///      two ETH pools on this hook and no route can split one ETH buy across two ETH doors; Uniswap's
+    ///      and Kyber's routers wrap and unwrap at the edges themselves (measured 23 and 24 Oct 2026). A
+    ///      route split across doors of DIFFERENT currencies (ETH and USDG) can still promise the same
+    ///      stock twice; the second leg then reverts and the whole route with it, nothing moves (accepted
+    ///      23 Oct 2026 for the USDG door).
+    function _plan(ListingCandidate memory listing, PoolCandidate memory pool)
         internal
-        returns (uint8 role, uint256 secondBps)
+        pure
+        returns (uint256 poolCap, Gen4Queue.Source source)
     {
-        if (cfg.marketAsset != address(weth9)) return (DOOR_FREE, 0);
-        bool native = quote.isAddressZero();
-        uint256 fixedSlot = _shareSlot(cfg.marketPool, 4);
-        uint256 nativeBps;
-        assembly ("memory-safe") {
-            nativeBps := tload(fixedSlot)
-        }
-        if (nativeBps == 0) {
-            (Currency s0, Currency s1) = _sort(native ? Currency.wrap(address(weth9)) : Currency.wrap(address(0)), token);
-            bytes32 sib = _pairKey(s0, s1);
-            PairConfig memory other = pairs[sib];
-            if (
-                !other.registered || other.marketPool != cfg.marketPool || !_pairOpened[sib]
-                    || other.baseSpreadBps < baseSpreadFloorBps
-            ) return (DOOR_FREE, 0);
-            nativeBps = nativeShareBps[cfg.marketPool];
-            if (nativeBps == 0) nativeBps = DEFAULT_NATIVE_SHARE_BPS;
-            assembly ("memory-safe") {
-                tstore(fixedSlot, nativeBps)
-            }
-        }
-        bool nativeMain = nativeBps * 2 >= BPS_DENOMINATOR;
-        secondBps = nativeMain ? BPS_DENOMINATOR - nativeBps : nativeBps;
-        role = native == nativeMain ? DOOR_MAIN : DOOR_SECOND;
-    }
-
-    /// @dev Deposits this door may still sell in this transaction (type(uint256).max = no cap). The
-    ///      pool's executable deposits are noted once per transaction and C1 pool, at the first attempt
-    ///      of the first capped swap (transient storage), with K = one inventory floor in tokens at the
-    ///      swap's rate. While both doors share, K always stays in the pool, so the pool's floor check
-    ///      (same rate, same asset) never closes it mid-transaction. Second door = its share of
-    ///      (deposits - K), less K; main door = the rest. When the second door's cut is 0, sharing is off
-    ///      for the transaction: the main door is uncapped and the second door sells nothing. Each door's
-    ///      deposit sales in the transaction (_recordShareSale) stay within its own budget. The note
-    ///      counts the deposits the hook reads (up to GEN4_MAX_POOL_NODES entries, bounded by maxBuy),
-    ///      the same for both doors, since the count does not depend on listings (Gen4Queue.inspect).
-    ///      While sharing, the note also keeps the queue it saw (_noteQueue) for the main door (_plan).
-    function _poolRoom(
-        PairConfig memory cfg,
-        Currency quote,
-        uint8 role,
-        uint256 secondBps,
-        PoolCandidate memory pool,
-        uint256 rate
-    ) internal returns (uint256) {
-        if (role == DOOR_FREE) return type(uint256).max;
-        uint256 noteSlot = _shareSlot(cfg.marketPool, 0);
-        uint256 keepSlot = _shareSlot(cfg.marketPool, 3);
-        uint256 note;
-        uint256 keep;
-        assembly ("memory-safe") {
-            note := tload(noteSlot)
-            keep := tload(keepSlot)
-        }
-        bool first = note == 0;
-        if (first) {
-            keep = Math.mulDiv(
-                _marketRead(IFlowstateMarketMinimal.inventoryFloor.selector, cfg.marketAsset), 1e18, rate, Math.Rounding.Ceil
-            );
-            note = pool.executable + 1; // +1: a noted zero stays distinguishable
-            assembly ("memory-safe") {
-                tstore(noteSlot, note)
-                tstore(keepSlot, keep)
-            }
-        }
-        uint256 shareable = note - 1 > keep ? note - 1 - keep : 0;
-        uint256 second = shareable * secondBps / BPS_DENOMINATOR;
-        second = second > keep ? second - keep : 0;
-        if (second == 0) return role == DOOR_MAIN ? type(uint256).max : 0; // sharing off
-        if (first) _noteQueue(cfg.marketPool, pool.nodes);
-        uint256 budget = role == DOOR_MAIN ? shareable - second : second;
-        uint256 sold = _soldBy(cfg.marketPool, quote);
-        return budget > sold ? budget - sold : 0;
-    }
-
-    /// @dev The next source and how much a pool leg may take (both walks). While both ETH pools share,
-    ///      the main door walks the queue as it stood when the transaction first touched this C1 pool,
-    ///      less its own sales: deposits the second door sold since still count as queued ahead of the
-    ///      listings. Without this the second door's sale could push the main door through more
-    ///      listings than its quote, past GEN4_MAX_ATTEMPTS (Robin pass 65). With the two ETH doors the
-    ///      only buyers of an otherwise unchanged queue, the main door then sells no more listings than
-    ///      its own quote, and, given enough gas and steps, the same stock sells whichever order a
-    ///      route runs the two pools: what sells when the main door goes first. The tokens come from the next deposits in line (the
-    ///      market sells deposits in queue order and does not see listings), which can sit in more
-    ///      queue entries, so a leg can need more gas and be split (Robin pass 67). Only the second
-    ///      door's sales count: at
-    ///      one listing position, what the main door sells past the deposits ahead of it adds up to at
-    ///      most what the second door has sold in the transaction (_useCredit), so another pool's sale
-    ///      (USDG) or a pin never lets the main door pass a listing (Robin pass 66).
-    function _plan(
-        PairConfig memory cfg,
-        Currency input,
-        uint8 role,
-        uint256 secondBps,
-        ListingCandidate memory listing,
-        PoolCandidate memory pool,
-        uint256 rate
-    ) internal returns (uint256 poolCap, Gen4Queue.Source source) {
-        uint256 room = _poolRoom(cfg, input, role, secondBps, pool, rate);
         bool hasListing = listing.state != LISTING_EMPTY;
         poolCap = hasListing ? pool.boundedAvailable : pool.totalAvailable;
-        uint64 first = pool.firstIndex;
-        if (hasListing && role == DOOR_MAIN) {
-            uint256 ahead = _noteAhead(cfg.marketPool, listing.poolTail);
-            uint256 sold = _soldBy(cfg.marketPool, input);
-            uint256 credit = ahead > sold ? ahead - sold : 0;
-            uint256 secondSold = _soldBy(cfg.marketPool, Currency.wrap(input.isAddressZero() ? address(weth9) : address(0)));
-            uint256 used = _creditUsed(cfg.marketPool, listing.poolTail);
-            uint256 limit = poolCap + (secondSold > used ? secondSold - used : 0);
-            if (credit > limit) credit = limit;
-            if (credit > poolCap) {
-                poolCap = credit;
-                first = listing.poolTail; // deposits count as first
-                pool.boundary = type(uint64).max; // the leg is sized across the listing's position
-            }
-        }
         if (poolCap > pool.executable) poolCap = pool.executable;
-        if (poolCap > room) poolCap = room;
-        source = Gen4Queue.select(poolCap != 0, first, hasListing, listing.poolTail);
-    }
-
-    /// @dev What the main door has sold past the deposits ahead of the listing position `poolTail`
-    ///      in this transaction: one transient slot per position (tag CREDIT_TAG + poolTail), so
-    ///      moving between positions never resets one (Robin pass 67).
-    function _creditUsed(address marketPool, uint64 poolTail) internal view returns (uint256 used) {
-        uint256 slot = _shareSlot(marketPool, CREDIT_TAG | poolTail);
-        assembly ("memory-safe") {
-            used := tload(slot)
-        }
-    }
-
-    /// @dev For a main-door pool leg planned past a listing position (_plan): adds what `plus` sells
-    ///      beyond the deposits then ahead of that position and takes back what `minus` did. Called
-    ///      before the leg with the planned amount and after it with the fill, as _recordShareSale
-    ///      is, so a swap nested inside the leg sees the credit as used. Queue order means the
-    ///      deposits ahead are sold first.
-    function _useCredit(
-        PairConfig memory cfg,
-        ListingCandidate memory listing,
-        PoolCandidate memory pool,
-        uint256 plus,
-        uint256 minus
-    ) internal {
-        if (listing.state == LISTING_EMPTY || pool.boundary != type(uint64).max) return;
-        uint256 ahead = pool.boundedAvailable;
-        plus = plus > ahead ? plus - ahead : 0;
-        minus = minus > ahead ? minus - ahead : 0;
-        uint256 slot = _shareSlot(cfg.marketPool, CREDIT_TAG | listing.poolTail);
-        assembly ("memory-safe") {
-            tstore(slot, sub(add(tload(slot), plus), minus))
-        }
-    }
-
-    /// @dev Keeps the queue the note saw: one transient entry per deposit entry with stock, in queue
-    ///      order, holding its index (top 64 bits) and the stock up to and including it (low 192 bits).
-    function _noteQueue(address marketPool, IGen4Pool.QueueNode[] memory nodes) internal {
-        uint256 stock;
-        uint256 j;
-        for (uint256 i; i < nodes.length; ++i) {
-            uint256 available = uint256(nodes[i].amount) - uint256(nodes[i].pinned);
-            if (available == 0) continue;
-            stock += available;
-            uint256 slot = _shareSlot(marketPool, NOTE_QUEUE_TAG + j++);
-            uint256 entry = (uint256(nodes[i].index) << 192) | stock;
-            assembly ("memory-safe") {
-                tstore(slot, entry)
-            }
-        }
-    }
-
-    /// @dev Noted deposits queued at or before `poolTail` (a node came before a listing exactly when
-    ///      node.index <= listing.poolTail, JUP-697); zero when nothing was noted. Indices rise along the
-    ///      queue, as Gen4Queue.sizeForGas also relies on.
-    function _noteAhead(address marketPool, uint64 poolTail) internal view returns (uint256 ahead) {
-        for (uint256 i; i < GEN4_MAX_POOL_NODES; ++i) {
-            uint256 slot = _shareSlot(marketPool, NOTE_QUEUE_TAG + i);
-            uint256 entry;
-            assembly ("memory-safe") {
-                entry := tload(slot)
-            }
-            if (entry == 0 || entry >> 192 > poolTail) break;
-            ahead = entry & type(uint192).max;
-        }
-    }
-
-    /// @dev Transient slots of one C1 pool: the pool address with a tag above bit 160 (0 = the deposit
-    ///      note, 1 = native-ETH pool's deposit sales, 2 = aeWETH pool's deposit sales, 3 = K, 4 = the
-    ///      native share fixed for the transaction, NOTE_QUEUE_TAG onward = the noted queue, CREDIT_TAG
-    ///      plus a listing position = the main door's credit used there).
-    function _shareSlot(address marketPool, uint256 tag) internal pure returns (uint256) {
-        return uint160(marketPool) | (tag << 160);
-    }
-
-    function _soldBy(address marketPool, Currency quote) internal view returns (uint256 sold) {
-        uint256 slot = _shareSlot(marketPool, quote.isAddressZero() ? 1 : 2);
-        assembly ("memory-safe") {
-            sold := tload(slot)
-        }
-    }
-
-    /// @dev Adds `plus` and removes `minus` from this ETH pool's deposit sales in the transaction.
-    ///      Called before each pool leg with the planned amount, then after it to swap the plan for the
-    ///      actual fill, so a swap nested inside the leg sees the planned sale.
-    function _recordShareSale(PairConfig memory cfg, Currency quote, uint256 plus, uint256 minus) internal {
-        if (cfg.marketAsset != address(weth9)) return;
-        uint256 slot = _shareSlot(cfg.marketPool, quote.isAddressZero() ? 1 : 2);
-        assembly ("memory-safe") {
-            tstore(slot, sub(add(tload(slot), plus), minus))
-        }
-    }
-
-    /// @dev One uint256 getter of the market taking one address (the two floor reads above), as a bare
-    ///      staticcall to keep the runtime small. The market is immutable and trusted; a failed or short
-    ///      return reverts the swap.
-    function _marketRead(bytes4 selector, address asset) internal view returns (uint256 value) {
-        address target = address(market);
-        assembly ("memory-safe") {
-            mstore(0x00, selector)
-            mstore(0x04, asset)
-            let ok := staticcall(gas(), target, 0x00, 0x24, 0x00, 0x20)
-            if iszero(ok) { revert(0x00, 0x00) }
-            if lt(returndatasize(), 0x20) { revert(0x00, 0x00) }
-            value := mload(0x00)
-        }
+        source = Gen4Queue.select(poolCap != 0, pool.firstIndex, hasListing, listing.poolTail);
     }
 
     function _affordable(uint256 available, uint256 budget, uint256 rate) internal pure returns (uint256 amount) {
@@ -1485,50 +1302,13 @@ contract FlowstateC1Hook is IHooks, Ownable2Step {
     }
 
     // -------------------------------------------------------------------------
-    // Hook callbacks — not flagged, never called
+    // Hook callbacks that are not flagged (afterInitialize, after/before remove and add liquidity,
+    // donate) are not implemented. Gen-6 (JUP-772): the six reverting stubs the Gen-5 hook carried
+    // for them went for runtime size (EIP-170); the PoolManager never calls an unflagged callback,
+    // and a direct call reverts the same way, with no function to run. The permission bits are
+    // unchanged (0x28cc) and validated in the constructor.
     // -------------------------------------------------------------------------
 
-    function afterInitialize(address, PoolKey calldata, uint160, int24) external pure returns (bytes4) {
-        revert HookNotImplemented();
-    }
-
-    function afterAddLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) external pure returns (bytes4, BalanceDelta) {
-        revert HookNotImplemented();
-    }
-
-    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external
-        pure
-        returns (bytes4)
-    {
-        revert HookNotImplemented();
-    }
-
-    function afterRemoveLiquidity(
-        address,
-        PoolKey calldata,
-        ModifyLiquidityParams calldata,
-        BalanceDelta,
-        BalanceDelta,
-        bytes calldata
-    ) external pure returns (bytes4, BalanceDelta) {
-        revert HookNotImplemented();
-    }
-
-    function beforeDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
-        revert HookNotImplemented();
-    }
-
-    function afterDonate(address, PoolKey calldata, uint256, uint256, bytes calldata) external pure returns (bytes4) {
-        revert HookNotImplemented();
-    }
 
     // -------------------------------------------------------------------------
     // Internals

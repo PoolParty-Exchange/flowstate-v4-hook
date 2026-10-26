@@ -1,0 +1,178 @@
+◇ injected env (0) from .env // tip: ◈ secrets for agents [www.dotenvx.com]
+
+🔎 [VERIFICATION] The following files are being included:
+==================================================================
+   📄 FlowAccumulatorBase.sol
+   📄 FlowBridgeCollector.sol
+   📄 FlowBuyback.sol
+   📄 FlowstateDepositWrapper.sol
+   📄 FlowstateMarket.sol
+   📄 FlowstatePool.sol
+   📄 FlowstateSupplierRegistry.sol
+   📄 TimelockedBeaconController.sol
+   📄 IFlowAdapters.sol
+   📄 IFlowstateBuyFunder.sol
+   📄 IFlowstateC1Hook.sol
+   📄 IFlowstateMarketErrors.sol
+   📄 IFlowstateMarketLibrarySurface.sol
+   📄 IFlowstatePool.sol
+   📄 IFlowstatePoolErrors.sol
+   📄 IFlowstatePoolLibrarySurface.sol
+   📄 IFlowstateRegistrarView.sol
+   📄 IFlowstateSignedLane.sol
+   📄 IFlowstateSupplierRegistry.sol
+   📄 IInitializableBeaconProxy.sol
+   📄 IOracle.sol
+   📄 IOwnedPoolContract.sol
+   📄 IPartyX.sol
+   📄 IPoolParty.sol
+   📄 IPoolPartyContract.sol
+   📄 IPoolPartyEvents.sol
+   📄 IPoolPartyStaking.sol
+   📄 IPublicPoolContract.sol
+   📄 IResellerRewards.sol
+   📄 IShadowRouter.sol
+   📄 IUniswapV3FactoryMinimal.sol
+   📄 IUniswapV3PoolMinimal.sol
+   📄 IUpgradeableBeacon.sol
+   📄 BokkyPooBahsDateTimeLibrary.sol
+   📄 FlowstateBuyBack.sol
+   📄 FlowstateEvents.sol
+   📄 FlowstateFeeSplit.sol
+   📄 FlowstateMarketAdmin.sol
+   📄 FlowstateMarketCore.sol
+   📄 FlowstateMarketStorage.sol
+   📄 FlowstatePassiveLane.sol
+   📄 FlowstatePoolCore.sol
+   📄 FlowstatePoolExits.sol
+   📄 FlowstatePoolLifecycle.sol
+   📄 FlowstatePoolPassiveFill.sol
+   📄 FlowstatePoolPriceRule.sol
+   📄 FlowstatePoolSignedLane.sol
+   📄 FlowstatePoolStorage.sol
+   📄 FlowstateQuoteLib.sol
+   📄 FlowstateRegistrar.sol
+   📄 FlowstateSignedLane.sol
+   📄 FlowstateStructs.sol
+   📄 FlowstateVenueMath.sol
+   📄 Mul512Compare.sol
+   📄 PoolPartyEvents.sol
+   📄 PoolPartyLogic.sol
+   📄 PoolPartyStructs.sol
+   📄 PriceOracleAddresses.sol
+   📄 RouterAddresses.sol
+   📄 SupportedAssetsManager.sol
+   📄 UpdatePoolPartyStruct.sol
+   📄 TickMath.sol
+   📄 C1ListingRegistry.sol
+   📄 C1ListingSettlement.sol
+   📄 IListingDeps.sol
+   📄 FlowstateSlimOracle.sol
+   📄 ownedPool.sol
+   📄 InitializableBeaconProxy.sol
+   📄 publicPool.sol
+   📄 resellerCommunityRewards.sol
+   📄 resellerCommunityRewardsL2.sol
+   📄 PoolPartySwap.sol
+   📄 PoolPartyStaking.sol
+   📄 PoolPartyFrenlyBridge.sol
+   📄 IFrenlyFactory.sol
+   📄 IPoolPartyContract.sol
+   📄 IPoolPartyMain.sol
+   📄 ChainlinkPriceFeedRegistry.sol
+   📄 PriceCalculations.sol
+   📄 AdversarialERC20s.sol
+   📄 BuildBHarnessMocks.sol
+   📄 FeeSplitHarness.sol
+   📄 FlowM4Mocks.sol
+   📄 FlowstateBatchCaller.sol
+   📄 FlowstateExactPairMocks.sol
+   📄 FlowstateMarketHarness.sol
+   📄 FlowstateV2Mocks.sol
+   📄 ListingMocks.sol
+   📄 MarketLayoutProbe.sol
+   📄 MockArbSys.sol
+   📄 MockC1Hook.sol
+   📄 MockChainlinkOracle.sol
+   📄 MockERC20.sol
+   📄 MockFeeOnTransferERC20.sol
+   📄 MockGasSensitiveOracle.sol
+   📄 MockLayerZeroEndpoint.sol
+   📄 MockPartyX.sol
+   📄 MockPoolPartyMain.sol
+   📄 MockSpotOracle.sol
+   📄 MockStaking.sol
+   📄 MockStargateRouter.sol
+   📄 MockSupplierRegistry.sol
+   📄 MockUniswapRouter.sol
+   📄 MockV3FactoryMinimal.sol
+   📄 MockV3VenueRing.sol
+   📄 OracleGasProbe.sol
+   📄 PoolLayoutProbe.sol
+   📄 QuoterExecutionProver.sol
+   📄 SellSideProbe.sol
+   📄 SignedLaneMocks.sol
+   📄 SlimOracleMocks.sol
+   📄 TestBokkyPooBahsDateTime.sol
+   📄 TestChainlinkPriceFeedRegistry.sol
+   📄 TestPriceCalculations.sol
+   📄 TestPriceOracleAddresses.sol
+   📄 TestRouterAddresses.sol
+   📄 TestSupportedAssetsManager.sol
+   📄 VenueMathProbe.sol
+   📄 FlowstateMarketBaseline3485d51.sol
+   📄 FlowstateMarketBaseline40aeb85.sol
+   📄 FlowstatePoolBaseline3485d51.sol
+   📄 FlowstatePoolBaseline40aeb85.sol
+   📄 FlowstatePoolLive3485d51.sol
+   📄 IFlowstatePoolBaseline3485d51.sol
+   📄 IFlowstatePoolBaseline40aeb85.sol
+==================================================================
+
+◇ injected env (0) from .env // tip: ⌘ override existing { override: true }
+[0] fork block 96649360 | market 0x8eFb662F738D0f5d9f146803FD02A36c6B67e60d | CASHCAT pool 0x1c8Fe931c9be6583d9a2E5C05712a0F6d1e4faeD | jup-771 pool surface: true
+PASS [1] Gen-6 listing registry and settlement deployed and bound to each other and the market  [0x5C1a4D6d97b8360F5F4af1ABc3638E039867032F / 0xDfEaBE5aB0B5cf0dedE11e5424C9b25DC13B223e]
+PASS [1] CASHCAT prices in USDG through the conversion leg (JUP-770 live on the fork)  [reason 0 factor 2363952810]
+PASS [2] opener deployed at the predicted CREATE address, bound to the mined hook  [0x75d895c462dfC8fE981075527eEA30c3379D0D52]
+PASS [2] Gen-6 hook at the mined CREATE2 address (flags 0x28cc), owner = the Safe, opener wired  [0x62B4ab3AFeC1a270fe1C0Ed8d68fe70Aba99E8Cc deploy gas 4725383]
+PASS [3] eight pairs registered by the Safe, eight pools initialised by the registrations (no init sends), all ready  [CASHCAT/native 251616, CASHCAT/USDG 261661, HOODRAT/native 192016, HOODRAT/USDG 201981, TENDIES/native 191884, TENDIES/USDG 202025, V4/native 191948, V4/USDG 201949]
+PASS [3] no aeWETH-keyed pool for CASHCAT (one ETH door)
+PASS [3] no aeWETH-keyed pool for HOODRAT (one ETH door)
+PASS [3] no aeWETH-keyed pool for TENDIES (one ETH door)
+PASS [3] no aeWETH-keyed pool for V4 (one ETH door)
+PASS [4] market.trustedHook = Gen-6
+PASS [4] Gen-5 pairs retired by the Safe (expected eight)  [8]
+   Universal Router params: with minHopPriceX36
+   CASHCAT hook rate: 40010737129583 aeWETH wei per 1e18 (maxBuy 1972.294898032219812588), 94584 USDG raw per 1e18 (maxBuy 1972.294898032219812588)
+   native exact-in 0.0005 ETH, FIRST fill (beacon): used 812680, estimate 812716, ratio 1, got 12.476682854867307383, spread 399361022363, jar 399361022365, beacons 1
+PASS [5] native exact-in 0.0005 ETH, FIRST fill (beacon): filled
+PASS [5] native exact-in 0.0005 ETH, FIRST fill (beacon): limit-to-used ratio under 1.30  [1]
+PASS [5] native exact-in 0.0005 ETH, FIRST fill (beacon): beacon lit on this first fill
+PASS [5] native exact-in 0.0005 ETH, FIRST fill (beacon): hook and opener hold no native
+PASS [5] native pool beacon: one unit of liquidity owned by the opener on the quote side
+   native exact-in 0.0005 ETH, SECOND fill: used 585407, estimate 655766, ratio 1.12, got 12.476682854867307383, spread 399361022364, jar 399361022365, beacons 0
+PASS [5] native exact-in 0.0005 ETH, SECOND fill: filled
+PASS [5] native exact-in 0.0005 ETH, SECOND fill: limit-to-used ratio under 1.30  [1.12]
+PASS [5] native exact-in 0.0005 ETH, SECOND fill: beacon not lit again
+PASS [5] native exact-in 0.0005 ETH, SECOND fill: hook and opener hold no native
+   USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): used 972872, estimate 972908, ratio 1, got 12.666867546308043643, spread 957, jar 959, beacons 1
+PASS [5] USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): filled
+PASS [5] USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): limit-to-used ratio under 1.30  [1]
+PASS [5] USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): beacon lit on this first fill
+PASS [5] USDG exact-in 1.2 USDG, FIRST fill (beacon in USDG): hook and opener hold no native
+   native exact-out 5 CASHCAT (+SWEEP of the unused value): used 613342, estimate 654110, ratio 1.066, got 5.0, spread 160042948518, jar 160042948519, beacons 0
+PASS [5] native exact-out 5 CASHCAT (+SWEEP of the unused value): filled
+PASS [5] native exact-out 5 CASHCAT (+SWEEP of the unused value): limit-to-used ratio under 1.30  [1.066]
+PASS [5] native exact-out 5 CASHCAT (+SWEEP of the unused value): beacon not lit again
+PASS [5] native exact-out 5 CASHCAT (+SWEEP of the unused value): hook and opener hold no native
+   aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: used 616970, estimate 721247, ratio 1.169, got 12.476682854867307383, spread 399361022364, jar 399361022365, beacons 0
+PASS [5] aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: filled
+PASS [5] aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: limit-to-used ratio under 1.30  [1.169]
+PASS [5] aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: beacon not lit again
+PASS [5] aeWETH payer 0.0005 aeWETH, router unwraps into the NATIVE door: hook and opener hold no native
+PASS [6] a USDG + ETH split route that promises 120% of the stock reverts as a whole (estimate refused, transaction status 0)  [estimate: Error: VM Exception while processing transaction: reverted with an unrecognized custom error (return data: 0x90bfb86500000000000000000000000; status 0; gas null]
+PASS [6] after the failed split nothing moved but gas  [tokens 0, usdg 0, pool 0]
+PASS [6] the same split inside the stock fills both doors in one transaction  [gas 1194365]
+PASS [7] createPool(ROBINCAT) opened the native and USDG doors by itself: two pairs ready, two pools initialised, no aeWETH-keyed pool, no operator call  [createPool gas 1809725]
+
+GEN-6 FORK E2E: 36 of 36 checks pass; record /private/tmp/claude-502/-Users-hamishludbrook-Documents-flowstate-workspace/b12b2a1c-6282-4ef8-b2ca-4444284e6e2f/scratchpad/gen6_e2e_run2/gen6_fork_e2e.json

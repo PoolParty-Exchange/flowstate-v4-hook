@@ -9,11 +9,15 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolManager} from "@uniswap/v4-core/src/PoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {Position} from "@uniswap/v4-core/src/libraries/Position.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolSwapTest} from "@uniswap/v4-core/src/test/PoolSwapTest.sol";
 import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {FlowstateC1Hook} from "../src/FlowstateC1Hook.sol";
+import {FlowstatePoolOpener} from "../src/FlowstatePoolOpener.sol";
 import {IGen4Pool} from "../src/interfaces/IGen4Inventory.sol";
 import {MockInventoryToken} from "./mocks/MockInventoryToken.sol";
 
@@ -282,14 +286,9 @@ contract FlowstateC1HookHarness is FlowstateC1Hook {
         address owner,
         address weth,
         address registry,
-        address settlement
-    ) FlowstateC1Hook(manager, market, owner, weth, address(0xBEEF), 0, registry, settlement) {}
-
-    /// @dev What beforeInitialize records when the pool of a registered pair is created.
-    function openPair(address a, address b) external {
-        (Currency c0, Currency c1) = _sort(Currency.wrap(a), Currency.wrap(b));
-        _pairOpened[_pairKey(c0, c1)] = true;
-    }
+        address settlement,
+        address opener_
+    ) FlowstateC1Hook(manager, market, owner, weth, address(0xBEEF), 0, registry, settlement, opener_) {}
 
     function runExactInput(
         address pool,
@@ -353,17 +352,28 @@ contract Gen4HookIntegrationTest is Test {
         market.approveAsset(address(quote));
         market.approveAsset(address(weth));
 
-        bytes memory args = abi.encode(
-            address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
-        );
-        (address expected, bytes32 salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1HookHarness).creationCode, args);
+        (address expected, bytes32 salt, address openerAddress) = _planHarness();
         hook = new FlowstateC1HookHarness{salt: salt}(
-            address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
         );
         assertEq(address(hook), expected);
         hook.registerPair(Currency.wrap(address(quote)), Currency.wrap(address(token)), address(pool), 0);
         quote.mint(address(manager), 1_000e18);
         vm.deal(address(manager), 1_000e18);
+    }
+
+    /// @dev Gen-6: the opener is deployed first at this contract's next CREATE address and the harness
+    ///      mined with it (see ForkTestBase._planHook). The mock manager has no initialize or
+    ///      modifyLiquidity, so every opener call the hook makes here fails and is caught: the suite
+    ///      exercises exactly that "never blocks" path, and the real-manager suite below the beacon.
+    function _planHarness() internal returns (address expected, bytes32 salt, address openerAddress) {
+        openerAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        bytes memory args = abi.encode(
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
+        );
+        (expected, salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1HookHarness).creationCode, args);
+        address deployed = address(new FlowstatePoolOpener(address(manager), expected, address(weth)));
+        assertEq(deployed, openerAddress, "opener address");
     }
 
     function test_DeadListingThenOlderPoolThenLiveListing() public {
@@ -709,504 +719,78 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(hook.poolNodeGas(address(recorder), address(quote)), hook.GEN4_POOL_NODE_GAS_RECYCLED());
     }
 
+    // Gen-6 (Robin pass, 24 Oct 2026): the opener the hook will approve must be bound to this hook, this
+    // manager and this wrapper; an opener deployed for another hook address is refused at construction
+    function test_ConstructorRefusesAnOpenerBoundToAnotherHook() public {
+        address openerAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        bytes memory args = abi.encode(
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
+        );
+        (address expected, bytes32 salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1HookHarness).creationCode, args);
+        FlowstatePoolOpener stray = new FlowstatePoolOpener(address(manager), address(0xD00D), address(weth)); // bound elsewhere
+        assertEq(address(stray), openerAddress);
+        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.OpenerWiringMismatch.selector, openerAddress));
+        new FlowstateC1HookHarness{salt: salt}(
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
+        );
+        expected; // the mined address is never deployed in this test
+    }
+
     // Review F6: the settlement the hook approves must be the one the registry is bound to
     function test_ConstructorRefusesASettlementTheRegistryDoesNotName() public {
         registry.setSettlement(address(0xBAD));
-        bytes memory args = abi.encode(
-            address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
-        );
-        (, bytes32 salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1HookHarness).creationCode, args);
+        (, bytes32 salt, address openerAddress) = _planHarness();
         vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.ListingWiringMismatch.selector, address(registry), address(settlement)));
         new FlowstateC1HookHarness{salt: salt}(
-            address(manager), address(market), address(this), address(weth), address(registry), address(settlement)
+            address(manager), address(market), address(this), address(weth), address(registry), address(settlement), openerAddress
         );
     }
 
-    // ---- Design E: two ETH Uniswap pools on one C1 pool (29 Sep 2026) ----
-    // Foundry runs a test function as one transaction, so two runs below are two pools hit in the same
-    // transaction, the case a router split across both pools creates. Native is the main door (80%).
-
-    function _twoEthPools(uint128 stock, uint256 floor) internal {
-        pool.setNode(1, stock, 0);
-        token.mint(address(pool), stock);
-        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
-        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool), 0);
-        hook.openPair(address(0), address(token));
-        hook.openPair(address(weth), address(token));
-        market.setFloors(address(weth), floor, 0); // K = floor tokens at rate 1
-        vm.deal(address(this), 4_000e18);
-        weth.deposit{value: 4_000e18}();
-        weth.transfer(address(manager), 4_000e18);
-    }
-
-    function _buyNative(uint256 amount) internal returns (uint256 tokens) {
-        (tokens,,,) = hook.runExactInput(address(pool), address(0), address(weth), address(token), amount, address(this));
-    }
-
-    function _buyWrapped(uint256 amount) internal returns (uint256 tokens) {
-        (tokens,,,) = hook.runExactInput(address(pool), address(weth), address(weth), address(token), amount, address(this));
-    }
+    // ---- Gen-6 (Hamish, 24 Oct 2026): one ETH door per token, every door free ----
 
     function _shortfall(uint256 filled, uint256 wanted) internal pure returns (bytes memory) {
         return abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, filled, wanted, uint8(5));
     }
 
-    function test_E_BothDoorsFillTheirBudgetsInOneTransaction_MainFirst() public {
-        _twoEthPools(1_000e18, 0);
-        assertEq(_buyNative(800e18), 800e18, "main door: 80% of deposits");
-        assertEq(_buyWrapped(200e18), 200e18, "second door: 20%, same transaction");
+    function _key(address a, address b) internal pure returns (bytes32) {
+        (address c0, address c1) = a < b ? (a, b) : (b, a);
+        return keccak256(abi.encode(Currency.wrap(c0), Currency.wrap(c1)));
+    }
+
+    /// @dev The market registering the wrapper's pair opens the NATIVE pair (market asset = the wrapper) and no
+    ///      aeWETH-keyed pair; idempotent; never over an owner-tuned native pair; other ERC-20 quotes register as themselves.
+    function test_OneDoor_MarketWrapperRegistrationOpensTheNativePairOnly() public {
+        bytes32 nativeKey = _key(address(0), address(token));
+        bytes32 wethKey = _key(address(weth), address(token));
+        vm.prank(address(market));
+        hook.registerPairFromMarket(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool));
+        (address mp, bool q0, bool reg, uint16 bps, address asset) = hook.pairs(nativeKey);
+        assertTrue(reg, "native pair registered"); assertEq(mp, address(pool)); assertTrue(q0, "native is currency0");
+        assertEq(asset, address(weth), "settles in the wrapper"); assertEq(bps, hook.marketRegistrationSpreadBps());
+        (,, bool wreg,,) = hook.pairs(wethKey); assertFalse(wreg, "no aeWETH-keyed pair from the market: one ETH door");
+        vm.prank(address(market));
+        hook.registerPairFromMarket(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool));
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 7);
+        vm.prank(address(market));
+        hook.registerPairFromMarket(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool));
+        (,,, uint16 tuned,) = hook.pairs(nativeKey); assertEq(tuned, 7, "owner spread kept");
+        (,, bool wreg2,,) = hook.pairs(wethKey); assertFalse(wreg2);
+        vm.prank(address(market));
+        hook.registerPairFromMarket(Currency.wrap(address(quote)), Currency.wrap(address(token)), address(pool));
+        (,, bool qreg,,) = hook.pairs(_key(address(quote), address(token))); assertTrue(qreg, "an ERC-20 dollar quote registers as itself");
+    }
+
+    /// @dev One ETH door sells every deposit with no share, then the next buy is all or nothing.
+    function test_OneDoor_NativePoolSellsEveryDepositUncapped_ThenAllOrNothing() public {
+        pool.setNode(1, 1_000e18, 0);
+        token.mint(address(pool), 1_000e18);
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
+        vm.deal(address(manager), 5_000e18);
+        (uint256 got,,,) = hook.runExactInput(address(pool), address(0), address(weth), address(token), 1_000e18, address(this));
+        assertEq(got, 1_000e18, "the one ETH door sells every deposit, uncapped");
         assertEq(pool.available(), 0);
-    }
-
-    function test_E_BothDoorsFillTheirBudgetsInOneTransaction_SecondFirst() public {
-        _twoEthPools(1_000e18, 0);
-        assertEq(_buyWrapped(200e18), 200e18);
-        assertEq(_buyNative(800e18), 800e18);
-    }
-
-    function test_E_SecondDoorOverItsBudgetRevertsAndSellsNothing() public {
-        _twoEthPools(1_000e18, 0);
-        vm.expectRevert(_shortfall(200e18, 201e18));
-        _buyWrapped(201e18);
-        assertEq(pool.available(), 1_000e18, "nothing sold");
-        assertEq(_buyNative(800e18), 800e18, "the main door's budget is untouched");
-    }
-
-    // K = 14: deposits 1,000 -> shareable 986, second = 197.2 - 14 = 183.2, main = 802.8; 14 stay in the pool
-    function test_E_OneFloorStaysInThePoolWhileSharing() public {
-        _twoEthPools(1_000e18, 14e18);
-        assertEq(_buyNative(802.8e18), 802.8e18);
-        assertEq(_buyWrapped(183.2e18), 183.2e18);
-        assertEq(pool.available(), 14e18, "K left for the next transaction");
         vm.expectRevert(_shortfall(0, 1e18));
-        _buyWrapped(1e18);
-    }
-
-    // deposits 60, K 14 -> second = 9.2 - 14 < 0 -> sharing off: main uncapped, second sells nothing
-    function test_E_SharingSwitchesOffBelowAboutSixFloors() public {
-        _twoEthPools(60e18, 14e18);
-        vm.expectRevert(_shortfall(0, 1e18));
-        _buyWrapped(1e18);
-        assertEq(_buyNative(60e18), 60e18, "main door sells everything");
-    }
-
-    function test_E_MainDoorManySlicesStayInItsBudget() public {
-        _twoEthPools(1_000e18, 0);
-        assertEq(_buyNative(500e18), 500e18);
-        assertEq(_buyNative(300e18), 300e18);
-        vm.expectRevert(_shortfall(0, 1e18));
-        _buyNative(1e18);
-    }
-
-    function test_E_NoCapUntilTheSiblingPoolIsOpened() public {
-        pool.setNode(1, 1_000e18, 0);
-        token.mint(address(pool), 1_000e18);
-        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
-        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool), 0);
-        hook.openPair(address(0), address(token)); // the aeWETH pool was never created
-        assertEq(_buyNative(1_000e18), 1_000e18);
-    }
-
-    // native at 20 bps, aeWETH at 16, the floor raised to 18: only the sibling drops below it (Adv pass)
-    function _spreads(uint16 nativeBps, uint16 wrappedBps) internal {
-        hook.setBaseSpread(Currency.wrap(address(0)), Currency.wrap(address(token)), nativeBps);
-        hook.setBaseSpread(Currency.wrap(address(weth)), Currency.wrap(address(token)), wrappedBps);
-    }
-
-    function test_E_SiblingBelowTheSpreadFloorDoesNotCount() public {
-        _twoEthPools(1_000e18, 0);
-        _spreads(20, 16);
-        hook.setBaseSpreadFloor(18); // the aeWETH pool can no longer trade; the native pool still can
-        assertEq(_buyNative(1_000e18), 1_000e18);
-    }
-
-    function test_E_UnregisteringTheSiblingRemovesTheCap() public {
-        _twoEthPools(1_000e18, 0);
-        hook.unregisterPair(Currency.wrap(address(weth)), Currency.wrap(address(token)));
-        assertEq(_buyNative(1_000e18), 1_000e18);
-    }
-
-    function test_E_NativeOnlyAtTenThousand() public {
-        _twoEthPools(1_000e18, 0);
-        hook.setNativeShare(address(pool), 10_000);
-        vm.expectRevert(_shortfall(0, 1e18));
-        _buyWrapped(1e18);
-        assertEq(_buyNative(1_000e18), 1_000e18);
-    }
-
-    function test_E_AeWETHIsTheMainDoorBelowFiveThousand() public {
-        _twoEthPools(1_000e18, 0);
-        hook.setNativeShare(address(pool), 2_000);
-        vm.expectRevert(_shortfall(200e18, 201e18));
-        _buyNative(201e18);
-        assertEq(_buyWrapped(800e18), 800e18);
-        assertEq(_buyNative(200e18), 200e18);
-    }
-
-    function test_E_NonEthPoolIsNeverCapped() public {
-        _twoEthPools(1_000e18, 0);
-        (uint256 tokens,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 1_000e18, address(this));
-        assertEq(tokens, 1_000e18);
-    }
-
-    // listings are sold only through the main door: deposits 200 (K 0: second 40, main 160) + a listing of 800
-    function test_E_MainDoorSellsListingsUncapped() public {
-        _twoEthPools(200e18, 0);
-        token.mint(address(settlement), 800e18);
-        registry.push(Gen4MockRegistry.Candidate(1, 1, 800e18, 1, 0)); // older than the pool node
-        assertEq(_buyNative(960e18), 960e18, "800 listed + 160 deposits");
-        assertEq(_buyWrapped(40e18), 40e18);
-    }
-
-    function test_E_SecondDoorNeverTouchesListings() public {
-        _twoEthPools(1_000e18, 0);
-        token.mint(address(settlement), 500e18);
-        registry.push(Gen4MockRegistry.Candidate(1, 1, 500e18, 1, 0)); // older than the pool node
-        assertEq(_buyWrapped(100e18), 100e18);
-        assertEq(recorder.length(), 1);
-        assertEq(recorder.step(0), 200, "one pool leg, no listing leg");
-        assertEq(registry.cursor(), 0, "the listing is untouched");
-    }
-
-    function test_E_ExactOutputFollowsTheSameBudgets() public {
-        _twoEthPools(1_000e18, 0);
-        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.Gen4FillShortfall.selector, 200e18, 201e18));
-        hook.runExactOutput(address(pool), address(weth), address(weth), address(token), 201e18, address(this));
-        (uint256 tokens,,) = hook.runExactOutput(address(pool), address(weth), address(weth), address(token), 200e18, address(this));
-        assertEq(tokens, 200e18);
-        (tokens,,) = hook.runExactOutput(address(pool), address(0), address(weth), address(token), 800e18, address(this));
-        assertEq(tokens, 800e18);
-    }
-
-    // a swap nested inside the main door's pool leg sees that leg's planned sale
-    uint256 internal nestedAmount;
-    uint256 internal nestedRuns;
-    bool internal nestedFilled;
-    function nested() external {
-        ++nestedRuns;
-        try hook.runExactInput(address(pool), address(0), address(weth), address(token), nestedAmount, address(this)) returns (
-            uint256 tokens, uint256, uint256, uint256
-        ) {
-            nestedFilled = tokens == nestedAmount;
-        } catch {
-            nestedFilled = false;
-        }
-    }
-
-    function test_E_NestedSwapDuringAPoolLegSeesThePlannedSale() public {
-        _twoEthPools(1_000e18, 0);
-        // main door budget 800; the outer leg plans 500 before it runs, so a nested 301 does not fit
-        nestedAmount = 301e18;
-        market.setReenter(address(this));
-        assertEq(_buyNative(500e18), 500e18);
-        assertEq(nestedRuns, 1, "the nested swap ran");
-        assertFalse(nestedFilled, "a nested 301 would take the main door past 800");
-        // outer 1 planned (501 recorded): a nested 299 fits exactly
-        nestedAmount = 299e18;
-        market.setReenter(address(this));
-        assertEq(_buyNative(1e18), 1e18);
-        assertEq(nestedRuns, 2);
-        assertTrue(nestedFilled, "299 fits beside the planned 501");
-        vm.expectRevert(_shortfall(0, 1e18));
-        _buyNative(1e18); // 500 + 1 + 299 = 800: the main door is full
-    }
-
-    function test_E_NativeShareSetterBoundsAndOwner() public {
-        vm.expectRevert(abi.encodeWithSelector(FlowstateC1Hook.InvalidShare.selector, uint16(10_001)));
-        hook.setNativeShare(address(pool), 10_001);
-        vm.prank(address(0xBAD));
-        vm.expectRevert();
-        hook.setNativeShare(address(pool), 5_000);
-        hook.setNativeShare(address(pool), 10_000);
-        assertEq(hook.nativeShareBps(address(pool)), 10_000);
-    }
-
-    // ---- Robin pass 65: the second door's sale must not push the main door past its own quote ----
-    // Queue: a deposit of 188 (entry 1), 17 listings of 20 queued after it, a deposit of 812 (entry 2).
-    // K = 10 -> shareable 990, second door 198 - 10 = 188, main door 802.
-    function _robin65Queue() internal {
-        _twoEthPools(188e18, 10e18);
-        pool.addNode(2, 812e18);
-        token.mint(address(pool), 812e18);
-        token.mint(address(settlement), 340e18);
-        for (uint64 id = 1; id <= 17; ++id) registry.push(Gen4MockRegistry.Candidate(1, id, 20e18, 1, 1));
-    }
-
-    function _mainExactOutput(uint256 target) internal returns (uint256 tokens) {
-        (tokens,,) = hook.runExactOutput(address(pool), address(0), address(weth), address(token), target, address(this));
-    }
-
-    /// @dev Steps recorded from entry `from` on: 200 = a pool leg, 100 + id = a listing.
-    function _assertSteps(uint256 from, uint256[] memory expected) internal view {
-        assertEq(recorder.length() - from, expected.length, "number of steps");
-        for (uint256 i; i < expected.length; ++i) assertEq(recorder.step(from + i), expected[i]);
-    }
-
-    function _robin65MainSteps() internal pure returns (uint256[] memory s) {
-        s = new uint256[](9);
-        s[0] = 200; // 188 of deposits
-        for (uint256 i = 1; i < 9; ++i) s[i] = 100 + i; // listings 1 to 8 (the 8th sells 12 of 20)
-    }
-
-    function test_E_Robin65_MainQuoteAloneTakesNineSteps() public {
-        _robin65Queue();
-        assertEq(_mainExactOutput(340e18), 340e18);
-        _assertSteps(0, _robin65MainSteps());
-    }
-
-    function test_E_Robin65_SecondDoorFirstLeavesTheMainDoorItsQuotedSteps() public {
-        _robin65Queue();
-        assertEq(_buyWrapped(188e18), 188e18, "second door: the first deposit");
-        uint256 from = recorder.length();
-        assertEq(_mainExactOutput(340e18), 340e18, "main door: 9 steps, not 17");
-        _assertSteps(from, _robin65MainSteps());
-        assertEq(pool.available(), 624e18, "188 + 188 of deposits sold");
-        assertEq(registry.cursor(), 8, "listings 1 to 8 sold");
-    }
-
-    function test_E_Robin65_MainDoorFirstSellsTheSameStock() public {
-        _robin65Queue();
-        assertEq(_mainExactOutput(340e18), 340e18);
-        assertEq(_buyWrapped(188e18), 188e18);
-        assertEq(pool.available(), 624e18, "the same deposits as the other order");
-        assertEq(registry.cursor(), 8, "the same listings as the other order");
-    }
-
-    function test_E_Robin65_ExactInputSecondDoorFirst() public {
-        _robin65Queue();
-        assertEq(_buyWrapped(188e18), 188e18);
-        uint256 from = recorder.length();
-        assertEq(_buyNative(340e18), 340e18);
-        _assertSteps(from, _robin65MainSteps());
-        assertEq(pool.available(), 624e18);
-        assertEq(registry.cursor(), 8);
-    }
-
-    // Deposits between listings: entry 1 = 100, listing 1 (10), entry 2 = 100, listings 2 to 20 (10 each),
-    // entry 3 = 1,000; K = 0 -> second door 240, main door 960. The main door's view must remember how
-    // far along the queue each listing sits: a plain "second door sold 100" credit would be spent on
-    // entry 2, which the main door reaches anyway, and leave it more listings than its quote.
-    function _betweenQueue() internal {
-        _twoEthPools(100e18, 0);
-        pool.addNode(2, 100e18);
-        pool.addNode(3, 1_000e18);
-        token.mint(address(pool), 1_100e18);
-        token.mint(address(settlement), 200e18);
-        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
-        for (uint64 id = 2; id <= 20; ++id) registry.push(Gen4MockRegistry.Candidate(1, id, 10e18, 1, 2));
-    }
-
-    function _betweenMainSteps() internal pure returns (uint256[] memory s) {
-        s = new uint256[](6);
-        (s[0], s[1], s[2], s[3], s[4], s[5]) = (200, 101, 200, 102, 103, 104);
-    }
-
-    function test_E_DepositsBetweenListings_SecondDoorFirst() public {
-        _betweenQueue();
-        assertEq(_buyWrapped(100e18), 100e18);
-        uint256 from = recorder.length();
-        assertEq(_mainExactOutput(240e18), 240e18);
-        _assertSteps(from, _betweenMainSteps());
-        assertEq(pool.available(), 900e18);
-        assertEq(registry.cursor(), 4);
-    }
-
-    function test_E_DepositsBetweenListings_MainDoorFirst() public {
-        _betweenQueue();
-        assertEq(_mainExactOutput(240e18), 240e18);
-        _assertSteps(0, _betweenMainSteps());
-        assertEq(_buyWrapped(100e18), 100e18);
-        assertEq(pool.available(), 900e18, "the same deposits as the other order");
-        assertEq(registry.cursor(), 4, "the same listings as the other order");
-    }
-
-    // Robin pass 66: only the second door's sales count. Entry 1 = 100, a listing of 10 queued after it,
-    // entry 2 = 900; K = 0 -> second door 200, main door 800.
-    function _oneListingQueue() internal {
-        _twoEthPools(100e18, 0);
-        pool.addNode(2, 900e18);
-        token.mint(address(pool), 900e18);
-        token.mint(address(settlement), 10e18);
-        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
-    }
-
-    // a USDG slice takes entry 1 after the note: the main door may pass the listing by the second
-    // door's 1 token only, then the listing sells in its turn
-    function test_E_AnotherPoolsSaleDoesNotLetTheMainDoorPassAListing() public {
-        _oneListingQueue();
-        assertEq(_buyWrapped(1e18), 1e18, "second door: 1 from entry 1 (the note is taken)");
-        (uint256 usdg,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 99e18, address(this));
-        assertEq(usdg, 99e18, "the USDG pool takes the rest of entry 1");
-        uint256 from = recorder.length();
-        assertEq(_mainExactOutput(20e18), 20e18);
-        uint256[] memory s = new uint256[](3);
-        (s[0], s[1], s[2]) = (200, 101, 200); // 1 of deposits, the listing, then 9 of deposits
-        _assertSteps(from, s);
-        assertEq(registry.cursor(), 1, "the listing sold");
-    }
-
-    // a hold pins the rest of entry 1 after the main door's first slice: with no second-door sale, the
-    // main door's next slice must sell the listing before any later deposit
-    function test_E_APinDoesNotLetTheMainDoorPassAListing() public {
-        _oneListingQueue();
-        assertEq(_mainExactOutput(1e18), 1e18, "main door: 1 from entry 1 (the note is taken)");
-        pool.pin(0, 99e18);
-        uint256 from = recorder.length();
-        assertEq(_mainExactOutput(20e18), 20e18);
-        uint256[] memory s = new uint256[](2);
-        (s[0], s[1]) = (101, 200); // the listing first, then entry 2
-        _assertSteps(from, s);
-    }
-
-    // Robin pass 67: the credit used at a listing position is kept per position. Entry 1 = 100, entry
-    // 2 = 100, entry 3 = 800; listings X (after entry 1), Y (after entry 2), then Z back at X's position
-    // (a listing position the walk returns to). The second door sells 1, a USDG slice the rest of entry
-    // 1, and a hold pins entry 2: the main door has 1 of credit at each position, once.
-    function test_E_CreditUsedAtAPositionIsNotResetByAnother() public {
-        _twoEthPools(100e18, 0);
-        pool.addNode(2, 100e18);
-        pool.addNode(3, 800e18);
-        token.mint(address(pool), 900e18);
-        token.mint(address(settlement), 30e18);
-        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
-        registry.push(Gen4MockRegistry.Candidate(1, 2, 10e18, 1, 2));
-        registry.push(Gen4MockRegistry.Candidate(1, 3, 10e18, 1, 1));
-        assertEq(_buyWrapped(1e18), 1e18);
-        (uint256 usdg,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 99e18, address(this));
-        assertEq(usdg, 99e18);
-        pool.pin(1, 100e18);
-        uint256 from = recorder.length();
-        assertEq(_mainExactOutput(32e18), 32e18);
-        uint256[] memory s = new uint256[](5);
-        (s[0], s[1], s[2], s[3], s[4]) = (200, 101, 200, 102, 103); // Z sells without a third credit
-        _assertSteps(from, s);
-    }
-
-    // Robin pass 67: a swap nested inside a credited leg sees that leg's credit as used. After the
-    // second door sells 1 and a USDG slice the rest of entry 1, the main door's 1 of credit is taken
-    // by the outer leg, so the nested main-door swap sells the listing instead of a second credit.
-    function test_E_NestedSwapDuringACreditedLegSeesTheCreditUsed() public {
-        _oneListingQueue();
-        assertEq(_buyWrapped(1e18), 1e18);
-        (uint256 usdg,,,) = hook.runExactInput(address(pool), address(quote), address(quote), address(token), 99e18, address(this));
-        assertEq(usdg, 99e18);
-        nestedAmount = 1e18;
-        market.setReenter(address(this));
-        uint256 from = recorder.length();
-        assertEq(_buyNative(1e18), 1e18);
-        assertEq(nestedRuns, 1, "the nested swap ran");
-        assertTrue(nestedFilled);
-        assertEq(recorder.step(from), 200, "outer: the credited leg");
-        assertEq(recorder.step(from + 1), 101, "nested: the listing, not a second credited leg");
-    }
-
-    // Adversarial pass on beff9e8: a credited leg with deposits still ahead of the listing. Entry 1 =
-    // 100, listings L1 and L2 (10 each) queued after it, entry 2 = 900; K = 0 -> second 200, main 800.
-    // Taking half of entry 1 first leaves the main door both physical stock and credit before L1.
-    function _partialAhead() internal {
-        _twoEthPools(100e18, 0);
-        pool.addNode(2, 900e18);
-        token.mint(address(pool), 900e18);
-        token.mint(address(settlement), 20e18);
-        registry.push(Gen4MockRegistry.Candidate(1, 1, 10e18, 1, 1));
-        registry.push(Gen4MockRegistry.Candidate(1, 2, 10e18, 1, 1));
-    }
-
-    function test_E_PartialAhead_MainDoorFirst() public {
-        _partialAhead();
-        assertEq(_mainExactOutput(60e18), 60e18); // 60 of entry 1
-        assertEq(_mainExactOutput(50e18), 50e18); // the other 40, then 10 of L1
-        assertEq(_buyWrapped(50e18), 50e18);
-        assertEq(registry.cursor(), 1, "only L1 sold");
-        assertEq(pool.available(), 850e18);
-    }
-
-    function test_E_PartialAhead_SecondDoorFirstSellsTheSameStock() public {
-        _partialAhead();
-        assertEq(_buyWrapped(50e18), 50e18, "second door: half of entry 1");
-        uint256 from = recorder.length();
-        assertEq(_mainExactOutput(60e18), 60e18);
-        uint256[] memory s1 = new uint256[](1);
-        s1[0] = 200; // one credited leg: the other 50 of entry 1, then 10 of entry 2
-        _assertSteps(from, s1);
-        from = recorder.length();
-        assertEq(_mainExactOutput(50e18), 50e18);
-        uint256[] memory s2 = new uint256[](2);
-        (s2[0], s2[1]) = (200, 101); // 40 on the rest of the credit, then L1
-        _assertSteps(from, s2);
-        assertEq(registry.cursor(), 1, "only L1 sold, as with the main door first");
-        assertEq(pool.available(), 850e18);
-    }
-
-    // FIFO case 2 on JUP-698 (for Wilko to confirm): with its deposit budget spent, the main door sells
-    // a listing queued after deposits that stay unsold (the second door's share). K = 0: main 800.
-    function test_E_MainDoorWithItsBudgetSpentSellsANewerListing() public {
-        _twoEthPools(1_000e18, 0);
-        token.mint(address(settlement), 100e18);
-        registry.push(Gen4MockRegistry.Candidate(1, 1, 100e18, 1, 1)); // queued after entry 1
-        assertEq(_buyNative(900e18), 900e18, "800 of deposits, then the listing");
-        assertEq(registry.cursor(), 1, "the newer listing sold");
-        assertEq(pool.available(), 200e18, "the second door's 200 still unsold");
-    }
-
-    // the sibling counts once its V4 pool is initialised: beforeInitialize itself records it (the
-    // other design E tests set the flag through the harness)
-    function test_E_InitialisingTheSiblingPoolTurnsSharingOn() public {
-        pool.setNode(1, 1_000e18, 0);
-        token.mint(address(pool), 1_000e18);
-        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
-        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(pool), 0);
-        hook.openPair(address(0), address(token));
-        (address a, address b) = address(weth) < address(token) ? (address(weth), address(token)) : (address(token), address(weth));
-        PoolKey memory k = PoolKey(Currency.wrap(a), Currency.wrap(b), 0, 60, IHooks(address(hook)));
-        vm.prank(address(manager));
-        hook.beforeInitialize(address(this), k, TickMath.MIN_SQRT_PRICE);
-        vm.expectRevert(_shortfall(800e18, 801e18));
-        _buyNative(801e18);
-        assertEq(_buyNative(800e18), 800e18, "the native door is now capped at its 80%");
-    }
-
-    // Robin pass 65: an owner call between two swaps of one transaction cannot lift a cap or swap roles
-    function test_E_SpreadFloorRaisedMidTransactionKeepsTheCap() public {
-        _twoEthPools(1_000e18, 10e18); // second 188, main 802
-        _spreads(20, 16);
-        assertEq(_buyWrapped(188e18), 188e18);
-        hook.setBaseSpreadFloor(18); // only the sibling (aeWETH, 16) now sits below the floor
-        vm.expectRevert(_shortfall(802e18, 803e18));
-        _buyNative(803e18);
-        assertEq(_buyNative(802e18), 802e18);
-        assertEq(pool.available(), 10e18, "K stays");
-    }
-
-    function test_E_UnregisteringMidTransactionKeepsTheCap() public {
-        _twoEthPools(1_000e18, 10e18);
-        assertEq(_buyWrapped(188e18), 188e18);
-        hook.unregisterPair(Currency.wrap(address(weth)), Currency.wrap(address(token)));
-        vm.expectRevert(_shortfall(802e18, 803e18));
-        _buyNative(803e18);
-        assertEq(_buyNative(802e18), 802e18);
-    }
-
-    function test_E_ShareChangeMidTransactionKeepsTheRoles() public {
-        _twoEthPools(1_000e18, 10e18);
-        assertEq(_buyNative(802e18), 802e18);
-        hook.setNativeShare(address(pool), 2_000); // would make aeWETH the main door
-        assertEq(_buyWrapped(188e18), 188e18);
-        vm.expectRevert(_shortfall(0, 1e18));
-        _buyWrapped(1e18);
-        assertEq(pool.available(), 10e18, "K stays");
-    }
-
-    function test_E_EthPoolsOnDifferentC1PoolsAreNotShared() public {
-        Gen4MockPool other = new Gen4MockPool(token);
-        market.addPool(address(other));
-        pool.setNode(1, 1_000e18, 0);
-        token.mint(address(pool), 1_000e18);
-        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(pool), 0);
-        hook.registerPair(Currency.wrap(address(weth)), Currency.wrap(address(token)), address(other), 0);
-        hook.openPair(address(0), address(token));
-        hook.openPair(address(weth), address(token));
-        assertEq(_buyNative(1_000e18), 1_000e18, "no share cap across two C1 pools");
+        hook.runExactInput(address(pool), address(0), address(weth), address(token), 1e18, address(this));
     }
 }
 
@@ -1214,6 +798,8 @@ contract Gen4HookIntegrationTest is Test {
 ///         PoolManager. This catches hook/caller delta mistakes that the direct
 ///         loop harness intentionally cannot model.
 contract Gen4PoolManagerIntegrationTest is Test {
+    using PoolIdLibrary for PoolKey;
+
     uint160 internal constant FLAGS = uint160((1 << 13) | (1 << 11) | (1 << 7) | (1 << 6) | (1 << 3) | (1 << 2));
 
     MockInventoryToken token;
@@ -1225,6 +811,7 @@ contract Gen4PoolManagerIntegrationTest is Test {
     Gen4MockMarket market;
     PoolManager manager;
     FlowstateC1Hook hook;
+    FlowstatePoolOpener opener;
     PoolSwapTest router;
     PoolKey key;
     address swapper = address(0x5157);
@@ -1242,6 +829,7 @@ contract Gen4PoolManagerIntegrationTest is Test {
         manager = new PoolManager(address(this));
         market.approveAsset(address(quote));
 
+        address openerAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         bytes memory args = abi.encode(
             address(manager),
             address(market),
@@ -1250,9 +838,12 @@ contract Gen4PoolManagerIntegrationTest is Test {
             address(0xBEEF),
             uint16(0),
             address(registry),
-            address(settlement)
+            address(settlement),
+            openerAddress
         );
         (address expected, bytes32 salt) = HookMiner.find(address(this), FLAGS, type(FlowstateC1Hook).creationCode, args);
+        opener = new FlowstatePoolOpener(address(manager), expected, address(weth));
+        assertEq(address(opener), openerAddress, "opener address");
         hook = new FlowstateC1Hook{salt: salt}(
             address(manager),
             address(market),
@@ -1261,7 +852,8 @@ contract Gen4PoolManagerIntegrationTest is Test {
             address(0xBEEF),
             0,
             address(registry),
-            address(settlement)
+            address(settlement),
+            openerAddress
         );
         assertEq(address(hook), expected);
         hook.registerPair(Currency.wrap(address(quote)), Currency.wrap(address(token)), address(inventoryPool), 0);
@@ -1270,13 +862,120 @@ contract Gen4PoolManagerIntegrationTest is Test {
             ? (Currency.wrap(address(quote)), Currency.wrap(address(token)))
             : (Currency.wrap(address(token)), Currency.wrap(address(quote)));
         key = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
-        manager.initialize(key, uint160(1 << 96));
+        // Gen-6: registerPair initialised the pool itself (the mock pool has no anchor, so at 1:1)
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(IPoolManager(address(manager)), key.toId());
+        assertEq(sqrtPriceX96, uint160(1 << 96), "registration initialised the pool at 1:1");
         router = new PoolSwapTest(IPoolManager(address(manager)));
 
         quote.mint(address(manager), 100e18);
         quote.mint(swapper, 100e18);
         vm.prank(swapper);
         quote.approve(address(router), type(uint256).max);
+    }
+
+    // ---- Gen-6 (JUP-772): a pool's first fill lights its visibility beacon ----
+
+    event BeaconSeeded(PoolId indexed poolId, address indexed sender);
+
+    function _buyExactIn(PoolKey memory k, uint256 quoteIn, uint256 value) internal {
+        bool zeroForOne = Currency.unwrap(k.currency0) != address(token);
+        vm.prank(swapper);
+        router.swap{value: value}(
+            k,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(quoteIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+    }
+
+    function _beaconLiquidity(PoolKey memory k, bool payIsCurrency0) internal view returns (uint128) {
+        (int24 lower, int24 upper) = opener.computeBeaconRange(0, 60, payIsCurrency0); // 1:1 pools sit at tick 0
+        bytes32 positionId = Position.calculatePositionKey(address(opener), lower, upper, bytes32(0));
+        return StateLibrary.getPositionLiquidity(IPoolManager(address(manager)), k.toId(), positionId);
+    }
+
+    function test_Beacon_FirstFillLightsIt_PaidFromTheHooksSpread_SecondFillDoesNot() public {
+        inventoryPool.setNode(1, 10e18, 0);
+        token.mint(address(inventoryPool), 10e18);
+        hook.setBaseSpread(Currency.wrap(address(quote)), Currency.wrap(address(token)), 16);
+        bool quoteIsC0 = address(quote) < address(token);
+        assertFalse(hook.beaconSeeded(key.toId()), "unlit before the first fill");
+        assertEq(quote.allowance(address(hook), address(opener)), 0, "no standing allowance to the opener after registration");
+        uint256 managerBefore = quote.balanceOf(address(manager));
+        uint256 swapperBefore = quote.balanceOf(swapper);
+
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit BeaconSeeded(key.toId(), address(opener));
+        _buyExactIn(key, 1e18, 0);
+
+        assertTrue(hook.beaconSeeded(key.toId()), "lit by the first fill");
+        assertEq(_beaconLiquidity(key, quoteIsC0), 1, "one unit of liquidity, owned by the opener, on the quote side");
+        assertEq(swapperBefore - quote.balanceOf(swapper), 1e18, "the buyer paid exactly the swap's input");
+        // the dust (one wei of the quote at 1:1) came out of the hook's spread: the books equal the holdings,
+        // and the PoolManager is up by exactly the beacon
+        assertEq(quote.balanceOf(address(hook)), hook.accruedSpreadMargin(Currency.wrap(address(quote))) + hook.accruedDust(Currency.wrap(address(quote))), "books = holdings");
+        assertEq(quote.balanceOf(address(manager)), managerBefore + 1, "the manager holds the one-wei beacon and nothing else");
+        assertEq(quote.allowance(address(hook), address(opener)), 0, "the fill's grant to the opener is back to zero in the same transaction");
+        uint256 marginAfterFirst = hook.accruedSpreadMargin(Currency.wrap(address(quote)));
+        assertGt(marginAfterFirst, 0, "the spread still accrued");
+
+        // a second fill: no second beacon, the spread accrues in full
+        _buyExactIn(key, 1e18, 0);
+        assertEq(_beaconLiquidity(key, quoteIsC0), 1, "still one unit");
+        assertEq(quote.balanceOf(address(manager)), managerBefore + 1, "no further dust");
+        assertEq(hook.accruedSpreadMargin(Currency.wrap(address(quote))), marginAfterFirst * 2 + 1, "second fill's spread accrued whole (the first paid one wei)");
+    }
+
+    function test_Beacon_ZeroSpreadFillHasNoBudget_FillsAndStaysUnlit() public {
+        inventoryPool.setNode(1, 10e18, 0);
+        token.mint(address(inventoryPool), 10e18);
+        uint256 managerBefore = quote.balanceOf(address(manager));
+        _buyExactIn(key, 1e18, 0);
+        assertFalse(hook.beaconSeeded(key.toId()), "no spread, no beacon");
+        assertEq(token.balanceOf(swapper), 1e18, "the fill is whole");
+        assertEq(quote.balanceOf(address(manager)), managerBefore, "nothing extra in the manager");
+    }
+
+    function test_Beacon_NativePool_PaidByUnwrappingTheHooksWrapperSpread() public {
+        market.approveAsset(address(weth));
+        hook.registerPair(Currency.wrap(address(0)), Currency.wrap(address(token)), address(inventoryPool), 16);
+        PoolKey memory nativeKey =
+            PoolKey({currency0: Currency.wrap(address(0)), currency1: Currency.wrap(address(token)), fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
+        (uint160 seeded,,,) = StateLibrary.getSlot0(IPoolManager(address(manager)), nativeKey.toId());
+        assertEq(seeded, uint160(1 << 96), "registration initialised the native pool");
+        inventoryPool.setNode(1, 10e18, 0);
+        token.mint(address(inventoryPool), 10e18);
+        vm.deal(address(manager), 10 ether); // the hook takes native from the manager, as on Robinhood Chain
+        vm.deal(swapper, 10 ether);
+        uint256 managerBefore = address(manager).balance;
+
+        vm.expectEmit(true, true, false, true, address(hook));
+        emit BeaconSeeded(nativeKey.toId(), address(opener));
+        _buyExactIn(nativeKey, 1e18, 1e18);
+
+        assertTrue(hook.beaconSeeded(nativeKey.toId()), "lit");
+        assertEq(_beaconLiquidity(nativeKey, true), 1, "one unit on the native side");
+        assertEq(address(manager).balance, managerBefore + 1, "one wei of native, unwrapped from the hook's wrapper spread");
+        assertEq(address(hook).balance, 0, "the hook holds no native");
+        assertEq(address(opener).balance, 0, "the opener holds nothing");
+        assertEq(weth.balanceOf(address(hook)), hook.accruedSpreadMargin(Currency.wrap(address(weth))) + hook.accruedDust(Currency.wrap(address(weth))), "books = holdings");
+        assertEq(weth.allowance(address(hook), address(opener)), 0, "no wrapper allowance left to the opener");
+    }
+
+    function test_Beacon_OpenerNeverHoldsAStandingAllowance_MarketAndSettlementStillDo() public {
+        // the two unlimited allowances the hook has always granted stay; the opener's is gone
+        assertEq(quote.allowance(address(hook), address(market)), type(uint256).max, "market allowance unchanged");
+        assertEq(quote.allowance(address(hook), address(settlement)), type(uint256).max, "settlement allowance unchanged");
+        assertEq(quote.allowance(address(hook), address(opener)), 0, "opener: none at registration");
+        // a zero-spread fill never grants anything either
+        inventoryPool.setNode(1, 10e18, 0);
+        token.mint(address(inventoryPool), 10e18);
+        _buyExactIn(key, 1e18, 0);
+        assertEq(quote.allowance(address(hook), address(opener)), 0, "opener: none after an unlit fill");
     }
 
     function test_ExactOutputSurplusPrefundSettlesHookDelta() public {
@@ -1351,7 +1050,9 @@ contract Gen4PoolManagerIntegrationTest is Test {
             : (Currency.wrap(address(token)), Currency.wrap(address(oppositeQuote)));
         PoolKey memory oppositeKey =
             PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
-        manager.initialize(oppositeKey, uint160(1 << 96));
+        // Gen-6: the registration above initialised this pool itself (at 1:1, the mock pool has no anchor)
+        (uint160 seeded,,,) = StateLibrary.getSlot0(IPoolManager(address(manager)), oppositeKey.toId());
+        assertEq(seeded, uint160(1 << 96), "registration initialised the opposite-ordering pool");
 
         inventoryPool.setNode(1, 1e18, 0);
         token.mint(address(inventoryPool), 1e18);

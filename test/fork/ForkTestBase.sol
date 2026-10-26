@@ -4,6 +4,8 @@ pragma solidity 0.8.26;
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
@@ -15,6 +17,7 @@ import {HookMiner} from "@uniswap/v4-periphery/test/shared/HookMiner.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {FlowstateC1Hook} from "../../src/FlowstateC1Hook.sol";
+import {FlowstatePoolOpener} from "../../src/FlowstatePoolOpener.sol";
 import {ListingStandIn} from "./ListingStandIn.sol";
 import {MockInventoryToken} from "../mocks/MockInventoryToken.sol";
 import {RealStackDeployer, IFlowstateMarketTest, IFlowstatePoolTest, ITestSpotOracle, AnchorFloorInput} from "./RealStackDeployer.sol";
@@ -47,6 +50,7 @@ interface IPoolAnchors {
 }
 
 abstract contract ForkTestBase is RealStackDeployer {
+    using PoolIdLibrary for PoolKey;
     // -- Robinhood Chain (4663) canonical addresses, verified 2026-07-28 ------
     address constant POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
     address constant V4_QUOTER = 0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94;
@@ -125,6 +129,7 @@ abstract contract ForkTestBase is RealStackDeployer {
     IV4Quoter quoter = IV4Quoter(V4_QUOTER);
 
     FlowstateC1Hook hook;
+    FlowstatePoolOpener opener;
     RealStack stack;
     IFlowstateMarketTest market;
     IFlowstatePoolTest poolContract;
@@ -162,16 +167,16 @@ abstract contract ForkTestBase is RealStackDeployer {
 
         // 3. the hook, mined to 0x28cc against the real market address
         (address standInRegistry, address standInSettlement) = ListingStandIn.deploy(address(market));
-        (address hookAddress, bytes32 salt) = HookMiner.find(
-            address(this),
-            HOOK_FLAGS,
-            type(FlowstateC1Hook).creationCode,
-            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), standInRegistry, standInSettlement)
+        (address hookAddress, bytes32 salt, address openerAddress) = _planHook(
+            abi.encode(POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), standInRegistry, standInSettlement),
+            POOL_MANAGER,
+            AEWETH
         );
         hook = new FlowstateC1Hook{salt: salt}(
-            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), standInRegistry, standInSettlement
+            POOL_MANAGER, address(market), address(this), AEWETH, TOKEN_JAR, _jarFeeBps(), standInRegistry, standInSettlement, openerAddress
         );
         assertEq(address(hook), hookAddress, "CREATE2 address mismatch");
+        opener = FlowstatePoolOpener(payable(openerAddress));
 
         // Conservative ship default: zero base spread, no rung schedule (the spread
         // suite configures spreads per test; the floor is 0 until set).
@@ -182,7 +187,9 @@ abstract contract ForkTestBase is RealStackDeployer {
             ? (Currency.wrap(USDG), Currency.wrap(address(token)))
             : (Currency.wrap(address(token)), Currency.wrap(USDG));
         poolKey = PoolKey({currency0: c0, currency1: c1, fee: 0, tickSpacing: 60, hooks: IHooks(address(hook))});
-        manager.initialize(poolKey, _sqrtPriceForMockRate());
+        // Gen-6: registerPair initialised the pool itself, through the opener, at the pool's USDG anchor
+        // (the oracle rate the lister consented to), which is exactly the fixture's cosmetic seed price
+        assertEq(_slot0Price(poolKey), _sqrtPriceForMockRate(), "registration initialised the pool at the anchor price");
 
         swapRouter = new PoolSwapTest(manager);
         lpRouter = new PoolModifyLiquidityTest(manager);
@@ -292,6 +299,28 @@ abstract contract ForkTestBase is RealStackDeployer {
     }
 
     // -- helpers --------------------------------------------------------------
+
+    /// @dev Gen-6: the hook carries its opener as a constructor argument and the opener carries the
+    ///      hook, so the opener is deployed FIRST at the CREATE address this contract's next nonce
+    ///      gives, and the hook's CREATE2 address is mined with that address in its arguments (the
+    ///      production sequence, deployer nonce for the opener and the canonical CREATE2 factory for
+    ///      the hook). `args8` = the eight Gen-5 constructor arguments; the opener is appended.
+    function _planHook(bytes memory args8, address poolManager_, address weth)
+        internal
+        returns (address hookAddress, bytes32 salt, address openerAddress)
+    {
+        openerAddress = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        (hookAddress, salt) = HookMiner.find(
+            address(this), HOOK_FLAGS, type(FlowstateC1Hook).creationCode, bytes.concat(args8, abi.encode(openerAddress))
+        );
+        address deployed = address(new FlowstatePoolOpener(poolManager_, hookAddress, weth));
+        require(deployed == openerAddress, "opener address");
+    }
+
+    /// @dev The pool's slot0 sqrt price on the real PoolManager (0 = not initialised).
+    function _slot0Price(PoolKey memory key) internal view returns (uint160 sqrtPriceX96) {
+        (sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, key.toId());
+    }
 
     function mockArbSys() internal {
         vm.etch(ARBSYS, ARBSYS_MOCK_CODE);

@@ -1,0 +1,182 @@
+{
+ "V0_250_200_100_30_500": {
+  "constants": {
+   "attempt": "250000",
+   "legBase": "200000",
+   "reserve": "100000",
+   "listing": "500000"
+  },
+  "shapes": {
+   "native exact-in 0.0005 ETH": {
+    "used": "664209",
+    "estimate": "845227",
+    "ratio": 1.273,
+    "got": "12.345805880600011954",
+    "fillsAtEstimate": true
+   },
+   "native exact-out 5 CASHCAT + SWEEP": {
+    "used": "692144",
+    "estimate": "803037",
+    "ratio": 1.16,
+    "got": "5.0",
+    "fillsAtEstimate": true
+   },
+   "USDG exact-in 1.2 USDG": {
+    "used": "797417",
+    "estimate": "908817",
+    "ratio": 1.14,
+    "got": "12.427989045870417626",
+    "fillsAtEstimate": true
+   },
+   "aeWETH payer, router unwraps into the native door": {
+    "used": "693272",
+    "estimate": "908613",
+    "ratio": 1.311,
+    "got": "12.345805880600011954",
+    "fillsAtEstimate": true
+   },
+   "native exact-in crossing all deposits into the listing (0.016318141893967283 ETH)": {
+    "used": "1019876",
+    "estimate": "1426321",
+    "ratio": 1.399,
+    "got": "402.921224310013838629",
+    "fillsAtEstimate": true
+   }
+  }
+ },
+ "V1_200_200_80_20_500": {
+  "constants": {
+   "attempt": "200000",
+   "legBase": "200000",
+   "reserve": "80000",
+   "listing": "500000"
+  },
+  "shapes": {
+   "native exact-in 0.0005 ETH": {
+    "used": "664209",
+    "estimate": "813442",
+    "ratio": 1.225,
+    "got": "12.345805880600011954",
+    "fillsAtEstimate": true
+   },
+   "native exact-out 5 CASHCAT + SWEEP": {
+    "used": "692144",
+    "estimate": "770591",
+    "ratio": 1.113,
+    "got": "5.0",
+    "fillsAtEstimate": true
+   },
+   "USDG exact-in 1.2 USDG": {
+    "used": "797417",
+    "estimate": "876887",
+    "ratio": 1.1,
+    "got": "12.427989045870417626",
+    "fillsAtEstimate": true
+   },
+   "aeWETH payer, router unwraps into the native door": {
+    "used": "693272",
+    "estimate": "876114",
+    "ratio": 1.264,
+    "got": "12.345805880600011954",
+    "fillsAtEstimate": true
+   },
+   "native exact-in crossing all deposits into the listing (0.016318141893967283 ETH)": {
+    "used": "1019876",
+    "estimate": "1394448",
+    "ratio": 1.367,
+    "got": "402.921224310013838629",
+    "fillsAtEstimate": true
+   }
+  }
+ },
+ "V2_150_150_80_20_500": {
+  "constants": {
+   "attempt": "150000",
+   "legBase": "150000",
+   "reserve": "80000",
+   "listing": "500000"
+  },
+  "shapes": {
+   "native exact-in 0.0005 ETH": {
+    "used": "664209",
+    "estimate": "760249",
+    "ratio": 1.145,
+    "got": "12.345805880600011954",
+    "fillsAtEstimate": true
+   },
+   "native exact-out 5 CASHCAT + SWEEP": {
+    "used": "692144",
+    "estimate": "740849",
+    "ratio": 1.07,
+    "got": "5.0",
+    "fillsAtEstimate": true
+   },
+   "USDG exact-in 1.2 USDG": {
+    "used": "797417",
+    "estimate": "861312",
+    "ratio": 1.08,
+    "got": "12.427989045870417626",
+    "fillsAtEstimate": true
+   },
+   "aeWETH payer, router unwraps into the native door": {
+    "used": "693272",
+    "estimate": "823303",
+    "ratio": 1.188,
+    "got": "12.345805880600011954",
+    "fillsAtEstimate": true
+   },
+   "native exact-in crossing all deposits into the listing (0.016318141893967283 ETH)": {
+    "used": "1019876",
+    "estimate": "1394448",
+    "ratio": 1.367,
+    "got": "402.921224310013838629",
+    "fillsAtEstimate": true
+   }
+  }
+ },
+ "V3_120_120_60_20_400": {
+  "constants": {
+   "attempt": "120000",
+   "legBase": "120000",
+   "reserve": "60000",
+   "listing": "400000"
+  },
+  "shapes": {
+   "native exact-in 0.0005 ETH": {
+    "used": "664209",
+    "estimate": "721329",
+    "ratio": 1.086,
+    "got": "12.345805880600011954",
+    "fillsAtEstimate": true
+   },
+   "native exact-out 5 CASHCAT + SWEEP": {
+    "used": "692144",
+    "estimate": "733414",
+    "ratio": 1.06,
+    "got": "5.0",
+    "fillsAtEstimate": true
+   },
+   "USDG exact-in 1.2 USDG": {
+    "used": "797417",
+    "estimate": "850409",
+    "ratio": 1.066,
+    "got": "12.427989045870417626",
+    "fillsAtEstimate": true
+   },
+   "aeWETH payer, router unwraps into the native door": {
+    "used": "693272",
+    "estimate": "784034",
+    "ratio": 1.131,
+    "got": "12.345805880600011954",
+    "fillsAtEstimate": true
+   },
+   "native exact-in crossing all deposits into the listing (0.016318141893967283 ETH)": {
+    "used": "1019876",
+    "estimate": "1266955",
+    "ratio": 1.242,
+    "got": "402.921224310013838629",
+    "fillsAtEstimate": true
+   }
+  }
+ }
+}
