@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
@@ -122,6 +123,7 @@ contract Gen4MockSettlement {
     MockInventoryToken public immutable token;
     Gen4Recorder public immutable recorder;
     address public immutable market;
+    string public lastListingCode;
     uint256 public rate = 1e18;
     function setRate(uint256 value) external { rate = value; }
     bool public alwaysStale;
@@ -150,9 +152,10 @@ contract Gen4MockSettlement {
         address quoteAsset,
         uint256 maxQuoteIn,
         address recipient,
-        string calldata,
+        string calldata code,
         uint256
     ) external returns (uint8 outcome, uint64 id, uint256 filled, uint256 quotePaid) {
+        lastListingCode = code;
         recorder.record(100 + listingId);
         require(!revertSettle, "settlement reverted");
         if (closed) return (CLOSED, listingId, 0, 0);
@@ -177,6 +180,16 @@ contract Gen4MockMarket {
     Gen4MockPool public immutable pool;
     MockInventoryToken public immutable token;
     Gen4Recorder public immutable recorder;
+    string public lastPoolCode;
+    mapping(address => string) public v4RouterReseller;
+    bool public resolverFails;
+    function setRouterReseller(address router, string calldata code) external { v4RouterReseller[router] = code; }
+    function setResolverFails(bool value) external { resolverFails = value; }
+    function resolveV4Reseller(address router) external view returns (string memory) {
+        require(!resolverFails, "resolver failure");
+        string memory code = v4RouterReseller[router];
+        return bytes(code).length == 0 ? "v4hook" : code;
+    }
     uint256 public rate = 1e18;
     function setRate(uint256 value) external { rate = value; }
     uint256 public executionRate = 1e18;
@@ -221,12 +234,13 @@ contract Gen4MockMarket {
         address,
         address asset,
         uint256 amount,
-        string calldata,
+        string calldata code,
         address buyer,
         uint256 maxCost,
         uint256,
         uint256
     ) public returns (uint256 tokensFilled, uint256 quotePaid) {
+        lastPoolCode = code;
         recorder.record(200);
         if (reenter != address(0)) {
             address r = reenter;
@@ -296,10 +310,11 @@ contract FlowstateC1HookHarness is FlowstateC1Hook {
         address marketAsset,
         address output,
         uint256 quoteIn,
-        address
+        address router
     ) external returns (uint256 tokens, uint256 cost, uint256 refund, uint256 dust) {
         PairConfig memory cfg = PairConfig(pool, false, true, 0, marketAsset);
-        Fill memory f = _buyGen4ExactInput(cfg, Currency.wrap(input), Currency.wrap(output), -int256(quoteIn));
+        string memory code = market.resolveV4Reseller(router);
+        Fill memory f = _buyGen4ExactInput(cfg, Currency.wrap(input), Currency.wrap(output), -int256(quoteIn), code);
         tokens = f.tokensOut;
         cost = f.costBase;
         dust = f.dustAccrued;
@@ -316,10 +331,11 @@ contract FlowstateC1HookHarness is FlowstateC1Hook {
         address marketAsset,
         address output,
         uint256 target,
-        address
+        address router
     ) external returns (uint256 tokens, uint256 cost, uint256 charged) {
         PairConfig memory cfg = PairConfig(pool, false, true, 0, marketAsset);
-        Fill memory f = _buyGen4ExactOutput(cfg, Currency.wrap(input), Currency.wrap(output), int256(target));
+        string memory code = market.resolveV4Reseller(router);
+        Fill memory f = _buyGen4ExactOutput(cfg, Currency.wrap(input), Currency.wrap(output), int256(target), code);
         return (f.tokensOut, f.costBase, f.quoteIn);
     }
 }
@@ -551,6 +567,21 @@ contract Gen4HookIntegrationTest is Test {
         assertEq(recorder.step(0), 101);
         assertEq(recorder.step(1), 200);
         assertEq(recorder.step(2), 102);
+    }
+
+    function test_RouterResolution_SameCodeAcrossPoolAndListingLegs() public {
+        address approvedRouter = address(0xA11CE);
+        market.setRouterReseller(approvedRouter, "partner-a");
+        pool.setNode(1, 1e18, 0);
+        token.mint(address(pool), 1e18);
+        token.mint(address(settlement), 1e18);
+        registry.push(Gen4MockRegistry.Candidate(1, 1, 1e18, 1, 1));
+        (uint256 tokens,,) = hook.runExactOutput(
+            address(pool), address(quote), address(quote), address(token), 2e18, approvedRouter
+        );
+        assertEq(tokens, 2e18);
+        assertEq(market.lastPoolCode(), "partner-a");
+        assertEq(settlement.lastListingCode(), "partner-a");
     }
 
     function test_StaleAttemptCapRevertsAndRetainsNothing() public {
@@ -878,6 +909,10 @@ contract Gen4PoolManagerIntegrationTest is Test {
     event BeaconSeeded(PoolId indexed poolId, address indexed sender);
 
     function _buyExactIn(PoolKey memory k, uint256 quoteIn, uint256 value) internal {
+        _buyExactInWithData(k, quoteIn, value, "");
+    }
+
+    function _buyExactInWithData(PoolKey memory k, uint256 quoteIn, uint256 value, bytes memory hookData) internal {
         bool zeroForOne = Currency.unwrap(k.currency0) != address(token);
         vm.prank(swapper);
         router.swap{value: value}(
@@ -888,7 +923,7 @@ contract Gen4PoolManagerIntegrationTest is Test {
                 sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             }),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
-            ""
+            hookData
         );
     }
 
@@ -938,6 +973,44 @@ contract Gen4PoolManagerIntegrationTest is Test {
         assertFalse(hook.beaconSeeded(key.toId()), "no spread, no beacon");
         assertEq(token.balanceOf(swapper), 1e18, "the fill is whole");
         assertEq(quote.balanceOf(address(manager)), managerBefore, "nothing extra in the manager");
+    }
+
+    function test_RouterResolution_UsesAuthenticatedSwapCallerAndEmitsOnce() public {
+        inventoryPool.setNode(1, 2e18, 0);
+        token.mint(address(inventoryPool), 2e18);
+        market.setRouterReseller(address(router), "partner-a");
+        vm.recordLogs();
+        _buyExactInWithData(key, 1e18, 0, abi.encode("attacker-chosen-code", swapper));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 topic = keccak256("V4RouterResolved(address,string)");
+        uint256 seen;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(hook) || logs[i].topics[0] != topic) continue;
+            ++seen;
+            assertEq(address(uint160(uint256(logs[i].topics[1]))), address(router), "PoolManager caller, not swapper");
+            assertEq(abi.decode(logs[i].data, (string)), "partner-a", "Market mapping");
+        }
+        assertEq(seen, 1, "one resolution for the whole swap");
+    }
+
+    function test_RouterResolution_UnmappedFallbackAndResolverFailure() public {
+        inventoryPool.setNode(1, 2e18, 0);
+        token.mint(address(inventoryPool), 2e18);
+        vm.recordLogs();
+        _buyExactIn(key, 1e18, 0);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 topic = keccak256("V4RouterResolved(address,string)");
+        uint256 seen;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter != address(hook) || logs[i].topics[0] != topic) continue;
+            ++seen;
+            assertEq(abi.decode(logs[i].data, (string)), "v4hook");
+        }
+        assertEq(seen, 1);
+        market.setResolverFails(true);
+        vm.expectRevert();
+        _buyExactIn(key, 1e18, 0);
+        assertEq(inventoryPool.amount(), 1e18, "failed resolution consumed no inventory");
     }
 
     function test_Beacon_NativePool_PaidByUnwrappingTheHooksWrapperSpread() public {
