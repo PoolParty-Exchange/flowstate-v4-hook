@@ -1,5 +1,25 @@
 # JUP-698 stack harness: the Gen-4 hook on the exact pinned PoolParty_Contracts stack
 
+## Gen-7 candidate stack check
+
+`gen7-stack.test.cjs` runs the Gen-7 hook against the current local
+PoolParty_Contracts candidate's real Market, Pool, supplier registry and V2
+listing pair, plus Uniswap V4 PoolManager and PoolSwapTest from this repo's
+Foundry artifacts. It uses synthetic recipients and an isolated Hardhat chain.
+The test exercises a mixed pool/listing swap before mapping, after mapping the
+PoolManager router to `KYBER`, and after unmapping it. It verifies both legs use
+the one authenticated resolver result, that hookData cannot choose the code,
+and that prices, fee totals and supplier credit stay equal across the snapshots.
+This is a local candidate check; its final source pin follows the Gen-7 PR head.
+
+From the candidate PoolParty_Contracts worktree after `forge build` in this
+hook checkout and local Hardhat compilation of the contract candidate:
+
+```powershell
+$env:HOOK_OUT='C:\path\to\flowstate-v4-hook\out'
+node node_modules\hardhat\internal\cli\cli.js test 'C:\path\to\flowstate-v4-hook\test\stack\gen7-stack.test.cjs' --config hardhat.gen7.local.config.js --no-compile
+```
+
 Gate 1 of the JUP-698 handover (Wilko, 26 Sep 2026): conformance against the real contracts, not mocks.
 
 **Pinned stack:** PoolParty_Contracts `3e899f0486e6050a4a6aa096fc4dd67c61eb4d90` (main after PR #57; it carries PR #54's listings and PR #56's `tokenQueueEnds`). The suite also passes on `de4464fb79e67d09212944f00ee64c9fae772bab`, the PR #54 head it was first pinned to. The market, the pool with its linked libraries, `C1ListingRegistry` and `C1ListingSettlement` are the real contracts, built and deployed by that checkout's own Hardhat config and test fixtures. The hook, Uniswap's `PoolManager` and `PoolSwapTest`, and the test-only `Gen4LiveDeltaRouter` come from this repo's `forge build`.

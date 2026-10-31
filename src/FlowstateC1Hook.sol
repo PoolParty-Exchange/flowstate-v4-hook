@@ -413,7 +413,7 @@ contract FlowstateC1Hook is Ownable2Step {
 
     /// @param _poolManager canonical PoolManager for this chain.
     /// @param _market      FlowstateMarket (must be non-zero and code-bearing).
-    /// @param _owner       admin for the pair registry and reseller code.
+    /// @param _owner       admin for pair registration and spread configuration.
     constructor(
         address _poolManager,
         address _market,
