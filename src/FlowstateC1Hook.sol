@@ -351,9 +351,6 @@ contract FlowstateC1Hook is Ownable2Step {
     ///         of reverting inside createPool.
     uint16 public marketRegistrationSpreadBps = 16;
 
-    /// @notice Reseller code passed to the market on each buy ("" = none).
-    string public resellerCode;
-
     // -------------------------------------------------------------------------
     // Margin accrual + sweep state
     // -------------------------------------------------------------------------
@@ -380,7 +377,9 @@ contract FlowstateC1Hook is Ownable2Step {
         Currency indexed currency0, Currency indexed currency1, address indexed marketPool, bool quoteIsCurrency0
     );
     event PairUnregistered(Currency indexed currency0, Currency indexed currency1);
-    event ResellerCodeUpdated(string previous, string current);
+    /// @notice Authenticated PoolManager swap caller and the Market-approved code used
+    ///         for every leg of this swap. Emitted before the first inventory leg.
+    event V4RouterResolved(address indexed router, string effectiveCode);
     /// @dev quoteIn is the buyer's committed input, charged in full (a short exact-input fill
     ///      reverts). Join this event to the market's PoolBuy by transaction hash; the charge
     ///      is quotePaid + spreadAccrued + dustAccrued.
@@ -635,11 +634,6 @@ contract FlowstateC1Hook is Ownable2Step {
         emit SizeRungsUpdated(quote, rungs);
     }
 
-    function setResellerCode(string calldata code) external onlyOwner {
-        emit ResellerCodeUpdated(resellerCode, code);
-        resellerCode = code;
-    }
-
     function setSweepDestination(address destination) external onlyOwner {
         if (destination == address(0)) revert ZeroAddress();
         emit SweepDestinationUpdated(sweepDestination, destination);
@@ -759,9 +753,10 @@ contract FlowstateC1Hook is Ownable2Step {
     ///      hook does 100% of the pricing. hookData is never read (rule 1). Spread
     ///      determination (scope §5): spreadBps = baseSpread[pair] + sizeRung(quote
     ///      notional); the buyer pays market cost * (1 + spreadBps/10_000); the
-    ///      spread accrues as margin per quote asset awaiting sweep. Inputs are pool
-    ///      identity and trade size ONLY (§5b: no per-caller logic).
-    function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+    ///      spread accrues as margin per quote asset awaiting sweep. Price and spread
+    ///      depend on pool identity and trade size; sender only selects the Market's
+    ///      approved fee attribution. Untrusted hookData has no attribution role.
+    function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -774,10 +769,14 @@ contract FlowstateC1Hook is Ownable2Step {
         Currency quote = cfg.quoteIsCurrency0 ? key.currency0 : key.currency1;
         if (Currency.unwrap(input) != Currency.unwrap(quote)) revert SellDirectionNotSupported();
 
+        // PoolManager authenticates sender as its direct swap caller. Market owns the
+        // only mutable router attribution; one resolution applies to every leg.
+        string memory effectiveCode = market.resolveV4Reseller(sender);
+        emit V4RouterResolved(sender, effectiveCode);
         bool exactInput = params.amountSpecified < 0;
         Fill memory f = exactInput
-            ? _buyGen4ExactInput(cfg, input, output, params.amountSpecified)
-            : _buyGen4ExactOutput(cfg, input, output, params.amountSpecified);
+            ? _buyGen4ExactInput(cfg, input, output, params.amountSpecified, effectiveCode)
+            : _buyGen4ExactOutput(cfg, input, output, params.amountSpecified, effectiveCode);
 
         // JUP-621: pay Uniswap's TokenJar its fee on this fill, out of the spread. The
         // fee base is the recomputed oracle cost the market actually charged
@@ -843,7 +842,9 @@ contract FlowstateC1Hook is Ownable2Step {
     ///      records its reason, and one final check decides: at least one token filled AND less than
     ///      one token unit of budget left, else ExactInputShortfall. The sub-unit leftover stays as
     ///      inversion dust, as in gen-3.
-    function _buyGen4ExactInput(PairConfig memory cfg, Currency input, Currency output, int256 amountSpecified)
+    function _buyGen4ExactInput(
+        PairConfig memory cfg, Currency input, Currency output, int256 amountSpecified, string memory effectiveCode
+    )
         internal
         returns (Fill memory f)
     {
@@ -919,7 +920,7 @@ contract FlowstateC1Hook is Ownable2Step {
                     cfg.marketPool,
                     cfg.marketAsset,
                     amount,
-                    resellerCode,
+                    effectiveCode,
                     address(this),
                     remainingBudget,
                     0,
@@ -953,7 +954,7 @@ contract FlowstateC1Hook is Ownable2Step {
                 cfg.marketAsset,
                 maxQuote,
                 address(this),
-                resellerCode,
+                effectiveCode,
                 0
             ) returns (uint8 outcome, uint64 actualId, uint256 listingTokens, uint256 listingQuote) {
                 if (outcome == LISTING_SOLD) {
@@ -999,7 +1000,8 @@ contract FlowstateC1Hook is Ownable2Step {
         PairConfig memory cfg,
         Currency input,
         Currency output,
-        int256 amountSpecified
+        int256 amountSpecified,
+        string memory effectiveCode
     ) internal returns (Fill memory f) {
         uint256 target = uint256(amountSpecified);
         Gen4Accounting.Totals memory totals;
@@ -1040,7 +1042,7 @@ contract FlowstateC1Hook is Ownable2Step {
                     cfg.marketPool,
                     cfg.marketAsset,
                     amount,
-                    resellerCode,
+                    effectiveCode,
                     address(this),
                     poolPrefund,
                     0,
@@ -1071,7 +1073,7 @@ contract FlowstateC1Hook is Ownable2Step {
                 cfg.marketAsset,
                 listingPrefund,
                 address(this),
-                resellerCode,
+                effectiveCode,
                 0
             ) returns (uint8 outcome, uint64 actualId, uint256 listingTokens, uint256 listingQuote) {
                 if (outcome == LISTING_SOLD) {
