@@ -9,6 +9,10 @@ pragma solidity ^0.8.26;
 ///      Verified against the real FlowstateMarket by the fork suite and the stack harness, so
 ///      signature drift on the market side is a compile or test failure here.
 interface IFlowstateMarketMinimal {
+    /// @notice The Market-approved reseller attribution for the direct PoolManager.swap caller.
+    /// @dev An unmapped router resolves to "v4hook". A failed lookup must revert the swap.
+    function resolveV4Reseller(address router) external view returns (string memory);
+
     /// @notice Canonical Market registry entry for a Flowstate pool.
     /// @dev The public mapping getter returns the PoolRecord fields in declaration order.
     function poolRecords(address pool) external view returns (address inventoryToken, bool exists);

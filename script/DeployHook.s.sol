@@ -17,19 +17,12 @@ import {FlowstateC1Hook} from "../src/FlowstateC1Hook.sol";
 ///   LISTING_REGISTRY=0x.. LISTING_SETTLEMENT=0x.. OPENER=0x.. \
 ///   forge script script/DeployHook.s.sol --rpc-url $RH_RPC_URL --broadcast
 ///
-/// Gen-6 (25 Oct 2026, Wilko's review of PR 20): this script DEPLOYS ONLY. It no
-/// longer registers a pair or sets the reseller code: both are onlyOwner, the owner
-/// is the Safe, and the deployer is not the owner. Pair registration is Safe A of the
-/// deploy package (native + USDG quotes, never aeWETH: one ETH door per token) and
-/// each registration initialises its V4 pool through the opener. The reseller code
-/// is a Safe step too.
-///
-/// Ops order (staging rehearsal = production runbook):
-///   1. Register the reseller code on the MARKET first
-///      (deploy/manage-reseller.js in PoolParty_Contracts).
-///   2. DeployOpener.s.sol at the predicted nonce, then this script.
-///   3. Safe A: registerPair(native, token) and registerPair(USDG, token) per token;
-///      Safe B: setResellerCode; Safe C: market.setTrustedHook.
+/// This script deploys only. The Gen-7 hook has no reseller-code setter:
+/// PoolManager's direct swap caller is resolved through the Market on each swap.
+/// Registering pairs, selecting the trusted hook, and any later dedicated-router
+/// mappings are separately reviewed Safe actions. No partner mapping is inferred
+/// from this deployment, and fee-bearing activation needs approved Market terms.
+/// The release package supplies the actual phased order and unsigned review.
 contract DeployHook is Script {
     function run() external {
         bytes32 salt = vm.envBytes32("SALT");
@@ -58,6 +51,6 @@ contract DeployHook is Script {
 
         console2.log("hook deployed:", address(hook));
         console2.log("owner (Safe):", owner);
-        console2.log("next: Safe A registerPair(native|USDG, token) per token (no aeWETH), Safe B setResellerCode, Safe C setTrustedHook");
+        console2.log("next: review Safe pair registration, Market resolver/readback, trusted-hook switch and separate activation gates");
     }
 }

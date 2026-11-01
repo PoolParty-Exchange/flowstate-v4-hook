@@ -153,8 +153,6 @@ contract SpreadConfigForkTest is SpreadTestBase {
         hook.setSizeRungs(usdg, new FlowstateC1Hook.SpreadRung[](0));
         vm.expectRevert();
         hook.registerPair(usdg, Currency.wrap(address(token)), pool, 0);
-        vm.expectRevert();
-        hook.setResellerCode("x");
         vm.stopPrank();
     }
 
