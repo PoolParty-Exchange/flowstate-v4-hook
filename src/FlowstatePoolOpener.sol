@@ -24,15 +24,15 @@ interface IOpenerPoolAnchors {
 }
 
 /// @title FlowstatePoolOpener
-/// @notice Gen-6 (JUP-772, Hamish 24 Oct 2026: "the calls should be built into the user actions"). The two
+/// @notice The two
 ///         Uniswap-side steps that every new token needed an operator for until now, initialising the
 ///         V4 pool key and lighting the visibility beacon, done by the hook itself inside the user's
-///         transaction. They live here, not in the hook, because the hook's runtime is 536 bytes under
-///         EIP-170 (24,040 of 24,576 at Gen-5). The hook holds this contract's address as an immutable
+///         transaction. They live here, not in the hook, because the hook's runtime has no room
+///         left under EIP-170. The hook holds this contract's address as an immutable
 ///         and is the only caller that can spend anything here; `open` is permissionless because the
 ///         PoolManager's initialize is, and the hook's beforeInitialize is the gate either way.
 ///
-///         Funding rule (no protocol capital, Hamish 28 Jul 2026): the beacon's dust (about one wei of
+///         Funding rule (no protocol capital): the beacon's dust (about one wei of
 ///         the quote currency) is paid out of the hook's own spread on the fill that lights it, never
 ///         from the buyer, never from a pool, never from an operator wallet. Between transactions this
 ///         contract holds nothing; the one position it owns per pool is 1 unit of liquidity, out of

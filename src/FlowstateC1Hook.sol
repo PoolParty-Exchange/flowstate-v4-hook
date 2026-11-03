@@ -32,16 +32,16 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///         which exists to emit the ModifyLiquidity event some routing indexers key on
 ///         and can never participate in pricing.
 ///
-/// @dev BUY-ONLY (scope §4, correction C1): a buy is quote-asset in, inventory token out.
+/// @dev BUY-ONLY : a buy is quote-asset in, inventory token out.
 ///      Both sell-direction paths revert with SellDirectionNotSupported, identically in
 ///      the V4Quoter simulation and the real swap. Sellers exit through the existing C1
 ///      deposit-and-claim path, off-hook.
 ///
 ///      Custody: the hook holds no user funds. Between unlocks its ONLY balances are
-///      accrued spread margin + inversion dust awaiting the owner sweep (scope §8);
+///      accrued spread margin + inversion dust awaiting the owner sweep;
 ///      everything else exists only transiently inside a single PoolManager unlock
 ///      (take input -> market pulls exactly the cost -> settle output). No pause, no
-///      sender gates, hookData never read (scope rules 1-3).
+///      sender gates, hookData never read.
 ///
 ///      Address flags must be 0x28cc: BEFORE_INITIALIZE | BEFORE_ADD_LIQUIDITY |
 ///      BEFORE_SWAP | AFTER_SWAP | BEFORE_SWAP_RETURNS_DELTA | AFTER_SWAP_RETURNS_DELTA.
@@ -70,7 +70,7 @@ contract FlowstateC1Hook is Ownable2Step {
     error ManagerReservesExceeded(Currency currency, uint256 requested, uint256 available);
     error SpreadOutOfRange(uint16 bps, uint16 floorBps, uint16 maxBps);
     error TradeTooSmallForSpread(uint256 quoteIn, uint256 spreadBps);
-    /// @dev JUP-621: cannot happen while the spread setters enforce spread >= jarFeeBps;
+    /// @dev cannot happen while the spread setters enforce spread >= jarFeeBps;
     ///      kept as a hard stop so the fee can never be skipped or paid from inventory.
     error JarFeeExceedsSpread(uint256 jarFee, uint256 spreadAccrued);
     error RungScheduleInvalid();
@@ -85,7 +85,7 @@ contract FlowstateC1Hook is Ownable2Step {
     error Gen4AttemptCapExceeded(uint256 attempts);
     error Gen4InsufficientGas(uint256 remaining, uint256 required);
     /// @notice Exact input stopped (gas, a failed read, a failed leg) before anything filled.
-    /// @dev WSR F5 (27 Sep 2026): exact input fills the whole slice or reverts with this. `filled` =
+    /// @dev Exact input fills the whole slice or reverts with this. `filled` =
     ///      tokens the walk had filled, `wanted` = tokens the budget buys at the swap's price, `reason` =
     ///      STOP_*. Nothing is ever handed back, so nothing can be left in a router.
     error ExactInputShortfall(uint256 filled, uint256 wanted, uint8 reason);
@@ -98,9 +98,8 @@ contract FlowstateC1Hook is Ownable2Step {
     /// @notice The canonical PoolManager on this chain.
     IPoolManager public immutable poolManager;
 
-    /// @notice The FlowstateMarket router. The Gen-4 walk buys through its bounded entry point with
-    ///         the input prefunded; the exact-quote/exact-output pair and its fundBuy callback belonged to
-    ///         the Gen-3 path, deleted on 29 Sep 2026.
+    /// @notice The FlowstateMarket router. The walk buys through its bounded entry point with
+    ///         the input prefunded.
     IFlowstateMarketMinimal public immutable market;
 
     /// @notice Wrapped-native (aeWETH on RH). Native-quoted V4 pools are served by
@@ -109,7 +108,7 @@ contract FlowstateC1Hook is Ownable2Step {
     ///         address(0) disables native-quote support on chains without a wrapper.
     IWETH9 public immutable weth9;
 
-    /// @notice JUP-621: Uniswap's TokenJar on this chain. Every fill pays
+    /// @notice Uniswap's TokenJar on this chain. Every fill pays
     ///         `jarFeeBps` of the recomputed oracle cost to it, in the same
     ///         transaction, out of the buyer's spread. Immutable: no setter, no owner
     ///         path, no fill path that skips it. This is the protocol-fee-equivalent
@@ -124,13 +123,12 @@ contract FlowstateC1Hook is Ownable2Step {
     ///         the buyer pays.
     uint16 public immutable jarFeeBps;
 
-    /// @notice JUP-697 one-candidate listing endpoints. Both are required and
-    ///         code-bearing (the Gen-3 path that ran without them was deleted on
-    ///         29 Sep 2026), and the settlement's immutable registry must match.
+    /// @notice The listing registry and settlement. Both are required and code-bearing, and the
+    ///         settlement's immutable registry must match.
     IGen4ListingRegistry public immutable listingRegistry;
     IGen4ListingSettlement public immutable listingSettlement;
 
-    /// @notice Gen-6 (JUP-772, 24 Oct 2026): the hook's door opener. Registering a pair initialises its
+    /// @notice The hook's door opener. Registering a pair initialises its
     ///         V4 pool through it, and a pool's first fill lights the visibility beacon through it, out
     ///         of the hook's own spread on that fill. Immutable, code-bearing, the hook is its only
     ///         paying caller. It exists as a separate contract only because the hook's runtime has no
@@ -144,97 +142,50 @@ contract FlowstateC1Hook is Ownable2Step {
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     uint256 public constant GEN4_MAX_ATTEMPTS = 16;
-    /// @notice Dead listings one swap may retire on the way to stock, outside GEN4_MAX_ATTEMPTS
-    ///         (Wilko, 29 Sep 2026: 17 dead listings at the front walled a swap off). Retiring sells
-    ///         nothing, so queue order is unchanged; each still needs GEN4_LISTING_LEG_MIN_GAS left.
-    ///         Measured on the real stack: about 231k gas per retirement inside a swap.
+    /// @notice Dead listings one swap may retire on the way to stock, outside GEN4_MAX_ATTEMPTS.
+    ///         Retiring sells nothing, so queue order is unchanged; each still needs
+    ///         GEN4_LISTING_LEG_MIN_GAS left.
     uint256 public constant GEN4_MAX_DEAD_RETIREMENTS = 32;
     uint256 public constant GEN4_MAX_POOL_NODES = 50;
     /// @notice Kept back for finalisation after the walk (accounting, jar fee, settle) and the frames
-    ///         above the hook. Measured on a Robinhood Chain fork through the live Universal Router
-    ///         (28 Sep 2026, block 74,626,053): the hook's own finalisation costs about 40k in every
-    ///         gas-matrix case. 200k is five times that. Under all-or-nothing a short reserve can only
-    ///         turn a fill into a revert, never a partial fill, so this sets the lowest gas limit that fills.
-    ///      Gen-5 (20 to 21 Oct 2026): 200k to 100k. Uniswap's router allowlist requires a gas limit under 130% of
-    ///      execution; the deployed Gen-4 needed 1.85x (estimateGas 1,427,945 against 768,570 used, live canary).
-    ///      100k is 2.5x the measured 40k finalisation. Fork evidence: deployment-ledger/gen4_gas_limit_2026-10-20.
-    ///      Gen-6 (24 Oct 2026, Hamish's call after the fork probe): 100k to 60k, 1.5x the measured 40k finalisation.
-    ///      Gen-6 fills cost about 100k less than Gen-5's (Design E's work is gone) while these gates set the required
-    ///      limit, so the limit-to-used ratio rose to 1.32 to 1.40 on the fork under the Gen-5 set; the chosen set measured
-    ///      1.09 / 1.06 / 1.07 / 1.13 / 1.24 on native in, native out, USDG in, an aeWETH payer unwrapped by the router,
-    ///      and a deposits-plus-listing fill (deployment-ledger GEN6_IMPACT_2026-10-24.md, section 7).
+    ///         above the hook. Under all-or-nothing a short reserve can only turn a fill into a revert,
+    ///         never a partial fill, so this sets the lowest gas limit that fills.
     uint256 public constant GEN4_FINALIZATION_GAS_RESERVE = 60_000;
     /// @notice Below reserve + this before an attempt, the walk stops and the swap reverts (exact
-    ///         input and exact output alike; nothing is ever handed back). A courtesy stop sized from measurement, not a
-    ///         guarantee: on the pinned stack the per-attempt reads (peek, tokenQueueEnds, queue,
-    ///         maxBuy; the price is read once per swap) cost ~0.32M cold with one deposit
-    ///         (test/stack/read-gas-probe.test.cjs), a smallest pool leg ~0.32M. An under-gassed swap
-    ///         may still revert in a read; either way the swap reverts (ExactInputShortfall).
-    ///      Gen-5 (20 to 21 Oct 2026): 800k to 250k. The reads before the check (price, registry, queue, maxBuy) are
-    ///      already spent when it runs; 250k covers the smallest pool leg (live 225k including its oracle read)
-    ///      with the reserve and return allowance held separately. Together with the three other Gen-5 floors
-    ///      the required limit measured 1.11x to 1.23x of execution across the three canary shapes and both
-    ///      pricing branches (fork, 21 Oct); the 300k first draft measured 1.25x to 1.31x because the CLEAR
-    ///      branch executes 50k to 70k cheaper than CATCH_UP while the required limit barely moves.
-    ///      Gen-6 (24 Oct 2026): 250k to 120k; the gate before an attempt is now reserve + 120k = 180k against the roughly
-    ///      150k the pre-attempt reads cost on the fork. Still a courtesy stop: an under-gassed leg is caught and the swap
-    ///      reverts, all or nothing.
+    ///         input and exact output alike; nothing is ever handed back). A courtesy stop, not a
+    ///         guarantee: an under-gassed swap may still revert in a read; either way the swap
+    ///         reverts (ExactInputShortfall).
     uint256 public constant GEN4_MIN_ATTEMPT_GAS = 120_000;
-    /// @notice Pool leg planning, from EXECUTION gas (eth_estimateGas, before end-of-transaction
-    ///         refunds) of the market's bounded buy on the pinned stack
-    ///         (test/stack/exec-gas-probe.test.cjs): 326k base + 55.7k per node plain; 414k base +
-    ///         109k per node when proceeds recycle into the buy-back (buy-back on in the traded
-    ///         asset, owner opted in). Paying a sell-side partner (market supplier registry set,
-    ///         JUP-695) adds up to ~134k per node. The hook reads both settings once per swap and
-    ///         plans with the matching figure (+~15%), assuming the worst when a read fails. The
-    ///         base is the larger of this floor and what the market's own maxBuy cost in this
-    ///         swap, since the buy re-runs that venue evaluation. A fully pinned node is only
-    ///         stepped over. A leg that still runs out of gas is caught (see _buyGen4ExactInput).
-    ///      Gen-5 (20 to 21 Oct 2026): 450k to 200k. The 450k came from an estimateGas probe that counted 63/64
-    ///      retention; the live leg inside the swap is 225k including its warm oracle read, so 200k sits below it:
-    ///      a leg planned with only the floor can run short on a cold oracle read, is caught, and the swap reverts
-    ///      atomically (availability at a tight gas limit, not safety). Lowering it only changes how many nodes a
-    ///      leg is planned for at a given gas budget.
-    ///      Gen-6 (24 Oct 2026): 200k to 120k. The planning base is the larger of this floor and what the market's maxBuy
-    ///      cost in the same swap, so the floor binds only when that read was cheaper than a leg; a leg that then runs
-    ///      short is caught and the swap reverts atomically.
+    /// @notice Pool leg planning base, in execution gas: the per-node cost of the market's bounded
+    ///         buy, higher when proceeds recycle into the buy-back or a sell-side partner is paid.
+    ///         The hook reads both settings once per swap and plans with the matching figure,
+    ///         assuming the worst when a read fails. The base is the larger of this floor and what
+    ///         the market's own maxBuy cost in this swap, since the buy re-runs that venue
+    ///         evaluation. A fully pinned node is only stepped over. A leg that still runs out of
+    ///         gas is caught (see _buyGen4ExactInput).
     uint256 public constant GEN4_POOL_LEG_BASE_GAS = 120_000;
     uint256 public constant GEN4_POOL_NODE_GAS = 65_000;
     uint256 public constant GEN4_POOL_NODE_GAS_RECYCLED = 125_000;
     uint256 public constant GEN4_POOL_NODE_GAS_ATTRIBUTED = 220_000;
     uint256 public constant GEN4_POOL_NODE_GAS_ATTRIBUTED_RECYCLED = 280_000;
     uint256 public constant GEN4_POOL_SKIP_GAS = 15_000;
-    /// @notice Least gas a listing leg is started with. A listing leg measured 335k to 542k inside the
-    ///         swap on the same fork (attribution on); the JUP-697 acceptance measured whole
-    ///         transactions at 0.9M to 1.2M with partner cuts. 800k is about 1.5 times the largest leg.
-    ///         A leg that still runs short is caught and the swap reverts (all-or-nothing).
-    ///      Gen-5 (20 Oct 2026): 800k to 500k. Measured on a fork with a live 2,000 CASHCAT listing and an empty
-    ///      deposit queue (native exact-in, the main door): a fill served by the listing used 1,038,778 gas and
-    ///      needed a limit of 1,251,472 (1.21x) at 500k; 600k gave 1.31x, 800k 1.51x. 500k sits inside the measured
-    ///      listing-leg range (335k to 542k, attribution on), below its maximum, so a leg that is started with only the
-    ///      floor can still run out of gas on the largest listings; that leg is caught and the swap reverts atomically
-    ///      (no partial fill), so the floor trades availability at a tight gas limit for the routing ratio, nothing more.
-    ///      Gen-6 (24 Oct 2026): 500k to 400k. This floor alone decides the deposits-plus-listing shape: 500k pinned it at
-    ///      1.37 whatever the other four did, 400k brought it to 1.24. 400k sits inside the measured listing-leg range
-    ///      (335k to 542k, attribution on), so the largest listing legs can start under-gassed; such a leg is caught and
-    ///      the swap reverts atomically (availability at a tight limit, never a partial fill).
+    /// @notice Least gas a listing leg is started with. A leg that runs short is caught and the
+    ///         swap reverts (all-or-nothing), so the floor trades availability at a tight gas limit
+    ///         for the routing ratio, nothing more.
     uint256 public constant GEN4_LISTING_LEG_MIN_GAS = 400_000;
     /// @notice Upper bound on the gas forwarded to one leg.
     uint256 public constant GEN4_MAX_LEG_GAS = 10_000_000;
-    /// @dev Gas given to the opener for a pool's first-fill beacon (Gen-6), attempted only when at least
+    /// @dev Gas given to the opener for a pool's first-fill beacon, attempted only when at least
     ///      this plus the finalisation reserve is left, so a tight swap skips the beacon instead of failing.
     uint256 internal constant BEACON_GAS = 300_000;
     /// @dev two approvals around the beacon attempt (grant this fill's spread, then zero it)
     uint256 internal constant BEACON_APPROVAL_GAS = 30_000;
     /// @dev What this frame keeps for itself after a leg returns, beyond the finalisation reserve.
-    ///      Gen-5 (20 to 21 Oct 2026): 60k to 30k; the frame's bookkeeping after a leg returns is a few thousand gas.
-    ///      Gen-6 (24 Oct 2026): 30k to 20k.
     uint256 internal constant GEN4_LEG_RETURN_GAS = 20_000;
     /// @dev Caps on the queue and listing reads, whose cost is bounded by the 50-node window and
-    ///      the registry's own walk bounds (measured cold: peek 90k, tokenQueueEnds 16k, queue 477k).
-    ///      maxBuy and price are not held to this cap: they run the venue evaluation, whose cost grows
-    ///      with the venue's initialized ticks (review F2: ~19k per tick, 1.57M at 72 ticks), so they
-    ///      get the gas that is left (at most GEN4_MAX_LEG_GAS), as the legs do.
+    ///      the registry's own walk bounds. maxBuy and price are not held to this cap: they run the
+    ///      venue evaluation, whose cost grows with the venue's initialized ticks, so they get the
+    ///      gas that is left (at most GEN4_MAX_LEG_GAS), as the legs do.
     uint256 internal constant GEN4_READ_GAS_LIMIT = 1_000_000;
     uint256 internal constant GEN4_REGISTRY_READ_GAS = 50_000;
     uint8 internal constant STOP_GAS = 1;
@@ -244,8 +195,8 @@ contract FlowstateC1Hook is Ownable2Step {
     uint8 internal constant STOP_STOCK = 5;
     uint8 internal constant STOP_CLOSED = 6;
     uint8 internal constant STOP_ATTEMPT_CAP = 7;
-    /// @notice The one tick spacing a pool of a registered pair may use (every live gen-3 door): one
-    ///         V4 pool per pair, so no route can count the same stock twice (WSR F5 pass, 27 Sep 2026).
+    /// @notice The one tick spacing a pool of a registered pair may use: one V4 pool per pair, so
+    ///         no route can count the same stock twice.
     int24 public constant CANONICAL_TICK_SPACING = 60;
     uint256 internal constant GEN4_QUEUE_READ_GAS_LIMIT = 1_000_000;
 
@@ -266,7 +217,7 @@ contract FlowstateC1Hook is Ownable2Step {
     // -------------------------------------------------------------------------
 
     /// @dev One fill's accounting, returned by the two fill helpers as a memory struct
-    ///      (JUP-621 added a sixth value and the tuple form overflowed the EVM stack).
+    ///      (the tuple form overflows the EVM stack).
     struct Fill {
         uint256 quoteIn;
         uint256 tokensOut;
@@ -305,7 +256,7 @@ contract FlowstateC1Hook is Ownable2Step {
         address marketAsset;
     }
 
-    /// @notice One size-adjustment rung (scope §5): trades whose quote notional is
+    /// @notice One size-adjustment rung: trades whose quote notional is
     ///         <= notionalCeiling pay extraBps on top of the pair's baseSpreadBps.
     struct SpreadRung {
         uint128 notionalCeiling; // in raw quote-asset units
@@ -317,12 +268,10 @@ contract FlowstateC1Hook is Ownable2Step {
     mapping(bytes32 pairKey => PairConfig config) public pairs;
 
     /// @notice Visibility beacon: whether a pool has consumed its single permitted
-    ///         liquidityDelta == 1 dust add (JUP-516). Measured 2026-08-08: GMGN's
-    ///         routing index admits pools by ModifyLiquidity history, so one dust add
-    ///         is the difference between invisible and routable there. Permissionless
-    ///         by design: any caller may fire it, the 1-wei cap means no real capital
-    ///         can ever be parked, and the dust never trades (beforeSwap consumes the
-    ///         entire specified amount, so the core curve always runs on zero).
+    ///         liquidityDelta == 1 dust add, the ModifyLiquidity event some routing indexers
+    ///         key on. Permissionless by design: any caller may fire it, the 1-wei cap means no
+    ///         real capital can ever be parked, and the dust never trades (beforeSwap consumes
+    ///         the entire specified amount, so the core curve always runs on zero).
     mapping(PoolId poolId => bool seeded) public beaconSeeded;
 
     /// @notice Size-adjustment schedule PER MARKET ASSET: notional is measured in raw
@@ -338,17 +287,14 @@ contract FlowstateC1Hook is Ownable2Step {
     ///         than a mid-size one). Empty schedule = baseSpread only (ship default).
     mapping(Currency quote => SpreadRung[] rungs) internal _sizeRungs;
 
-    /// @notice Current floor on baseSpreadBps (the per-chain oracle-drift floor,
-    ///         scope §5: 10 bps BSC / 16 bps RH / 23 bps Base — set operationally at
-    ///         deploy). Checked when configuring and when testing readiness/executing,
-    ///         so raising it lazily disables older below-floor pairs until retuned.
+    /// @notice Current floor on baseSpreadBps (the per-chain oracle-drift floor, set at deploy).
+    ///         Checked when configuring and when testing readiness/executing, so raising it
+    ///         lazily disables older below-floor pairs until retuned.
     uint16 public baseSpreadFloorBps;
 
-    /// @notice Spread applied to pairs the trusted Market auto-registers inside
-    ///         createPool (JUP-587). 16 bps = launch parity with the manually
-    ///         registered CASHCAT/HOODRAT pairs. If the floor is later raised above
-    ///         this value the market path self-heals by charging the floor instead
-    ///         of reverting inside createPool.
+    /// @notice Spread applied to pairs the trusted Market auto-registers inside createPool.
+    ///         If the floor is later raised above this value the market path self-heals by
+    ///         charging the floor instead of reverting inside createPool.
     uint16 public marketRegistrationSpreadBps = 16;
 
     // -------------------------------------------------------------------------
@@ -365,8 +311,7 @@ contract FlowstateC1Hook is Ownable2Step {
     ///         the same sweep.
     mapping(Currency asset => uint256 amount) public accruedDust;
 
-    /// @notice Owner-settable sweep destination (scope §5: the same wallet the
-    ///         UniswapX executor margins sweep to today).
+    /// @notice Owner-settable sweep destination.
     address public sweepDestination;
 
     // -------------------------------------------------------------------------
@@ -403,7 +348,7 @@ contract FlowstateC1Hook is Ownable2Step {
         Currency indexed asset, address indexed to, uint256 spreadPortion, uint256 dustPortion, uint256 swept
     );
     event ETHSwept(address indexed to, uint256 amount);
-    /// @notice JUP-621: the TokenJar fee paid on one fill, in the quote asset the
+    /// @notice the TokenJar fee paid on one fill, in the quote asset the
     ///         buyer paid (the wrapper for a native quote).
     event ProtocolFeePaid(PoolId indexed poolId, Currency indexed asset, uint256 amount);
 
@@ -437,7 +382,7 @@ contract FlowstateC1Hook is Ownable2Step {
         weth9 = IWETH9(_weth9); // address(0) = native quotes disabled on this chain
         tokenJar = _tokenJar;
         jarFeeBps = _jarFeeBps;
-        // Gen-4 only (29 Sep 2026): the listings-free Gen-3 path is deleted, so both are required
+        // both endpoints are required
         if (_listingRegistry.code.length == 0 || _listingSettlement.code.length == 0) {
             revert ListingWiringMismatch(_listingRegistry, _listingSettlement);
         }
@@ -455,7 +400,7 @@ contract FlowstateC1Hook is Ownable2Step {
         }
         listingRegistry = IGen4ListingRegistry(_listingRegistry);
         listingSettlement = IGen4ListingSettlement(_listingSettlement);
-        // Gen-6 (Robin pass, 24 Oct 2026): the hook grants the opener an allowance on every market asset, so
+        // the hook grants the opener an allowance on every market asset, so
         // a code-bearing address is not enough: the opener must be bound to THIS hook, manager and wrapper
         if (_opener.code.length == 0) revert ZeroAddress();
         if (
@@ -510,18 +455,16 @@ contract FlowstateC1Hook is Ownable2Step {
         _registerPair(quote, token, marketPool, baseSpreadBps);
     }
 
-    /// @notice Market-trusted auto-registration fired inside createPool (JUP-587; Wilko GO 24 Aug:
-    ///         no venue discovery, no oracle feed work). IDEMPOTENT: an already-registered pair is
-    ///         left untouched, however it is tuned, so a market call can never clobber owner
-    ///         configuration. Spread = the configured market registration spread, floored at
-    ///         baseSpreadFloorBps so a later floor raise degrades to a wider spread instead of a
-    ///         createPool-time revert.
-    ///         Gen-6 (JUP-772, Hamish 24 Oct 2026): ONE ETH door per token. The market registering the
-    ///         wrapper's pair opens the token's NATIVE-ETH pair instead (the market asset stays the
-    ///         wrapper): routers wrap and unwrap at the edges themselves (Uniswap and Kyber measured 23
-    ///         and 24 Oct 2026), and one ETH pool means no route can split an ETH buy across two doors.
-    ///         Each registration initialises its V4 pool (_registerPair). No Safe call and no operator
-    ///         transaction is left on the Uniswap side of a new token.
+    /// @notice Market-trusted auto-registration fired inside createPool. IDEMPOTENT: an
+    ///         already-registered pair is left untouched, however it is tuned, so a market call can
+    ///         never clobber owner configuration. Spread = the configured market registration
+    ///         spread, floored at baseSpreadFloorBps so a later floor raise degrades to a wider
+    ///         spread instead of a createPool-time revert.
+    ///         One ETH door per token: the market registering the wrapper's pair opens the token's
+    ///         NATIVE-ETH pair instead (the market asset stays the wrapper); routers wrap and unwrap
+    ///         at the edges themselves, and one ETH pool means no route can split an ETH buy across
+    ///         two doors. Each registration initialises its V4 pool (_registerPair). No Safe call
+    ///         and no operator transaction is left on the Uniswap side of a new token.
     function registerPairFromMarket(Currency quote, Currency token, address marketPool) external {
         if (msg.sender != address(market)) revert NotMarket();
         if (marketPool == address(0)) revert ZeroAddress();
@@ -542,7 +485,7 @@ contract FlowstateC1Hook is Ownable2Step {
     }
 
     function _registerPair(Currency quote, Currency token, address marketPool, uint16 baseSpreadBps) internal {
-        // native quote (v1 decision, 2026-07-30): served by wrapping into weth9, so
+        // native quote: served by wrapping into weth9, so
         // the market-side asset for a native pair IS the wrapper
         address marketAsset;
         if (quote.isAddressZero()) {
@@ -566,7 +509,7 @@ contract FlowstateC1Hook is Ownable2Step {
         // no standing allowance for the opener: _lightBeacon grants exactly one fill's spread, once
         emit PairRegistered(c0, c1, marketPool, quoteIsCurrency0);
         emit BaseSpreadUpdated(c0, c1, baseSpreadBps);
-        // Gen-6: the pair's V4 pool is initialised here, in the same transaction, by the opener (whose
+        // the pair's V4 pool is initialised here, in the same transaction, by the opener (whose
         // initialize call runs this hook's beforeInitialize gate). Best effort: a refusal leaves the pool
         // to the permissionless opener.open / PoolManager.initialize.
         try opener.open(quote, token) {} catch {}
@@ -593,14 +536,14 @@ contract FlowstateC1Hook is Ownable2Step {
     ///         and non-executable until the owner retunes them.
     function setBaseSpreadFloor(uint16 floorBps) external onlyOwner {
         if (floorBps > MAX_SPREAD_BPS) revert SpreadOutOfRange(floorBps, 0, MAX_SPREAD_BPS);
-        // JUP-621: the floor is only a floor on top of the jar fee; a lower floor would
+        // the floor is only a floor on top of the jar fee; a lower floor would
         // let setBaseSpread admit a spread that cannot carry the fee.
         if (floorBps < jarFeeBps) revert SpreadOutOfRange(floorBps, jarFeeBps, MAX_SPREAD_BPS);
         emit BaseSpreadFloorUpdated(baseSpreadFloorBps, floorBps);
         baseSpreadFloorBps = floorBps;
     }
 
-    /// @notice Retune the spread used by market auto-registration (JUP-587).
+    /// @notice Retune the spread used by market auto-registration.
     ///         Already-registered pairs are untouched (retune those per-pair via
     ///         setBaseSpread). Bounded by the hard cap only; the floor is applied
     ///         lazily at registration time so this can never make createPool revert.
@@ -641,16 +584,15 @@ contract FlowstateC1Hook is Ownable2Step {
     }
 
     // -------------------------------------------------------------------------
-    // Sweep (mirrors the UniswapX executor's sweepTokens/sweepETH collection path)
+    // Sweep
     // -------------------------------------------------------------------------
 
     /// @notice Collect accrued margin for one quote asset. Sweeps the hook's FULL
-    ///         balance — which is exactly accruedSpreadMargin + accruedDust by
-    ///         construction (the hook holds nothing else between unlocks), plus any
-    ///         force-sent donation dust (recovered here, mirroring the executor's
-    ///         stuck-dust recovery). Both accrual counters reset; the event carries
-    ///         the split so off-chain reconciliation (O1 monthly pass) can check
-    ///         spreadPortion + dustPortion == swept absent donations.
+    ///         balance, which is exactly accruedSpreadMargin + accruedDust by construction
+    ///         (the hook holds nothing else between unlocks), plus any force-sent donation
+    ///         dust (recovered here). Both accrual counters reset; the event carries the split
+    ///         so off-chain reconciliation can check spreadPortion + dustPortion == swept
+    ///         absent donations.
     function sweepMargin(Currency asset) external onlyOwner returns (uint256 swept) {
         address to = sweepDestination;
         if (to == address(0)) revert SweepDestinationNotSet();
@@ -727,15 +669,14 @@ contract FlowstateC1Hook is Ownable2Step {
         return IHooks.beforeInitialize.selector;
     }
 
-    /// @notice Visibility beacon gate (JUP-516): admits exactly ONE liquidityDelta == 1
-    ///         add per pool, from any caller (Gen-6: the opener, on the pool's first fill, is the
-    ///         usual one; the seeder periphery and anyone else can still go first), then closes that pool forever. The
-    ///         ModifyLiquidity event this permits is the measured key into GMGN's
-    ///         routing index. Everything else about the original stray-LP protection
-    ///         survives: no position of real size can ever be created (delta capped at
-    ///         1), the dust never participates in pricing (the custom curve consumes
-    ///         the entire specified amount before the core swap runs), and removals
-    ///         remain unflagged because the only position that can exist is 1 wei.
+    /// @notice Visibility beacon gate: admits exactly ONE liquidityDelta == 1 add per pool, from
+    ///         any caller (the opener, on the pool's first fill, is the usual one; anyone else can
+    ///         go first), then closes that pool forever. The ModifyLiquidity event this permits is
+    ///         what some routing indexers key on. Everything else about the original stray-LP
+    ///         protection survives: no position of real size can ever be created (delta capped at
+    ///         1), the dust never participates in pricing (the custom curve consumes the entire
+    ///         specified amount before the core swap runs), and removals remain unflagged because
+    ///         the only position that can exist is 1 wei.
     function beforeAddLiquidity(address sender, PoolKey calldata key, ModifyLiquidityParams calldata params, bytes calldata)
         external
         onlyPoolManager
@@ -750,8 +691,8 @@ contract FlowstateC1Hook is Ownable2Step {
 
     /// @dev The custom curve. Consumes the entire specified amount (specifiedDelta =
     ///      -amountSpecified) so the concentrated-liquidity swap runs on zero and the
-    ///      hook does 100% of the pricing. hookData is never read (rule 1). Spread
-    ///      determination (scope §5): spreadBps = baseSpread[pair] + sizeRung(quote
+    ///      hook does 100% of the pricing. hookData is never read. Spread
+    ///      determination: spreadBps = baseSpread[pair] + sizeRung(quote
     ///      notional); the buyer pays market cost * (1 + spreadBps/10_000); the
     ///      spread accrues as margin per quote asset awaiting sweep. Price and spread
     ///      depend on pool identity and trade size; sender only selects the Market's
@@ -778,14 +719,14 @@ contract FlowstateC1Hook is Ownable2Step {
             ? _buyGen4ExactInput(cfg, input, output, params.amountSpecified, effectiveCode)
             : _buyGen4ExactOutput(cfg, input, output, params.amountSpecified, effectiveCode);
 
-        // JUP-621: pay Uniswap's TokenJar its fee on this fill, out of the spread. The
+        // pay Uniswap's TokenJar its fee on this fill, out of the spread. The
         // fee base is the recomputed oracle cost the market actually charged
         // (quotePaid / cost), the same base the spread is computed on, so
         // jarFee <= spreadAccrued always holds (spreadBps >= jarFeeBps is enforced by
         // every spread setter). Paid before the margin is booked, in the asset the hook
         // is holding (the wrapper for a native quote), inside the swap itself.
         f.spreadAccrued = _payJar(key.toId(), input, f.costBase, f.spreadAccrued);
-        // Gen-6: a pool's first fill lights its visibility beacon out of the hook's own spread on this
+        // a pool's first fill lights its visibility beacon out of the hook's own spread on this
         // fill (after the jar); the buyer's price and amounts are already fixed above
         if (!beaconSeeded[key.toId()]) f.spreadAccrued -= _lightBeacon(key, cfg.quoteIsCurrency0, f.spreadAccrued);
         Currency heldInput = input.isAddressZero() ? Currency.wrap(address(weth9)) : input;
@@ -796,13 +737,13 @@ contract FlowstateC1Hook is Ownable2Step {
         return (IHooks.beforeSwap.selector, f.hookDelta, 0);
     }
 
-    /// @dev Gen-6 (JUP-772): light the pool's beacon through the opener, which takes at most `budget` of
+    /// @dev Light the pool's beacon through the opener, which takes at most `budget` of
     ///      the asset the hook holds for this quote (the wrapper for a native quote; the opener unwraps
     ///      what the pool owes in native), the hook's own spread and dust on this fill. Never blocks a
     ///      fill: skipped when the budget is zero or the gas left would eat into the finalisation
     ///      reserve, and a failed attempt is caught and leaves the pool for the next fill or the seeder
     ///      periphery. Returns what was spent.
-    /// @dev The opener holds NO standing allowance (Hamish, 26 Oct 2026). The hook grants it this
+    /// @dev The opener holds NO standing allowance. The hook grants it this
     ///      fill's spread immediately before the attempt and takes the grant back immediately after,
     ///      success or not, so the most the opener can ever pull is one fill's spread, once per pool.
     ///      Both approvals run outside the gas-capped call; BEACON_APPROVAL_GAS covers them in the gate.
@@ -817,7 +758,7 @@ contract FlowstateC1Hook is Ownable2Step {
         held.forceApprove(address(opener), 0);
     }
 
-    /// @dev JUP-621: pay the TokenJar its fee for this fill and return the spread the
+    /// @dev pay the TokenJar its fee for this fill and return the spread the
     ///      hook keeps. Paid in the asset the hook holds (the wrapper for a native quote).
     function _payJar(PoolId poolId, Currency input, uint256 costBase, uint256 spreadAccrued)
         internal
@@ -833,15 +774,15 @@ contract FlowstateC1Hook is Ownable2Step {
     }
 
     // -------------------------------------------------------------------------
-    // Gen-4 mixed pool/listing lane (JUP-698)
+    // Mixed pool/listing lane
     // -------------------------------------------------------------------------
 
-    /// @dev Exact input fills the whole slice or reverts (WSR F5, 27 Sep 2026): nothing is ever handed
+    /// @dev Exact input fills the whole slice or reverts: nothing is ever handed
     ///      back, so nothing can be left in a router. The price is read before the input is taken. The
     ///      walk stops as soon as the budget left cannot buy one more token unit; every other stop
     ///      records its reason, and one final check decides: at least one token filled AND less than
     ///      one token unit of budget left, else ExactInputShortfall. The sub-unit leftover stays as
-    ///      inversion dust, as in gen-3.
+    ///      inversion dust.
     function _buyGen4ExactInput(
         PairConfig memory cfg, Currency input, Currency output, int256 amountSpecified, string memory effectiveCode
     )
@@ -915,7 +856,7 @@ contract FlowstateC1Hook is Ownable2Step {
                 if (sized < poolCap) poolCap = sized;
                 uint256 amount = _affordable(poolCap, remainingBudget, priceRate);
                 // A leg that reverts or runs out of gas is rolled back inside the market; the walk
-                // stops and the final check reverts the swap. Gas is re-read at the call (Robin pass 57).
+                // stops and the final check reverts the swap. Gas is re-read at the call.
                 try market.buyFromPoolBounded{gas: _legGas()}(
                     cfg.marketPool,
                     cfg.marketAsset,
@@ -992,7 +933,7 @@ contract FlowstateC1Hook is Ownable2Step {
     }
 
     /// @dev Exact output caps every leg by the remaining target. Pool and listing
-    ///      calls are pre-funded at the same previewed rate used by JUP-697; any
+    ///      calls are pre-funded at the same previewed rate used by the settlement; any
     ///      typed unsuccessful listing outcome refunds that pre-funding before both
     ///      sources are inspected again. Failure to reach the target reverts the
     ///      whole unlock, so no partial exact-output debt can survive.
@@ -1159,7 +1100,7 @@ contract FlowstateC1Hook is Ownable2Step {
         c.boundary = boundary;
         c.nodes = nodes;
 
-        // maxBuy runs the venue evaluation (review F2): it gets the gas that is left, and a failure is
+        // maxBuy runs the venue evaluation: it gets the gas that is left, and a failure is
         // reported to the caller (exact input stops or reverts, exact output reverts)
         uint256 marketMax;
         uint256 before = gasleft();
@@ -1170,7 +1111,7 @@ contract FlowstateC1Hook is Ownable2Step {
             return c;
         }
         // the market's bounded buy re-runs this evaluation (warm): use what it cost here as an estimate
-        // of the leg's base, never below the measured floor; a leg that still runs short is caught
+        // of the leg's base, never below the floor; a leg that still runs short is caught
         uint256 spent = before - gasleft();
         c.legBase = spent > GEN4_POOL_LEG_BASE_GAS ? spent : GEN4_POOL_LEG_BASE_GAS;
         c.executable = c.totalAvailable < marketMax ? c.totalAvailable : marketMax;
@@ -1201,7 +1142,7 @@ contract FlowstateC1Hook is Ownable2Step {
     ///      pool's buy-back (buy-back on with the traded asset). A getter that reverts or runs out of
     ///      gas counts as on. Malformed return data from a getter reverts in this frame (try/catch does
     ///      not cover decoding): the market and pool are FlowState's own contracts, fixed at pair
-    ///      registration and upgraded only through the timelock (Robin pass 58).
+    ///      registration and upgraded only through the timelock.
     function _poolNodeGas(PairConfig memory cfg) internal view returns (uint256) {
         bool attributed = true;
         try market.supplierRegistry{gas: GEN4_REGISTRY_READ_GAS}() returns (address registry) {
@@ -1221,12 +1162,12 @@ contract FlowstateC1Hook is Ownable2Step {
         return recycled ? GEN4_POOL_NODE_GAS_RECYCLED : GEN4_POOL_NODE_GAS;
     }
 
-    /// @dev The swap route's price, read once per swap (Hamish, 26 Sep 2026). It is the passive rule of
+    /// @dev The swap route's price, read once per swap. It is the passive rule of
     ///      the pool's registered venue, which this swap does not trade: pool legs and listing sales move
     ///      neither the venue nor anything else the rule prices from, and no admin call can land inside
     ///      the swap. Each leg still prices itself at execution and is bounded by what the hook offers
     ///      (maxCost, maxQuoteIn), so a moved price fails that leg, which is caught. The read runs the
-    ///      venue evaluation, so it gets the gas that is left (review F2).
+    ///      venue evaluation, so it gets the gas that is left.
     function _readPrice(address token, address asset) internal view returns (bool ok, uint8 why, uint256 rate) {
         try listingSettlement.price{gas: _legGas()}(token, asset) returns (uint8 w, uint256 r) {
             return (true, w, r);
@@ -1237,14 +1178,12 @@ contract FlowstateC1Hook is Ownable2Step {
 
     /// @dev The next source and how much a pool leg may take (both walks): the pool's deposits up to the
     ///      listing's position in the queue (all of them when there is no listing), capped by what the
-    ///      market says is executable. Gen-6 (Hamish, 24 Oct 2026): ONE Uniswap door per currency per
-    ///      token, every door free. Design E's two-ETH-door share (29 Sep 2026) is retired with its
-    ///      transient ledger: the market's aeWETH registration maps to the native pair, so no token gets
-    ///      two ETH pools on this hook and no route can split one ETH buy across two ETH doors; Uniswap's
-    ///      and Kyber's routers wrap and unwrap at the edges themselves (measured 23 and 24 Oct 2026). A
-    ///      route split across doors of DIFFERENT currencies (ETH and USDG) can still promise the same
-    ///      stock twice; the second leg then reverts and the whole route with it, nothing moves (accepted
-    ///      23 Oct 2026 for the USDG door).
+    ///      market says is executable. One Uniswap door per currency per token: the market's aeWETH
+    ///      registration maps to the native pair, so no token gets two ETH pools on this hook and no
+    ///      route can split one ETH buy across two ETH doors; routers wrap and unwrap at the edges
+    ///      themselves. A route split across doors of DIFFERENT currencies (ETH and USDG) can still
+    ///      promise the same stock twice; the second leg then reverts and the whole route with it,
+    ///      nothing moves.
     function _plan(ListingCandidate memory listing, PoolCandidate memory pool)
         internal
         pure
@@ -1305,10 +1244,9 @@ contract FlowstateC1Hook is Ownable2Step {
 
     // -------------------------------------------------------------------------
     // Hook callbacks that are not flagged (afterInitialize, after/before remove and add liquidity,
-    // donate) are not implemented. Gen-6 (JUP-772): the six reverting stubs the Gen-5 hook carried
-    // for them went for runtime size (EIP-170); the PoolManager never calls an unflagged callback,
-    // and a direct call reverts the same way, with no function to run. The permission bits are
-    // unchanged (0x28cc) and validated in the constructor.
+    // donate) are not implemented: the PoolManager never calls an unflagged callback, and a direct
+    // call reverts with no function to run. The permission bits (0x28cc) are validated in the
+    // constructor.
     // -------------------------------------------------------------------------
 
 
@@ -1317,8 +1255,8 @@ contract FlowstateC1Hook is Ownable2Step {
     // -------------------------------------------------------------------------
 
     /// @dev manager.take needs the PoolManager to physically hold the ERC20 at call
-    ///      time; raise the explicit typed revert decided in scope §2.1 so aggregators
-    ///      see a clean error at simulation time instead of take()'s implicit one.
+    ///      time; raise an explicit typed revert so aggregators see a clean error at
+    ///      simulation time instead of take()'s implicit one.
     function _takeChecked(Currency currency, uint256 amount) internal {
         uint256 available = currency.balanceOf(address(poolManager));
         if (amount > available) revert ManagerReservesExceeded(currency, amount, available);
@@ -1334,7 +1272,7 @@ contract FlowstateC1Hook is Ownable2Step {
     /// @dev baseSpread must clear the current per-chain oracle-drift floor and sit
     ///      under the hard cap. Shared by config-time checks and the readiness gate.
     function _checkBaseSpread(uint16 bps) internal view {
-        // JUP-621: the effective lower bound is max(floor, jarFeeBps): every spread must
+        // the effective lower bound is max(floor, jarFeeBps): every spread must
         // be able to carry the TokenJar fee without touching the buyer's price.
         uint16 lower = baseSpreadFloorBps > jarFeeBps ? baseSpreadFloorBps : jarFeeBps;
         if (bps < lower || bps > MAX_SPREAD_BPS) {

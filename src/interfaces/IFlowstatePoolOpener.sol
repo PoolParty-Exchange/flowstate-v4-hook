@@ -7,7 +7,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IWETH9} from "./IWETH9.sol";
 
-/// @notice Gen-6 (JUP-772, 24 Oct 2026): the hook's own door-opening periphery, an immutable
+/// @notice The hook's own door-opening periphery, an immutable
 ///         dependency of the hook (constructor argument), never of the frontend. The hook calls it
 ///         inside the user's own transaction: `open` when a pair is registered (createPool, or the
 ///         owner's registerPair), `lightBeacon` on a pool's first fill.
@@ -25,7 +25,7 @@ interface IFlowstatePoolOpener {
     ///         hook's beforeInitialize refuses it). Never reverts.
     function open(Currency quote, Currency token) external returns (bool opened);
 
-    /// @notice Light a pool's visibility beacon (JUP-516: one liquidityDelta == 1 add) paid by the hook
+    /// @notice Light a pool's visibility beacon (one liquidityDelta == 1 add) paid by the hook
     ///         in the pool's currency on the side `payIsCurrency0` names, pulled from the hook's
     ///         allowance in the asset the hook holds for it (the wrapper where the pool owes native,
     ///         unwrapped here), at most `maxPay`. Hook-only. Returns what it cost.

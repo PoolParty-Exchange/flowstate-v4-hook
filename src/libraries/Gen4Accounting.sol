@@ -3,7 +3,7 @@ pragma solidity 0.8.26;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
-/// @notice Aggregate accounting for a gen-4 fill composed from multiple sources.
+/// @notice Aggregate accounting for a fill composed from multiple sources.
 /// @dev Internal-only and independent of the final listings ABI. Actual quote debits and
 ///      token receipts are recorded after each source succeeds; failed listing attempts
 ///      change only the attempt counter, so they cannot corrupt prior fill accounting.
@@ -52,8 +52,8 @@ library Gen4Accounting {
     }
 
     /// @notice Finalize a COMPLETE exact input from actual successful source receipts. Nothing is
-    ///         refunded (WSR F5): the executor has already reverted any short fill, so the remaining
-    ///         committed input is inversion/carve dust, gen-3's distinct dust bucket.
+    ///         refunded: the executor has already reverted any short fill, so the remaining
+    ///         committed input is inversion/carve dust, a distinct dust bucket.
     function exactInput(Totals memory totals, uint256 committed, uint256 spreadBps, uint256 jarFeeBps)
         internal
         pure
