@@ -13,7 +13,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {SafeERC20, IERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @dev ABI twin of FlowstateStructs.AnchorFloor (JUP-611): the lowest anchor rate,
+/// @dev ABI twin of FlowstateStructs.AnchorFloor: the lowest anchor rate,
 ///      per seeded quote asset, the depositor consents to. Declared locally because
 ///      the seeder pins 0.8.26 and the vendored contracts pin 0.8.29; the tuple
 ///      layout (address, uint192) is what the market decodes.
@@ -23,9 +23,9 @@ struct AnchorFloor {
 }
 
 /// @dev The one market entry point the seeder consumes: deposit on behalf of a named
-///      contribution owner (FlowstateMarket "gift semantics", R10). Tokens are pulled
+///      contribution owner (FlowstateMarket gift semantics). Tokens are pulled
 ///      from msg.sender (this contract); the position is credited to contributionOwner.
-///      JUP-611 (contracts PR #40): the deposit carries the floors the depositor
+///      The deposit carries the floors the depositor
 ///      consents to, one per asset the pool has an anchor for.
 interface IFlowstateMarketDeposit {
     function contributeTokens(address pool, uint256 amount, address contributionOwner, AnchorFloor[] calldata floors)
@@ -45,17 +45,15 @@ interface IBeaconHook {
 }
 
 /// @title FlowstateBeaconSeeder
-/// @notice UNPRIVILEGED convenience periphery for the GMGN-visibility beacon (JUP-516).
+/// @notice UNPRIVILEGED convenience periphery for the visibility beacon.
 ///         The hook itself enforces the only invariant that matters (at most one
 ///         liquidityDelta == 1 add per pool, from anyone); this contract merely makes
 ///         firing it convenient and bundles it with a first deposit so a depositor
 ///         needs ONE approval and ONE transaction.
 ///
-///         Funding rule (no-protocol-capital, Hamish 2026-07-28): the caller pays the
-///         dust and the gas. The dust's unit count is price-dependent (fork-measured:
-///         1 wei at the live CASHCAT price; ~4.2k wei of an 18d token at the test
-///         fixture's price — roughly the value of 1 wei of the counter-asset, always
-///         value-negligible). Flowstate never funds or holds anything here; between
+///         Funding rule (no protocol capital): the caller pays the dust and the gas. The
+///         dust's unit count is price-dependent and always value-negligible. Flowstate
+///         never funds or holds anything here; between
 ///         transactions this contract's balances are zero and the position it
 ///         custodies is 1 unit of liquidity, permanently locked (no remove path, by
 ///         design).
@@ -88,7 +86,7 @@ contract FlowstateBeaconSeeder is IUnlockCallback, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice Light a pool's beacon: mint the single permitted 1-liquidity dust
-    ///         position, paid by the caller in `payToken` (~1 wei, fork-measured).
+///         position, paid by the caller in `payToken` (about 1 wei).
     ///         Caller must have approved this contract for a few wei of `payToken`.
     /// @param key      the V4 pool key (its hook enforces once-per-pool and delta == 1).
     /// @param payToken the ERC-20 the caller pays the dust in; must be one of the
@@ -107,11 +105,11 @@ contract FlowstateBeaconSeeder is IUnlockCallback, ReentrancyGuard {
     /// @param inventoryToken the pool's inventory token (mismatches revert inside the
     ///                       market's pull; nothing can be lost to a wrong value).
     /// @param amount         inventory-token amount to deposit.
-    /// @param floors         the depositor's JUP-611 consent floors, one per seeded
+    /// @param floors         the depositor's consent floors, one per seeded
     ///                       quote asset, chosen and signed by the depositor BEFORE
     ///                       submission and passed to the market UNCHANGED. The
     ///                       periphery never substitutes a value it read during
-    ///                       execution (Wilko, PR #11 review): if the durable anchor
+    ///                       execution: if the durable anchor
     ///                       has moved below a signed floor by the time this executes,
     ///                       the market reverts with AnchorBelowFloor and no inventory
     ///                       is funded at the moved price.
@@ -139,7 +137,7 @@ contract FlowstateBeaconSeeder is IUnlockCallback, ReentrancyGuard {
     ///         (or lower floors of their own), and the signed values travel to the
     ///         market unchanged. This function is deliberately NOT called inside
     ///         `seedAndDeposit`: a floor read at execution time consents to whatever the
-    ///         anchor is at that moment, which is exactly the exposure JUP-611 removes.
+    ///         anchor is at that moment, which is exactly the exposure the floors remove.
     function consentFloors(address marketPool) external view returns (AnchorFloor[] memory floors) {
         address[] memory assets = IFlowstatePoolAnchors(marketPool).seededAssets();
         floors = new AnchorFloor[](assets.length);

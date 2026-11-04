@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity ^0.8.26;
 
-/// @notice JUP-697 one-candidate listing inspection surface pinned at
-///         PoolParty_Contracts PR #54 head de4464f.
+/// @notice One-candidate listing inspection surface of the listing registry.
 interface IGen4ListingRegistry {
     function market() external view returns (address);
     function settlement() external view returns (address);
@@ -13,7 +12,7 @@ interface IGen4ListingRegistry {
         returns (uint8 state, uint64 id, uint64 createdBlock, uint256 available, uint32 version, uint64 poolTail);
 }
 
-/// @notice JUP-697 one-candidate settlement surface. Gen-4 always supplies a
+/// @notice One-candidate settlement surface. The hook always supplies a
 ///         non-zero listingId and its inspected version; legacy walking mode is
 ///         deliberately unreachable through this adapter.
 interface IGen4ListingSettlement {
@@ -34,7 +33,7 @@ interface IGen4ListingSettlement {
     ) external returns (uint8 outcome, uint64 id, uint256 filled, uint256 quotePaid);
 }
 
-/// @notice Pool queue read model added by JUP-688/JUP-697. The index is
+/// @notice Pool queue read model. The index is
 ///         append-only; `pinned` is the active pinned amount, already clamped to
 ///         `amount` by the pool.
 interface IGen4Pool {

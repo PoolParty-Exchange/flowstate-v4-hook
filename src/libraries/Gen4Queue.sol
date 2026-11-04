@@ -3,8 +3,8 @@ pragma solidity 0.8.26;
 
 import {IGen4Pool} from "../interfaces/IGen4Inventory.sol";
 
-/// @notice Production FIFO primitives for the Gen-4 mixed pool/listing lane.
-/// @dev JUP-697 supplies a definitive cross-source boundary: a pool node was
+/// @notice Production FIFO primitives for the mixed pool/listing lane.
+/// @dev The listing registry supplies a definitive cross-source boundary: a pool node was
 ///      queued before a listing exactly when node.index <= listing.poolTail.
 library Gen4Queue {
     enum Source {
