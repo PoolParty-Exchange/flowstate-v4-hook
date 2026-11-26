@@ -10,6 +10,7 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {TransientStateLibrary} from "@uniswap/v4-core/src/libraries/TransientStateLibrary.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {FlowstateC1Hook} from "../FlowstateC1Hook.sol";
 
 /// @notice The rate the settlement prices a hook buy at. The listing settlement calls this same
@@ -29,8 +30,14 @@ interface IFlowstateHookRate {
 ///
 ///         GAS. `simGas` is the gas handed to `PoolManager.unlock` for each simulated buy, and it is
 ///         required. The hook stops early when gas runs short, so an answer holds only for a real
-///         call whose `unlock` gets at least `simGas`. Inside the simulation, POST_SWAP_RESERVE is
-///         held back from the swap for the router's own settle and take after the hook returns.
+///         call whose `unlock` gets at least `simGas`. Inside the simulation the swap is given less
+///         than the callback holds: POST_SWAP_RESERVE for a router's own settle and take, plus
+///         FRAME_RESERVE_64THS/64 of the gas for the extra call frames a router puts between its
+///         callback and PoolManager.swap (each keeps 1/64 back; Tycho's V4 path has three). A
+///         router deeper than that, or with more post-swap work, must pass a smaller simGas.
+///         The eth_call must carry enough gas for every simulation it runs (up to four per pool
+///         in `answer`, one per size in `quote`, each about simGas); the view refuses to run a
+///         simulation with less than simGas available rather than answer for less.
 ///         Every simulation runs in a frame that reverts, and every read the view makes for itself
 ///         runs in a reverting frame too, so nothing is pre-warmed: each simulation starts as cold
 ///         as a fresh transaction's first touch of the hook, market and listing contracts.
@@ -40,23 +47,31 @@ interface IFlowstateHookRate {
 ///         and the fill; a router mapped to a partner fee code (the view itself resolves to the
 ///         house code); the extra gas of a pool's first fill when its beacon is not yet lit (the
 ///         beacon is skipped, never blocks, when gas is short); state a router changes earlier in
-///         its own transaction.
+///         its own transaction. Figures for a hostile token are untrusted: a token controls its
+///         own transfers and revert data, so it can make any simulation look as it likes.
 contract FlowstateC1View is IUnlockCallback {
     using CurrencyLibrary for Currency;
 
     /// @notice `reason` values. 1 to 7 are the hook's own stop codes (FlowstateC1Hook STOP_*):
     ///         1 gas, 2 price read, 3 pool leg, 4 listing leg, 5 stock, 6 closed, 7 attempt cap.
+    ///         A read or leg that runs out of gas also shows as 2 or 4: with a small simGas, try more.
     uint8 public constant REASON_NONE = 0;
     uint8 public constant REASON_OTHER_REVERT = 100; // see `otherSelector`
     uint8 public constant REASON_NO_RESERVES = 101; // the PoolManager holds none of the quote asset
     uint8 public constant REASON_UNEXPECTED = 102; // a simulation returned instead of reverting
     uint8 public constant REASON_UNCONFIRMED = 103; // the probe reported stock but no buy confirmed it
 
-    /// @notice Gas held back inside the simulation for a router's settle and take after the swap.
-    uint256 public constant POST_SWAP_RESERVE = 60_000;
+    /// @notice Gas held back inside the simulation for a router's settle and take after the swap
+    ///         (a Universal Router buy on a Permit2-paid pool measured about 88k of such work).
+    uint256 public constant POST_SWAP_RESERVE = 100_000;
+    /// @notice Share of the callback's gas, in 64ths, held back for a router's extra call frames.
+    uint256 public constant FRAME_RESERVE_64THS = 4;
+    /// @notice The most revert data copied back from a simulation (a genuine one is under 400 bytes).
+    uint256 public constant MAX_REVERT_BYTES = 1_024;
     /// @notice The confirming buy is sized at this share of the probe's implied ceiling.
     uint16 public constant CONFIRM_BPS = 9_950;
 
+    /// @dev `maxAmountIn` is an input CONFIRMED to fill in full, not the largest possible one.
     struct PoolAnswer {
         PoolKey key;
         address marketPool; // two keys can share one market pool: take one figure per pool, never a sum
@@ -71,7 +86,7 @@ contract FlowstateC1View is IUnlockCallback {
         bool availableIsFloor; // the probe itself filled in full at PoolManager reserves
         bool rateOk;
         uint256 rate; // quote units per 1e18 tokens, before the hook's spread (the market's hook rate)
-        uint8 gateWhy; // the settlement's gate code read as a plain caller; 1-4 are its gates (see doc)
+        uint8 gateWhy; // the settlement's gate code read as a plain caller (see rateAndRevert); 255 = unreadable
         uint16 baseSpreadBps;
     }
 
@@ -91,6 +106,7 @@ contract FlowstateC1View is IUnlockCallback {
     error Rated(bool ok, uint256 rate, uint8 gateWhy);
     error HookNotSettled(int256 delta0, int256 delta1);
     error UnexpectedPeek();
+    error OuterGasTooLow(uint256 simGas, uint256 gasLeft);
 
     IPoolManager public immutable poolManager;
     FlowstateC1Hook public immutable hook;
@@ -136,12 +152,13 @@ contract FlowstateC1View is IUnlockCallback {
                 a.available = filled;
                 a.probeCeiling = filled;
                 a.availableIsFloor = true;
-            } else if (reason <= 7 && filled != 0 && wanted != 0) {
+            } else if (reason <= 7 && filled != 0 && wanted != 0 && filled <= wanted) {
                 a.probeCeiling = filled;
                 // Confirm with a real full fill sized just under the probe's implied ceiling. Only a
                 // buy the simulation completes counts, so a forged or misleading shortfall reports 0.
                 // The size rung can differ between the probe and a smaller buy, so step down twice.
-                uint256 ceilingIn = p.reserves * filled / wanted;
+                // filled <= wanted always holds for the genuine hook, so ceilingIn <= reserves
+                uint256 ceilingIn = Math.mulDiv(p.reserves, filled, wanted);
                 uint16[3] memory steps = [CONFIRM_BPS, 9_800, 9_000];
                 for (uint256 i; i < 3 && a.available == 0; i++) {
                     uint256 confirmIn = ceilingIn * steps[i] / 10_000;
@@ -252,20 +269,34 @@ contract FlowstateC1View is IUnlockCallback {
         internal
         returns (uint8 reason, uint256 a, uint256 b, bytes4 sel)
     {
-        bytes memory data = abi.encode(key, zeroForOne, amountIn);
-        try poolManager.unlock{gas: simGas}(data) {
-            return (REASON_UNEXPECTED, 0, 0, bytes4(0));
-        } catch (bytes memory err) {
-            return _decode(err);
+        // the call below gets min(simGas, 63/64 of what is left): refuse rather than answer for less
+        if (gasleft() < simGas * 64 / 63 + 50_000) revert OuterGasTooLow(simGas, gasleft());
+        bytes memory data = abi.encodeCall(IPoolManager.unlock, (abi.encode(key, zeroForOne, amountIn)));
+        address pm = address(poolManager);
+        uint256 cap = MAX_REVERT_BYTES;
+        bool ok;
+        bytes memory err;
+        assembly ("memory-safe") {
+            ok := call(simGas, pm, 0, add(data, 32), mload(data), 0, 0)
+            let n := returndatasize()
+            if gt(n, cap) { n := cap }
+            err := mload(0x40)
+            mstore(err, n)
+            returndatacopy(add(err, 32), 0, n)
+            mstore(0x40, add(add(err, 32), and(add(n, 31), not(31))))
         }
+        if (ok) return (REASON_UNEXPECTED, 0, 0, bytes4(0));
+        return _decode(err);
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
         (PoolKey memory key, bool zeroForOne, uint256 amountIn) = abi.decode(data, (PoolKey, bool, uint256));
         uint256 g = gasleft();
-        // hold back what a router needs after the swap: settle the input and take the output
-        uint256 swapGas = g > POST_SWAP_RESERVE ? g - POST_SWAP_RESERVE : 0;
+        // hold back what a router needs: its extra call frames before the swap, and its settle and
+        // take after it
+        uint256 reserve = POST_SWAP_RESERVE + g * FRAME_RESERVE_64THS / 64;
+        uint256 swapGas = g > reserve ? g - reserve : 0;
         BalanceDelta delta = poolManager.swap{gas: swapGas}(
             key,
             SwapParams({

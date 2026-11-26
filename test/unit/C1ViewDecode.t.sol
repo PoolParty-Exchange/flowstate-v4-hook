@@ -164,4 +164,31 @@ contract C1ViewDecodeTest is Test {
         vm.expectRevert(FlowstateC1View.SimGasRequired.selector);
         v.quote(key, _one(1), 0);
     }
+
+    function test_ForgedHugeFilled_NoOverflowAndBatchSurvives() public {
+        // filled above wanted (never true for the genuine hook) used to overflow the confirm sizing
+        pm.setErr(_shortfall(type(uint256).max / 2, 1, 5));
+        PoolKey[] memory ks = new PoolKey[](2);
+        ks[0] = key;
+        ks[1] = key;
+        FlowstateC1View.PoolAnswer[] memory out = v.answerAll(ks, G);
+        assertFalse(out[0].active);
+        assertEq(out[0].available, 0);
+        assertFalse(out[1].active);
+    }
+
+    function test_HugeRevertData_CopyIsCapped() public {
+        pm.setBig(200_000);
+        uint256 g = gasleft();
+        v.answer(key, G);
+        uint256 used = g - gasleft();
+        emit log_named_uint("answer gas with a 200 KB revert reason", used);
+        assertLt(used, 1_500_000, "revert data copy is capped");
+    }
+
+    function test_OuterGasTooLow_Refuses() public {
+        pm.setErr(_shortfall(0, 0, 5));
+        vm.expectRevert();
+        v.answer{gas: 1_000_000}(key, G);
+    }
 }

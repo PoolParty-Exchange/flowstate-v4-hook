@@ -107,6 +107,50 @@ contract TestBuyRouter is IUnlockCallback {
     receive() external payable {}
 }
 
+/// @dev Mirrors the frame shape of Tycho's V4 path (propeller-heads tycho at 04a4f9a: router ->
+///      Dispatcher delegatecall executor.handleCallback -> delegatecall swapExactInputSingle ->
+///      settle before the swap -> PoolManager.swap -> take). Native input only. From the 26 Nov
+///      re-review (deployment-ledger/tycho_view_rereview_2026-11-26.md).
+contract TychoShapeRouter {
+    IPoolManager public immutable pm;
+    address immutable self;
+
+    constructor(IPoolManager pm_) {
+        pm = pm_;
+        self = address(this);
+    }
+
+    function buy(PoolKey memory key, uint128 amountIn, uint256 unlockGas) external payable returns (uint256 out) {
+        uint256 before = IERC20(Currency.unwrap(key.currency1)).balanceOf(msg.sender);
+        bytes memory swapData = abi.encodeWithSelector(this.swapExactInputSingle.selector, key, true, amountIn, msg.sender, bytes(""));
+        pm.unlock{gas: unlockGas}(abi.encodeWithSelector(this.handleCallback.selector, swapData));
+        out = IERC20(Currency.unwrap(key.currency1)).balanceOf(msg.sender) - before;
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(pm), "pm");
+        (bool ok, bytes memory r) = self.delegatecall(data);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+        return r;
+    }
+
+    function handleCallback(bytes calldata swapData) external returns (bytes memory) {
+        (bool ok, bytes memory r) = self.delegatecall(swapData);
+        if (!ok) assembly { revert(add(r, 32), mload(r)) }
+        return abi.encode(r);
+    }
+
+    function swapExactInputSingle(PoolKey memory key, bool zf, uint128 amountIn, address receiver, bytes calldata) external {
+        pm.settle{value: amountIn}();
+        BalanceDelta d = pm.swap(
+            key, SwapParams({zeroForOne: zf, amountSpecified: -int256(uint256(amountIn)), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}), ""
+        );
+        pm.take(key.currency1, receiver, uint256(uint128(d.amount1())));
+    }
+
+    receive() external payable {}
+}
+
 /// @notice The view against the LIVE hook, market, settlement and registry on a fork of chain 4663.
 ///         Stock is created the way a seller creates it: the seller wallet behind listings 6 and 7
 ///         cancels the dead listing 7 and lists again. Then every figure the view gives is checked
@@ -121,11 +165,12 @@ contract C1ViewLiveForkTest is Test {
     // the seller wallet of listings 6 and 7 (deployment-ledger/first_routed_fill_2026-11-18)
     address constant SELLER = 0x1e4B26315fb7B3Ab8720e1272F093D64e409D3C9;
 
-    uint256 constant SIM_GAS = 1_200_000;
+    uint256 constant SIM_GAS = 1_600_000; // about one listing, cold, after the frame and post-swap reserves
     uint256 constant AMPLE_GAS = 30_000_000;
 
     FlowstateC1View view_;
     TestBuyRouter router;
+    TychoShapeRouter tycho;
     IPoolManager pm;
     PoolKey formKey;
     address buyer = makeAddr("buyer");
@@ -139,6 +184,7 @@ contract C1ViewLiveForkTest is Test {
         view_ = new FlowstateC1View(HOOK);
         pm = HOOK.poolManager();
         router = new TestBuyRouter(pm);
+        tycho = new TychoShapeRouter(pm);
         formKey = _key(address(0), FORM_TOKEN);
         vm.deal(buyer, 1_000 ether);
     }
@@ -263,7 +309,7 @@ contract C1ViewLiveForkTest is Test {
         FlowstateC1View.PoolAnswer memory tight = view_.answer(formKey, SIM_GAS);
         FlowstateC1View.PoolAnswer memory starved = view_.answer(formKey, 400_000);
         emit log_named_uint("available all gas", full.available);
-        emit log_named_uint("available 1.2M", tight.available);
+        emit log_named_uint("available 1.6M", tight.available);
         emit log_named_uint("available 400k", starved.available);
         emit log_named_uint("reason 400k", starved.reason);
         assertLe(tight.available, full.available);
@@ -317,6 +363,41 @@ contract C1ViewLiveForkTest is Test {
         IPermit2Approve(permit2).approve(FORM_TOKEN, address(HOOK.listingSettlement()), type(uint160).max, uint48(block.timestamp + 30 days));
         reg.list(FORM_TOKEN, amount, uint64(block.timestamp + 1 days), bytes32(0), floors, none, "");
         vm.stopPrank();
+    }
+
+    /// @dev Every gas level where the view says active, a Tycho-shaped buy at maxAmountIn with that
+    ///      same gas handed to unlock fills exactly `available`. Run with --isolate for cold state.
+    function _tychoScan(uint256 lo, uint256 hi, uint256 step) internal returns (uint256 actives) {
+        for (uint256 s = lo; s <= hi; s += step) {
+            uint256 snap = vm.snapshotState();
+            FlowstateC1View.PoolAnswer memory a = view_.answer(formKey, s);
+            if (a.active) {
+                actives++;
+                vm.prank(buyer);
+                uint256 got = tycho.buy{value: a.maxAmountIn}(formKey, uint128(a.maxAmountIn), s);
+                assertEq(got, a.available, "Tycho-shaped buy at the view's gas fills what it said");
+            }
+            vm.revertToState(snap);
+        }
+        emit log_named_uint("active points", actives);
+    }
+
+    function test_TychoShape_OneListing() public {
+        _relist(20_000e18);
+        assertGt(_tychoScan(1_000_000, 2_000_000, 50_000), 0);
+    }
+
+    function test_TychoShape_TwoListings() public {
+        _relist(9_000e18);
+        _listFrom(makeAddr("seller2"), 12_000e18);
+        assertGt(_tychoScan(1_400_000, 2_600_000, 40_000), 0);
+    }
+
+    function test_TychoShape_ThreeListings() public {
+        _relist(9_000e18);
+        _listFrom(makeAddr("seller2"), 12_000e18);
+        _listFrom(makeAddr("seller3"), 40_000e18);
+        assertGt(_tychoScan(1_900_000, 3_200_000, 50_000), 0);
     }
 
     function test_SpreadPassthroughMatchesHook() public view {
