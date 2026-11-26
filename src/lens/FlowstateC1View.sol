@@ -36,8 +36,9 @@ interface IFlowstateHookRate {
 ///         callback and PoolManager.swap (each keeps 1/64 back; Tycho's V4 path has three). A
 ///         router deeper than that, or with more post-swap work, must pass a smaller simGas.
 ///         The eth_call must carry enough gas for every simulation it runs (up to four per pool
-///         in `answer`, one per size in `quote`, each about simGas); the view refuses to run a
-///         simulation with less than simGas available rather than answer for less.
+///         in `answer`, one per size in `quote`, each needing simGas x 64/63 + 50k available),
+///         plus about 100k per pool for the view's own reads. When a simulation cannot get
+///         simGas the view reverts the whole call (OuterGasTooLow) rather than answer for less.
 ///         Every simulation runs in a frame that reverts, and every read the view makes for itself
 ///         runs in a reverting frame too, so nothing is pre-warmed: each simulation starts as cold
 ///         as a fresh transaction's first touch of the hook, market and listing contracts.
@@ -62,7 +63,8 @@ contract FlowstateC1View is IUnlockCallback {
     uint8 public constant REASON_UNCONFIRMED = 103; // the probe reported stock but no buy confirmed it
 
     /// @notice Gas held back inside the simulation for a router's settle and take after the swap
-    ///         (a Universal Router buy on a Permit2-paid pool measured about 88k of such work).
+    ///         (sized above an estimate of about 88k for a Universal Router buy paid through Permit2:
+    ///         a trace figure plus a separately measured Permit2 settle).
     uint256 public constant POST_SWAP_RESERVE = 100_000;
     /// @notice Share of the callback's gas, in 64ths, held back for a router's extra call frames.
     uint256 public constant FRAME_RESERVE_64THS = 4;
@@ -86,7 +88,8 @@ contract FlowstateC1View is IUnlockCallback {
         bool availableIsFloor; // the probe itself filled in full at PoolManager reserves
         bool rateOk;
         uint256 rate; // quote units per 1e18 tokens, before the hook's spread (the market's hook rate)
-        uint8 gateWhy; // the settlement's gate code read as a plain caller (see rateAndRevert); 255 = unreadable
+        uint8 gateWhy; // the settlement's gate code as a plain caller (see rateAndRevert); 255 = the price call
+        // failed (for example short of gas); 0 also when the whole read failed, so trust it only with rateOk
         uint16 baseSpreadBps;
     }
 
@@ -161,7 +164,7 @@ contract FlowstateC1View is IUnlockCallback {
                 uint256 ceilingIn = Math.mulDiv(p.reserves, filled, wanted);
                 uint16[3] memory steps = [CONFIRM_BPS, 9_800, 9_000];
                 for (uint256 i; i < 3 && a.available == 0; i++) {
-                    uint256 confirmIn = ceilingIn * steps[i] / 10_000;
+                    uint256 confirmIn = Math.mulDiv(ceilingIn, steps[i], 10_000);
                     if (confirmIn == 0) break;
                     (uint8 r2, uint256 got,,) = _simulate(key, p.quoteIsCurrency0, confirmIn, simGas);
                     if (r2 == REASON_NONE && got != 0) {

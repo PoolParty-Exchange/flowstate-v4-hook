@@ -188,7 +188,10 @@ contract C1ViewDecodeTest is Test {
 
     function test_OuterGasTooLow_Refuses() public {
         pm.setErr(_shortfall(0, 0, 5));
-        vm.expectRevert();
-        v.answer{gas: 1_000_000}(key, G);
+        try v.answer{gas: 1_000_000}(key, G) {
+            fail();
+        } catch (bytes memory err) {
+            assertEq(bytes4(err), FlowstateC1View.OuterGasTooLow.selector, "refused for outer gas, not another revert");
+        }
     }
 }
