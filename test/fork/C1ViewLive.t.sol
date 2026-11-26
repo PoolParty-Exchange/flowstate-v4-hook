@@ -70,6 +70,16 @@ contract TestBuyRouter is IUnlockCallback {
         out = abi.decode(pm.unlock(abi.encode(key, zeroForOne, amountIn, msg.sender)), (uint256));
     }
 
+    /// @dev The same buy with exactly `unlockGas` handed to PoolManager.unlock, the figure the
+    ///      view's simGas stands for.
+    function buyWithGas(PoolKey memory key, bool zeroForOne, uint256 amountIn, uint256 unlockGas)
+        external
+        payable
+        returns (uint256 out)
+    {
+        out = abi.decode(pm.unlock{gas: unlockGas}(abi.encode(key, zeroForOne, amountIn, msg.sender)), (uint256));
+    }
+
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(pm), "pm");
         (PoolKey memory key, bool zf, uint256 amountIn, address payer) = abi.decode(data, (PoolKey, bool, uint256, address));
@@ -112,6 +122,7 @@ contract C1ViewLiveForkTest is Test {
     address constant SELLER = 0x1e4B26315fb7B3Ab8720e1272F093D64e409D3C9;
 
     uint256 constant SIM_GAS = 1_200_000;
+    uint256 constant AMPLE_GAS = 30_000_000;
 
     FlowstateC1View view_;
     TestBuyRouter router;
@@ -187,38 +198,44 @@ contract C1ViewLiveForkTest is Test {
         _relist(20_000e18);
         FlowstateC1View.PoolAnswer memory a = view_.answer(formKey, SIM_GAS);
         emit log_named_uint("available", a.available);
+        emit log_named_uint("probeCeiling", a.probeCeiling);
+        emit log_named_uint("maxAmountIn", a.maxAmountIn);
         emit log_named_uint("reason", a.reason);
         emit log_named_uint("rate", a.rate);
+        emit log_named_uint("gateWhy", a.gateWhy);
         assertTrue(a.active, "active with a listing");
         assertTrue(a.rateOk, "rate read");
+        assertEq(a.gateWhy, 0, "settlement gates open");
+        assertEq(a.marketAsset, address(HOOK.weth9()), "native pair: the market is called with the wrapped asset");
         assertGt(a.available, 0);
-        assertLe(a.available, 20_000e18, "never more than listed");
+        assertLe(a.available, a.probeCeiling, "confirmed never above the probe");
+        assertLe(a.probeCeiling, 20_000e18, "never more than listed");
 
-        // largest exact input the view says fills in full (binary search on quote())
-        uint256 lo = 0;
-        uint256 hi = a.probeIn;
-        for (uint256 i; i < 80 && hi - lo > 1; i++) {
-            uint256 mid = (lo + hi) / 2;
-            (uint256[] memory outs,,) = view_.quote(formKey, _one(mid), SIM_GAS);
-            if (outs[0] > 0) lo = mid;
-            else hi = mid;
+        // a real buy at maxAmountIn, with exactly simGas handed to unlock, fills exactly `available`
+        vm.prank(buyer);
+        uint256 got = router.buyWithGas{value: a.maxAmountIn}(formKey, true, a.maxAmountIn, SIM_GAS);
+        assertEq(got, a.available, "real fill at maxAmountIn equals available");
+    }
+
+    /// @dev For each gas level: whenever the view says a buy fills, the same buy through a router
+    ///      whose unlock gets that same gas fills the same amount. Run with --isolate for cold state.
+    function test_GasCalibration_ActiveMeansRealFill() public {
+        _relist(9_000e18);
+        _listFrom(makeAddr("seller2"), 12_000e18);
+        uint256[5] memory levels = [uint256(900_000), 1_100_000, 1_400_000, 1_800_000, 2_400_000];
+        for (uint256 i; i < levels.length; i++) {
+            uint256 snap = vm.snapshotState();
+            FlowstateC1View.PoolAnswer memory a = view_.answer(formKey, levels[i]);
+            emit log_named_uint("simGas", levels[i]);
+            emit log_named_uint("  available", a.available);
+            emit log_named_uint("  reason", a.reason);
+            if (a.active) {
+                vm.prank(buyer);
+                uint256 got = router.buyWithGas{value: a.maxAmountIn}(formKey, true, a.maxAmountIn, levels[i]);
+                assertEq(got, a.available, "active means a real fill of that size at that gas");
+            }
+            vm.revertToState(snap);
         }
-        uint256 maxIn = lo;
-        (uint256[] memory atMax,,) = view_.quote(formKey, _one(maxIn), SIM_GAS);
-        emit log_named_uint("maxIn", maxIn);
-        emit log_named_uint("tokensAtMax", atMax[0]);
-        assertLe(atMax[0], a.available, "a full fill never exceeds available");
-
-        // a real buy at maxIn fills exactly what quote() said; one wei more reverts
-        uint256 snap = vm.snapshotState();
-        vm.prank(buyer);
-        uint256 got = router.buy{value: maxIn}(formKey, true, maxIn);
-        assertEq(got, atMax[0], "real fill equals quote at maxIn");
-        vm.revertToState(snap);
-
-        vm.prank(buyer);
-        vm.expectRevert();
-        router.buy{value: maxIn + 1}(formKey, true, maxIn + 1);
     }
 
     function test_WithListing_QuoteLadderMatchesRealBuys() public {
@@ -242,7 +259,7 @@ contract C1ViewLiveForkTest is Test {
 
     function test_WithListing_LessGasNeverReportsMore() public {
         _relist(20_000e18);
-        FlowstateC1View.PoolAnswer memory full = view_.answer(formKey, 0);
+        FlowstateC1View.PoolAnswer memory full = view_.answer(formKey, AMPLE_GAS);
         FlowstateC1View.PoolAnswer memory tight = view_.answer(formKey, SIM_GAS);
         FlowstateC1View.PoolAnswer memory starved = view_.answer(formKey, 400_000);
         emit log_named_uint("available all gas", full.available);
@@ -260,29 +277,30 @@ contract C1ViewLiveForkTest is Test {
         address seller2 = makeAddr("seller2");
         _listFrom(seller2, 12_000e18);
 
-        uint256[4] memory gasLevels = [uint256(1_200_000), 2_000_000, 3_000_000, 0];
+        uint256[4] memory gasLevels = [uint256(1_200_000), 2_000_000, 3_000_000, AMPLE_GAS];
         for (uint256 i; i < 4; i++) {
             FlowstateC1View.PoolAnswer memory g = view_.answer(formKey, gasLevels[i]);
             emit log_named_uint("simGas", gasLevels[i]);
             emit log_named_uint("  available", g.available);
             emit log_named_uint("  reason", g.reason);
         }
-        FlowstateC1View.PoolAnswer memory a = view_.answer(formKey, 0);
-        assertEq(a.available, 21_000e18, "both listings counted with enough gas");
+        FlowstateC1View.PoolAnswer memory a = view_.answer(formKey, AMPLE_GAS);
+        assertEq(a.probeCeiling, 21_000e18, "both listings reached with enough gas");
+        assertGe(a.available, 21_000e18 * 99 / 100, "confirmed within 1% of the ceiling");
         FlowstateC1View.PoolAnswer memory tight = view_.answer(formKey, SIM_GAS);
         assertLe(tight.available, a.available, "less gas never reports more");
 
         // a buy sized past the first listing, simulated and executed with the same ample gas
         uint256 size = 0.015 ether;
-        (uint256[] memory outs, uint8[] memory reasons,) = view_.quote(formKey, _one(size), 0);
+        (uint256[] memory outs, uint8[] memory reasons,) = view_.quote(formKey, _one(size), AMPLE_GAS);
         assertEq(reasons[0], 0);
         assertGt(outs[0], 9_000e18, "crosses into the second listing");
         vm.prank(buyer);
         uint256 got = router.buy{value: size}(formKey, true, size);
         assertEq(got, outs[0], "crossing fill equals quote");
 
-        FlowstateC1View.PoolAnswer memory after_ = view_.answer(formKey, 0);
-        assertEq(after_.available, 21_000e18 - got, "available falls by what was sold");
+        FlowstateC1View.PoolAnswer memory after_ = view_.answer(formKey, AMPLE_GAS);
+        assertEq(after_.probeCeiling, 21_000e18 - got, "the ceiling falls by what was sold");
     }
 
     function _listFrom(address seller, uint256 amount) internal {
