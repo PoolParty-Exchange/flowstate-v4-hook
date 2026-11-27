@@ -69,6 +69,8 @@ contract FlowstateC1View is IUnlockCallback {
     uint8 public constant REASON_UNCONFIRMED = 103; // the probe reported stock but no buy confirmed it
     uint8 public constant REASON_ANSWER_FAILED = 104; // answerAll only: this pool's answer reverted (see otherSelector)
     uint8 public constant REASON_PEEK_FAILED = 105; // the pair or the PoolManager's reserves could not be read
+    /// @notice probeStop / gateWhy value when no probe or read ran.
+    uint8 public constant NOT_RUN = 255;
 
     /// @notice Gas held back inside the simulation for a router's settle and take after the swap
     ///         (sized above an estimate of about 88k for a Universal Router buy paid through Permit2:
@@ -98,10 +100,11 @@ contract FlowstateC1View is IUnlockCallback {
         address quoteCurrency; // the V4 currency a buy pays in (address(0) = native ETH)
         bool active; // a confirmed exact-input buy fills now
         uint8 reason; // 0 when active; otherwise why not (a stop code 1-7 or REASON_*)
-        uint8 probeStop; // why the large probe stopped (0 = it filled in full), whether or not active
+        uint8 probeStop; // why the large probe stopped (0 = it filled in full; NOT_RUN = no probe ran)
         bool beaconLit; // false: the pool's first fill also lights its beacon (up to ~330k more gas,
-        // which the simulation may not have spent); give such a pool more gas than simGas
-        bytes4 otherSelector; // the decoded error when reason == REASON_OTHER_REVERT
+        // which the simulation may not have spent); give such a pool more gas than simGas. Only
+        // meaningful when the pair was read (reason not 104 or 105)
+        bytes4 otherSelector; // the decoded error when reason is REASON_OTHER_REVERT or REASON_ANSWER_FAILED
         uint256 maxAmountIn; // an exact input confirmed to fill in full (0 when inactive)
         uint256 available; // tokens that confirmed buy takes; a lower bound on what one buy can take
         uint256 probeCeiling; // tokens the probe reached before it stopped (unconfirmed upper figure)
@@ -119,6 +122,7 @@ contract FlowstateC1View is IUnlockCallback {
         uint16 baseSpreadBps;
         address marketAsset;
         uint256 reserves;
+        bool beaconLit;
     }
 
     error NotPoolManager();
@@ -153,6 +157,8 @@ contract FlowstateC1View is IUnlockCallback {
             } catch (bytes memory err) {
                 out[i].key = keys[i];
                 out[i].reason = REASON_ANSWER_FAILED;
+                out[i].probeStop = NOT_RUN;
+                out[i].gateWhy = NOT_RUN;
                 out[i].otherSelector = _selector(err);
             }
         }
@@ -161,6 +167,8 @@ contract FlowstateC1View is IUnlockCallback {
     function answer(PoolKey calldata key, uint256 simGas) public returns (PoolAnswer memory a) {
         _checkArgs(key, simGas);
         a.key = key;
+        a.probeStop = NOT_RUN;
+        a.gateWhy = NOT_RUN;
 
         (bool peeked, Peek memory p) = _peek(key);
         if (!peeked) {
@@ -170,6 +178,7 @@ contract FlowstateC1View is IUnlockCallback {
         a.marketPool = p.marketPool;
         a.marketAsset = p.marketAsset;
         a.baseSpreadBps = p.baseSpreadBps;
+        a.beaconLit = p.beaconLit;
         a.quoteCurrency = Currency.unwrap(p.quoteIsCurrency0 ? key.currency0 : key.currency1);
 
         if (p.reserves == 0) {
@@ -195,7 +204,6 @@ contract FlowstateC1View is IUnlockCallback {
         }
         a.active = a.available != 0;
         if (a.active) a.reason = REASON_NONE;
-        a.beaconLit = hook.beaconSeeded(key.toId());
 
         // Reads for the caller's own pricing, after the simulations and in a reverting frame.
         if (p.marketPool != address(0)) (a.rateOk, a.rate, a.gateWhy) = _rate(key, p);
@@ -246,6 +254,8 @@ contract FlowstateC1View is IUnlockCallback {
 
     /// @notice Exact tokens out for each exact-input size, or why that size would not fill.
     ///         tokensOut is 0 whenever reasons[i] != 0 (an exact-input buy fills in full or reverts).
+    ///         Reasons: 0, the hook's stop codes 1-7, 100 (other revert), 101 (size above what the
+    ///         PoolManager holds of the quote currency), 102, 105. No beacon signal: use answer().
     function quote(PoolKey calldata key, uint256[] calldata amountsIn, uint256 simGas)
         external
         returns (uint256[] memory tokensOut, uint8[] memory reasons, bytes4[] memory otherSelectors)
@@ -288,7 +298,7 @@ contract FlowstateC1View is IUnlockCallback {
     ///      it touches is not left warm for the simulation that follows.
     function _peek(PoolKey calldata key) internal returns (bool ok, Peek memory p) {
         try this.peekAndRevert{gas: PEEK_GAS}(key) {} catch (bytes memory err) {
-            if (_selector(err) == Peeked.selector && err.length == 4 + 5 * 32) {
+            if (_selector(err) == Peeked.selector && err.length == 4 + 6 * 32) {
                 p = abi.decode(_args(err), (Peek));
                 ok = true;
             }
@@ -300,7 +310,10 @@ contract FlowstateC1View is IUnlockCallback {
         (address marketPool, bool quoteIsCurrency0,, uint16 baseSpreadBps, address marketAsset) =
             hook.pairs(keccak256(abi.encode(key.currency0, key.currency1)));
         Currency payIn = quoteIsCurrency0 ? key.currency0 : key.currency1;
-        revert Peeked(Peek(marketPool, quoteIsCurrency0, baseSpreadBps, marketAsset, payIn.balanceOf(address(poolManager))));
+        // the beacon flag is read here, in a reverting frame, so the hook account is not left warm
+        revert Peeked(
+            Peek(marketPool, quoteIsCurrency0, baseSpreadBps, marketAsset, payIn.balanceOf(address(poolManager)), hook.beaconSeeded(key.toId()))
+        );
     }
 
     function _rate(PoolKey calldata key, Peek memory p) internal returns (bool ok, uint256 rate, uint8 why) {
@@ -411,6 +424,7 @@ contract FlowstateC1View is IUnlockCallback {
         } else if (sel == FlowstateC1Hook.ExactInputShortfall.selector) {
             return (REASON_OTHER_REVERT, 0, 0, sel); // an unwrapped shortfall did not come from the hook call
         }
+        if (sel == FlowstateC1Hook.ManagerReservesExceeded.selector) return (REASON_NO_RESERVES, 0, 0, bytes4(0));
         if (sel == FlowstateC1Hook.ExactInputShortfall.selector && err.length == 4 + 3 * 32) {
             (uint256 filled, uint256 wanted, uint256 stop) = abi.decode(_args(err), (uint256, uint256, uint256));
             if (stop >= 1 && stop <= 7) return (uint8(stop), filled, wanted, bytes4(0));

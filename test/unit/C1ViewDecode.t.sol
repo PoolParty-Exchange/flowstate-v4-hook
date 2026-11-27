@@ -281,4 +281,26 @@ contract C1ViewDecodeTest is Test {
         assertGe(a.maxAmountIn, 0.25 ether * 99 / 100, "found within 1% of the real limit");
         assertEq(a.available, a.maxAmountIn * 3);
     }
+
+    function test_HookTargetOtherSelector_IsOther() public {
+        bytes memory inner = abi.encodeWithSelector(FlowstateC1Hook.ExactInputShortfall.selector, uint256(1e30), uint256(1e31), uint256(5));
+        pm.setErr(abi.encodeWithSelector(CustomRevert.WrappedError.selector, address(hk), IHooks.afterSwap.selector, inner, hex""));
+        FlowstateC1View.PoolAnswer memory a = v.answer(key, G);
+        assertEq(a.reason, v.REASON_OTHER_REVERT());
+    }
+
+    function test_ManagerReservesExceeded_IsNoReserves() public {
+        pm.setErr(_wrap(abi.encodeWithSelector(FlowstateC1Hook.ManagerReservesExceeded.selector, address(0), uint256(2), uint256(1))));
+        (, uint8[] memory rs,) = v.quote(key, _one(2), G);
+        assertEq(rs[0], v.REASON_NO_RESERVES());
+    }
+
+    function test_NotRunDefaults() public {
+        PoolKey[] memory ks = new PoolKey[](1);
+        ks[0] = key;
+        ks[0].hooks = IHooks(address(0xdead));
+        FlowstateC1View.PoolAnswer[] memory out = v.answerAll(ks, G);
+        assertEq(out[0].probeStop, v.NOT_RUN());
+        assertEq(out[0].gateWhy, v.NOT_RUN());
+    }
 }
