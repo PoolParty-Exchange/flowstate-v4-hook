@@ -4,6 +4,8 @@ pragma solidity 0.8.26;
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
@@ -35,10 +37,12 @@ interface IFlowstateHookRate {
 ///         FRAME_RESERVE_64THS/64 of the gas for the extra call frames a router puts between its
 ///         callback and PoolManager.swap (each keeps 1/64 back; Tycho's V4 path has three). A
 ///         router deeper than that, or with more post-swap work, must pass a smaller simGas.
-///         The eth_call must carry enough gas for every simulation it runs (up to four per pool
-///         in `answer`, one per size in `quote`, each needing simGas x 64/63 + 50k available),
-///         plus about 100k per pool for the view's own reads. When a simulation cannot get
-///         simGas the view reverts the whole call (OuterGasTooLow) rather than answer for less.
+///         The eth_call must carry enough gas for every simulation it runs (up to 12 per pool in
+///         `answer`: one probe, three confirm sizes, up to BISECT_STEPS halvings; one per size in
+///         `quote`; each needing simGas x 64/63 + 50k available), plus PEEK_GAS and up to RATE_GAS
+///         per pool for the view's own reads. When a simulation cannot get simGas, `answer` and
+///         `quote` revert (OuterGasTooLow) rather than answer for less; `answerAll` marks that pool
+///         REASON_ANSWER_FAILED and carries on. simGas above MAX_SIM_GAS is refused.
 ///         Every simulation runs in a frame that reverts, and every read the view makes for itself
 ///         runs in a reverting frame too, so nothing is pre-warmed: each simulation starts as cold
 ///         as a fresh transaction's first touch of the hook, market and listing contracts.
@@ -52,15 +56,19 @@ interface IFlowstateHookRate {
 ///         own transfers and revert data, so it can make any simulation look as it likes.
 contract FlowstateC1View is IUnlockCallback {
     using CurrencyLibrary for Currency;
+    using PoolIdLibrary for PoolKey;
 
     /// @notice `reason` values. 1 to 7 are the hook's own stop codes (FlowstateC1Hook STOP_*):
     ///         1 gas, 2 price read, 3 pool leg, 4 listing leg, 5 stock, 6 closed, 7 attempt cap.
-    ///         A read or leg that runs out of gas also shows as 2 or 4: with a small simGas, try more.
+    ///         2 means a price read OR a pool read (queue or maxBuy) failed. A read or leg that runs
+    ///         out of gas also shows as 2 or 4: with a small simGas, try more.
     uint8 public constant REASON_NONE = 0;
     uint8 public constant REASON_OTHER_REVERT = 100; // see `otherSelector`
     uint8 public constant REASON_NO_RESERVES = 101; // the PoolManager holds none of the quote asset
     uint8 public constant REASON_UNEXPECTED = 102; // a simulation returned instead of reverting
     uint8 public constant REASON_UNCONFIRMED = 103; // the probe reported stock but no buy confirmed it
+    uint8 public constant REASON_ANSWER_FAILED = 104; // answerAll only: this pool's answer reverted (see otherSelector)
+    uint8 public constant REASON_PEEK_FAILED = 105; // the pair or the PoolManager's reserves could not be read
 
     /// @notice Gas held back inside the simulation for a router's settle and take after the swap
     ///         (sized above an estimate of about 88k for a Universal Router buy paid through Permit2:
@@ -72,15 +80,27 @@ contract FlowstateC1View is IUnlockCallback {
     uint256 public constant MAX_REVERT_BYTES = 1_024;
     /// @notice The confirming buy is sized at this share of the probe's implied ceiling.
     uint16 public constant CONFIRM_BPS = 9_950;
+    /// @notice Halvings tried after the three fixed confirm sizes all fail.
+    uint256 public constant BISECT_STEPS = 8;
+    /// @notice The largest simGas accepted (beyond any block's gas).
+    uint256 public constant MAX_SIM_GAS = 50_000_000;
+    /// @notice Gas given to the view's own reads, so one slow pool cannot starve the next.
+    uint256 public constant PEEK_GAS = 300_000;
+    uint256 public constant RATE_GAS = 3_000_000;
 
-    /// @dev `maxAmountIn` is an input CONFIRMED to fill in full, not the largest possible one.
+    /// @dev `maxAmountIn` is an input CONFIRMED to fill in full, not the largest possible one. Every
+    ///      input is also capped at what the PoolManager holds of the quote currency (the hook takes
+    ///      the whole input from it first); that is a ceiling of the method, not a stock limit.
     struct PoolAnswer {
         PoolKey key;
         address marketPool; // two keys can share one market pool: take one figure per pool, never a sum
         address marketAsset; // the asset the market is called with (the wrapped asset for a native pair)
         address quoteCurrency; // the V4 currency a buy pays in (address(0) = native ETH)
         bool active; // a confirmed exact-input buy fills now
-        uint8 reason; // why not, or why the probe stopped (0 when the probe filled in full)
+        uint8 reason; // 0 when active; otherwise why not (a stop code 1-7 or REASON_*)
+        uint8 probeStop; // why the large probe stopped (0 = it filled in full), whether or not active
+        bool beaconLit; // false: the pool's first fill also lights its beacon (up to ~330k more gas,
+        // which the simulation may not have spent); give such a pool more gas than simGas
         bytes4 otherSelector; // the decoded error when reason == REASON_OTHER_REVERT
         uint256 maxAmountIn; // an exact input confirmed to fill in full (0 when inactive)
         uint256 available; // tokens that confirmed buy takes; a lower bound on what one buy can take
@@ -89,7 +109,7 @@ contract FlowstateC1View is IUnlockCallback {
         bool rateOk;
         uint256 rate; // quote units per 1e18 tokens, before the hook's spread (the market's hook rate)
         uint8 gateWhy; // the settlement's gate code as a plain caller (see rateAndRevert); 255 = the price call
-        // failed (for example short of gas); 0 also when the whole read failed, so trust it only with rateOk
+        // failed (for example short of gas) or the whole read failed; trust it only with rateOk
         uint16 baseSpreadBps;
     }
 
@@ -104,11 +124,11 @@ contract FlowstateC1View is IUnlockCallback {
     error NotPoolManager();
     error WrongHook(address hooks);
     error SimGasRequired();
+    error SimGasTooHigh(uint256 simGas);
     error Simulated(uint256 tokensOut);
     error Peeked(Peek p);
     error Rated(bool ok, uint256 rate, uint8 gateWhy);
     error HookNotSettled(int256 delta0, int256 delta1);
-    error UnexpectedPeek();
     error OuterGasTooLow(uint256 simGas, uint256 gasLeft);
 
     IPoolManager public immutable poolManager;
@@ -123,19 +143,30 @@ contract FlowstateC1View is IUnlockCallback {
 
     // ---------------------------------------------------------------- answers
 
+    /// @notice One answer per key. A pool whose answer reverts (wrong hook, outer gas too low, ...)
+    ///         comes back with reason REASON_ANSWER_FAILED and the error's selector; the rest stand.
     function answerAll(PoolKey[] calldata keys, uint256 simGas) external returns (PoolAnswer[] memory out) {
         out = new PoolAnswer[](keys.length);
         for (uint256 i; i < keys.length; i++) {
-            out[i] = answer(keys[i], simGas);
+            try this.answer(keys[i], simGas) returns (PoolAnswer memory a) {
+                out[i] = a;
+            } catch (bytes memory err) {
+                out[i].key = keys[i];
+                out[i].reason = REASON_ANSWER_FAILED;
+                out[i].otherSelector = _selector(err);
+            }
         }
     }
 
     function answer(PoolKey calldata key, uint256 simGas) public returns (PoolAnswer memory a) {
-        if (address(key.hooks) != address(hook)) revert WrongHook(address(key.hooks));
-        if (simGas == 0) revert SimGasRequired();
+        _checkArgs(key, simGas);
         a.key = key;
 
-        Peek memory p = _peek(key);
+        (bool peeked, Peek memory p) = _peek(key);
+        if (!peeked) {
+            a.reason = REASON_PEEK_FAILED;
+            return a;
+        }
         a.marketPool = p.marketPool;
         a.marketAsset = p.marketAsset;
         a.baseSpreadBps = p.baseSpreadBps;
@@ -148,6 +179,7 @@ contract FlowstateC1View is IUnlockCallback {
             // PoolManager first, FlowstateC1Hook._takeChecked). It reports how far one buy walks.
             (uint8 reason, uint256 filled, uint256 wanted, bytes4 sel) =
                 _simulate(key, p.quoteIsCurrency0, p.reserves, simGas);
+            a.probeStop = reason;
             a.reason = reason;
             a.otherSelector = sel;
             if (reason == REASON_NONE) {
@@ -155,30 +187,61 @@ contract FlowstateC1View is IUnlockCallback {
                 a.available = filled;
                 a.probeCeiling = filled;
                 a.availableIsFloor = true;
-            } else if (reason <= 7 && filled != 0 && wanted != 0 && filled <= wanted) {
+            } else if (reason <= 7 && filled != 0) {
                 a.probeCeiling = filled;
-                // Confirm with a real full fill sized just under the probe's implied ceiling. Only a
-                // buy the simulation completes counts, so a forged or misleading shortfall reports 0.
-                // The size rung can differ between the probe and a smaller buy, so step down twice.
-                // filled <= wanted always holds for the genuine hook, so ceilingIn <= reserves
-                uint256 ceilingIn = Math.mulDiv(p.reserves, filled, wanted);
-                uint16[3] memory steps = [CONFIRM_BPS, 9_800, 9_000];
-                for (uint256 i; i < 3 && a.available == 0; i++) {
-                    uint256 confirmIn = Math.mulDiv(ceilingIn, steps[i], 10_000);
-                    if (confirmIn == 0) break;
-                    (uint8 r2, uint256 got,,) = _simulate(key, p.quoteIsCurrency0, confirmIn, simGas);
-                    if (r2 == REASON_NONE && got != 0) {
-                        a.maxAmountIn = confirmIn;
-                        a.available = got;
-                    }
-                }
+                _confirm(a, key, p, filled, wanted, simGas);
                 if (a.available == 0) a.reason = REASON_UNCONFIRMED;
             }
         }
         a.active = a.available != 0;
+        if (a.active) a.reason = REASON_NONE;
+        a.beaconLit = hook.beaconSeeded(key.toId());
 
         // Reads for the caller's own pricing, after the simulations and in a reverting frame.
         if (p.marketPool != address(0)) (a.rateOk, a.rate, a.gateWhy) = _rate(key, p);
+    }
+
+    /// @dev Finds an exact input the simulation fills in full. A pool leg pays the pool's own price and
+    ///      a listing leg can settle under its cap, so one buy can take more tokens than the probe's
+    ///      `wanted` (budget / hook rate) implies: the implied input is only a first guess. Three
+    ///      fixed sizes under it, then halving between 0 and the smallest failed size. Only a buy the
+    ///      simulation completes counts, so a forged or misleading shortfall reports nothing.
+    function _confirm(PoolAnswer memory a, PoolKey calldata key, Peek memory p, uint256 filled, uint256 wanted, uint256 simGas)
+        internal
+    {
+        uint256 ceilingIn = (wanted == 0 || filled >= wanted) ? p.reserves : Math.mulDiv(p.reserves, filled, wanted);
+        uint16[3] memory steps = [CONFIRM_BPS, 9_800, 9_000];
+        uint256 failedAt = ceilingIn;
+        for (uint256 i; i < 3; i++) {
+            uint256 confirmIn = Math.mulDiv(ceilingIn, steps[i], 10_000);
+            if (confirmIn == 0) return;
+            (uint8 r, uint256 got,,) = _simulate(key, p.quoteIsCurrency0, confirmIn, simGas);
+            if (r == REASON_NONE && got != 0) {
+                a.maxAmountIn = confirmIn;
+                a.available = got;
+                return;
+            }
+            failedAt = confirmIn;
+        }
+        uint256 lo;
+        uint256 hi = failedAt;
+        for (uint256 j; j < BISECT_STEPS && hi - lo > 1; j++) {
+            uint256 mid = lo + (hi - lo) / 2;
+            (uint8 r, uint256 got,,) = _simulate(key, p.quoteIsCurrency0, mid, simGas);
+            if (r == REASON_NONE && got != 0) {
+                lo = mid;
+                a.maxAmountIn = mid;
+                a.available = got;
+            } else {
+                hi = mid;
+            }
+        }
+    }
+
+    function _checkArgs(PoolKey calldata key, uint256 simGas) internal view {
+        if (address(key.hooks) != address(hook)) revert WrongHook(address(key.hooks));
+        if (simGas == 0) revert SimGasRequired();
+        if (simGas > MAX_SIM_GAS) revert SimGasTooHigh(simGas);
     }
 
     /// @notice Exact tokens out for each exact-input size, or why that size would not fill.
@@ -187,14 +250,18 @@ contract FlowstateC1View is IUnlockCallback {
         external
         returns (uint256[] memory tokensOut, uint8[] memory reasons, bytes4[] memory otherSelectors)
     {
-        if (address(key.hooks) != address(hook)) revert WrongHook(address(key.hooks));
-        if (simGas == 0) revert SimGasRequired();
-        bool quoteIsCurrency0 = _peek(key).quoteIsCurrency0;
+        _checkArgs(key, simGas);
+        (bool peeked, Peek memory p) = _peek(key);
+        bool quoteIsCurrency0 = p.quoteIsCurrency0;
         uint256 n = amountsIn.length;
         tokensOut = new uint256[](n);
         reasons = new uint8[](n);
         otherSelectors = new bytes4[](n);
         for (uint256 i; i < n; i++) {
+            if (!peeked) {
+                reasons[i] = REASON_PEEK_FAILED;
+                continue;
+            }
             (uint8 reason, uint256 got,, bytes4 sel) = _simulate(key, quoteIsCurrency0, amountsIn[i], simGas);
             reasons[i] = reason;
             otherSelectors[i] = sel;
@@ -219,10 +286,12 @@ contract FlowstateC1View is IUnlockCallback {
 
     /// @dev Reads the pair and the PoolManager's reserves in a frame that reverts, so the storage
     ///      it touches is not left warm for the simulation that follows.
-    function _peek(PoolKey calldata key) internal returns (Peek memory p) {
-        try this.peekAndRevert(key) {} catch (bytes memory err) {
-            if (_selector(err) != Peeked.selector || err.length != 4 + 5 * 32) revert UnexpectedPeek();
-            p = abi.decode(_args(err), (Peek));
+    function _peek(PoolKey calldata key) internal returns (bool ok, Peek memory p) {
+        try this.peekAndRevert{gas: PEEK_GAS}(key) {} catch (bytes memory err) {
+            if (_selector(err) == Peeked.selector && err.length == 4 + 5 * 32) {
+                p = abi.decode(_args(err), (Peek));
+                ok = true;
+            }
         }
     }
 
@@ -235,7 +304,8 @@ contract FlowstateC1View is IUnlockCallback {
     }
 
     function _rate(PoolKey calldata key, Peek memory p) internal returns (bool ok, uint256 rate, uint8 why) {
-        try this.rateAndRevert(key, p.marketPool, p.marketAsset, p.quoteIsCurrency0) {} catch (bytes memory err) {
+        why = type(uint8).max; // unless the read below answers
+        try this.rateAndRevert{gas: RATE_GAS}(key, p.marketPool, p.marketAsset, p.quoteIsCurrency0) {} catch (bytes memory err) {
             if (_selector(err) == Rated.selector && err.length == 4 + 3 * 32) {
                 (ok, rate, why) = abi.decode(_args(err), (bool, uint256, uint8));
             }
@@ -273,7 +343,7 @@ contract FlowstateC1View is IUnlockCallback {
         returns (uint8 reason, uint256 a, uint256 b, bytes4 sel)
     {
         // the call below gets min(simGas, 63/64 of what is left): refuse rather than answer for less
-        if (gasleft() < simGas * 64 / 63 + 50_000) revert OuterGasTooLow(simGas, gasleft());
+        if (gasleft() < simGas + simGas / 63 + 50_000) revert OuterGasTooLow(simGas, gasleft());
         bytes memory data = abi.encodeCall(IPoolManager.unlock, (abi.encode(key, zeroForOne, amountIn)));
         address pm = address(poolManager);
         uint256 cap = MAX_REVERT_BYTES;
@@ -329,12 +399,17 @@ contract FlowstateC1View is IUnlockCallback {
             return (REASON_NONE, abi.decode(_args(err), (uint256)), 0, bytes4(0));
         }
         if (sel == CustomRevert.WrappedError.selector) {
-            try this.unwrap(err) returns (bytes memory inner) {
+            try this.unwrap(err) returns (address target, bytes4 fn, bytes memory inner) {
+                // only the hook's own beforeSwap revert can carry a stop code; v4-core also wraps token
+                // transfer failures, whose revert data the token controls
+                if (target != address(hook) || fn != IHooks.beforeSwap.selector) return (REASON_OTHER_REVERT, 0, 0, sel);
                 err = inner;
                 sel = _selector(err);
             } catch {
                 return (REASON_OTHER_REVERT, 0, 0, sel);
             }
+        } else if (sel == FlowstateC1Hook.ExactInputShortfall.selector) {
+            return (REASON_OTHER_REVERT, 0, 0, sel); // an unwrapped shortfall did not come from the hook call
         }
         if (sel == FlowstateC1Hook.ExactInputShortfall.selector && err.length == 4 + 3 * 32) {
             (uint256 filled, uint256 wanted, uint256 stop) = abi.decode(_args(err), (uint256, uint256, uint256));
@@ -344,8 +419,8 @@ contract FlowstateC1View is IUnlockCallback {
     }
 
     /// @notice Decodes a v4-core WrappedError and returns its inner revert data.
-    function unwrap(bytes memory err) external pure returns (bytes memory inner) {
-        (,, inner,) = abi.decode(_args(err), (address, bytes4, bytes, bytes));
+    function unwrap(bytes memory err) external pure returns (address target, bytes4 fn, bytes memory inner) {
+        (target, fn, inner,) = abi.decode(_args(err), (address, bytes4, bytes, bytes));
     }
 
     function _selector(bytes memory b) private pure returns (bytes4 s) {

@@ -25,3 +25,8 @@ runs = 64
 
 [rpc_endpoints]
 robinhood = "https://rpc.mainnet.chain.robinhood.com"
+
+# Fork tests whose gas figures need cold state per call (test/fork/C1ViewLive.t.sol):
+#   FOUNDRY_PROFILE=fork-isolate forge test --match-path test/fork/C1ViewLive.t.sol
+[profile.fork-isolate]
+isolate = true

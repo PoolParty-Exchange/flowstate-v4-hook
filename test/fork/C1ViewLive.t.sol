@@ -176,7 +176,11 @@ contract C1ViewLiveForkTest is Test {
     address buyer = makeAddr("buyer");
 
     function setUp() public {
-        vm.createSelectFork(vm.envOr("RH_RPC", string("https://rpc.mainnet.chain.robinhood.com")));
+        // FORK_BLOCK pins the fork (the public endpoint keeps recent state only); 0 = latest
+        string memory rpc = vm.envOr("RH_RPC", string("https://rpc.mainnet.chain.robinhood.com"));
+        uint256 pin = vm.envOr("FORK_BLOCK", uint256(0));
+        if (pin == 0) vm.createSelectFork(rpc);
+        else vm.createSelectFork(rpc, pin);
         // The chain's block-number system contract (ArbSys at 0x64) does not exist in a Foundry
         // fork; this stand-in returns the block number, as the earlier fork runs did
         // (deployment-ledger/tycho_fork_test_2026-11-18/tycho_fork_test.cjs:75).
@@ -205,7 +209,8 @@ contract C1ViewLiveForkTest is Test {
         if (bal < amount) deal(FORM_TOKEN, SELLER, amount);
         PermitSingle memory none;
         vm.startPrank(SELLER);
-        reg.cancel(7);
+        // listing 7 (dead stub, expires 18 Dec) blocks a relist until cancelled; it may already be gone
+        try reg.cancel(7) {} catch {}
         id = reg.list(FORM_TOKEN, amount, uint64(block.timestamp + 1 days), bytes32(0), floors, none, "");
         vm.stopPrank();
     }
@@ -213,16 +218,19 @@ contract C1ViewLiveForkTest is Test {
     // ------------------------------------------------------------ live state, no stock
 
     function test_LiveState_NoStock_ReasonsAndSharedPool() public {
+        // Live state moves (stock, pauses); the exact codes held on 25-27 Nov, logged here. What must
+        // always hold: inactive pools carry a reason, active ones carry reason 0.
         FlowstateC1View.PoolAnswer memory f = view_.answer(formKey, SIM_GAS);
-        assertFalse(f.active, "form pool inactive");
-        assertEq(f.reason, 5, "form pool: STOP_STOCK");
-        assertEq(f.available, 0);
+        emit log_named_uint("form pool reason (5 = no stock on 25-27 Nov)", f.reason);
+        assertTrue(f.active ? f.reason == 0 : f.reason != 0, "reason consistent with active");
         assertEq(f.quoteCurrency, address(0), "native ETH quote");
 
         FlowstateC1View.PoolAnswer memory r1 = view_.answer(_key(address(0), REF_TOKEN), SIM_GAS);
         FlowstateC1View.PoolAnswer memory r2 = view_.answer(_key(QUOTE_USD, REF_TOKEN), SIM_GAS);
-        assertEq(r1.reason, 6, "ref ETH pool: STOP_CLOSED");
-        assertEq(r2.reason, 6, "ref USD pool: STOP_CLOSED");
+        emit log_named_uint("ref ETH pool reason (6 = closed on 25-27 Nov)", r1.reason);
+        emit log_named_uint("ref USD pool reason (6 = closed on 25-27 Nov)", r2.reason);
+        assertTrue(r1.active ? r1.reason == 0 : r1.reason != 0);
+        assertTrue(r2.active ? r2.reason == 0 : r2.reason != 0);
         assertEq(r1.marketPool, r2.marketPool, "two keys, one market pool");
         assertTrue(r1.marketPool != address(0));
 
@@ -250,6 +258,9 @@ contract C1ViewLiveForkTest is Test {
         emit log_named_uint("rate", a.rate);
         emit log_named_uint("gateWhy", a.gateWhy);
         assertTrue(a.active, "active with a listing");
+        assertEq(a.reason, 0, "reason is 0 when active");
+        emit log_named_uint("probeStop", a.probeStop);
+        assertTrue(a.beaconLit, "the form pool's beacon is lit");
         assertTrue(a.rateOk, "rate read");
         assertEq(a.gateWhy, 0, "settlement gates open");
         assertEq(a.marketAsset, address(HOOK.weth9()), "native pair: the market is called with the wrapped asset");
@@ -264,7 +275,7 @@ contract C1ViewLiveForkTest is Test {
     }
 
     /// @dev For each gas level: whenever the view says a buy fills, the same buy through a router
-    ///      whose unlock gets that same gas fills the same amount. Run with --isolate for cold state.
+    ///      whose unlock gets that same gas fills the same amount. Run cold: FOUNDRY_PROFILE=fork-isolate (isolate = true).
     function test_GasCalibration_ActiveMeansRealFill() public {
         _relist(9_000e18);
         _listFrom(makeAddr("seller2"), 12_000e18);
@@ -366,7 +377,7 @@ contract C1ViewLiveForkTest is Test {
     }
 
     /// @dev Every gas level where the view says active, a Tycho-shaped buy at maxAmountIn with that
-    ///      same gas handed to unlock fills exactly `available`. Run with --isolate for cold state.
+    ///      same gas handed to unlock fills exactly `available`. Run cold: FOUNDRY_PROFILE=fork-isolate (isolate = true).
     function _tychoScan(uint256 lo, uint256 hi, uint256 step) internal returns (uint256 actives) {
         for (uint256 s = lo; s <= hi; s += step) {
             uint256 snap = vm.snapshotState();
